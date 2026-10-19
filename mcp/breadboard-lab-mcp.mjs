@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.19（commit f94cd79）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.19（commit 8968264）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process$1 from "node:process";
