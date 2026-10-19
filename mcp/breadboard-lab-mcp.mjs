@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.19（commit 8968264）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.19（commit ba32f75）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process$1 from "node:process";
@@ -28541,7 +28541,7 @@ function blockOutputs(chip, inputs) {
 * values：輸入端 id → 0 / 1；沒給的用節點自己的 value。displays：顯示器 id → 0–15（A + 2B + 4C + 8D）或 X。
 * 子專案 32：dps 是小數點（沒接是 0）；segs 是每段直接控制的顯示器亮的段（沒接的段是 0，有不確定的是 X）。
 */
-function evaluate(d, values = {}) {
+function evaluate$1(d, values = {}) {
 	const { order, loop } = topoOrder(d);
 	const nodes = /* @__PURE__ */ new Map();
 	const displays = /* @__PURE__ */ new Map();
@@ -28644,7 +28644,7 @@ function truthTable(d) {
 	const rows = [];
 	for (let r = 0; r < 1 << inputs.length; r++) {
 		const bits = inputs.map((_, i) => r >> inputs.length - 1 - i & 1);
-		const v = evaluate(d, Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]])));
+		const v = evaluate$1(d, Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]])));
 		rows.push({
 			in: bits,
 			out: outputs.map((o) => o.kind === "DISPLAY" ? displayValue(o, v) : v.nodes.get(o.id) ?? "X")
@@ -28882,7 +28882,7 @@ function compareDiagramToTask(d, task) {
 	const mismatches = [];
 	task.rows.forEach((want, row) => {
 		const bits = rowBits(task, row);
-		const v = evaluate(d, Object.fromEntries(task.inputs.map((name, i) => [inputs.get(name).id, bits[i]])));
+		const v = evaluate$1(d, Object.fromEntries(task.inputs.map((name, i) => [inputs.get(name).id, bits[i]])));
 		const actual = task.outputs.map((name, k) => {
 			const b = isDisplayOutput(task, k) ? displayValue(sinks.get(name), v) : v.nodes.get(sinks.get(name).id) ?? "X";
 			return b === "X" ? "?" : String(b);
@@ -31213,6 +31213,240 @@ function checkAgainstTask(task, circuit) {
 		inputs: task.inputs,
 		outputs: task.outputs,
 		mapping: mappingText(io, bindings)
+	};
+}
+//#endregion
+//#region src/logic/expression.ts
+/** 從文件複製來的全形字先換成一般的字（一個字換一個字，位置不變）。 */
+var FULL_WIDTH = {
+	"＝": "=",
+	"（": "(",
+	"）": ")",
+	"＋": "+",
+	"　": " "
+};
+var OPS = {
+	"'": "post-not",
+	"’": "post-not",
+	"′": "post-not",
+	"!": "pre-not",
+	"~": "pre-not",
+	"¬": "pre-not",
+	"*": "and",
+	"·": "and",
+	"⋅": "and",
+	"&": "and",
+	"∧": "and",
+	".": "and",
+	"+": "or",
+	"|": "or",
+	"∨": "or",
+	"⊕": "xor",
+	"^": "xor",
+	"(": "(",
+	")": ")"
+};
+var ExpressionError = class extends Error {};
+/** 把一行的式子（從 offset 開始）切成記號；col 是這一行的第幾個字（從 1 開始）。 */
+function tokenize(text, offset, line) {
+	const tokens = [];
+	let i = 0;
+	while (i < text.length) {
+		const c = text[i];
+		const col = offset + i + 1;
+		if (/\s/.test(c)) i++;
+		else if (/[A-Za-z]/.test(c)) {
+			let j = i + 1;
+			while (j < text.length && /[0-9]/.test(text[j])) j++;
+			tokens.push({
+				kind: "var",
+				name: text.slice(i, j),
+				col,
+				text: text.slice(i, j)
+			});
+			i = j;
+		} else if (c === "0" || c === "1") {
+			tokens.push({
+				kind: "const",
+				value: c === "1" ? 1 : 0,
+				col,
+				text: c
+			});
+			i++;
+		} else if (OPS[c]) {
+			tokens.push({
+				kind: "op",
+				op: OPS[c],
+				col,
+				text: c
+			});
+			i++;
+		} else throw new ExpressionError(`第 ${line} 行第 ${col} 個字：看不懂「${c}」`);
+	}
+	return tokens;
+}
+/** 遞迴下降：or → xor → and（含連寫）→ 反相 → 變數、常數、括號。 */
+function parseLine(tokens, line) {
+	let pos = 0;
+	const peek = () => tokens[pos];
+	const isOp = (t, op) => t?.kind === "op" && t.op === op;
+	const missingAfter = () => {
+		const prev = tokens[pos - 1];
+		return new ExpressionError(prev ? `第 ${line} 行：${prev.text} 後面少了東西` : `第 ${line} 行：= 後面少了式子`);
+	};
+	const binary = (kind, next) => {
+		const args = [next()];
+		while (isOp(peek(), kind)) {
+			pos++;
+			args.push(next());
+		}
+		return args.length === 1 ? args[0] : {
+			kind,
+			args
+		};
+	};
+	/** 下一個記號可以開始一個因子（連寫的 AND）。 */
+	const startsFactor = (t) => t !== void 0 && (t.kind !== "op" || t.op === "(" || t.op === "pre-not");
+	const andExpr = () => {
+		const args = [unary()];
+		for (;;) if (isOp(peek(), "and")) {
+			pos++;
+			args.push(unary());
+		} else if (startsFactor(peek())) args.push(unary());
+		else break;
+		return args.length === 1 ? args[0] : {
+			kind: "and",
+			args
+		};
+	};
+	const unary = () => {
+		if (isOp(peek(), "pre-not")) {
+			pos++;
+			return {
+				kind: "not",
+				arg: unary()
+			};
+		}
+		let e = primary();
+		while (isOp(peek(), "post-not")) {
+			pos++;
+			e = {
+				kind: "not",
+				arg: e
+			};
+		}
+		return e;
+	};
+	const primary = () => {
+		const t = peek();
+		if (!t) throw missingAfter();
+		if (t.kind === "var") {
+			pos++;
+			return {
+				kind: "var",
+				name: t.name
+			};
+		}
+		if (t.kind === "const") {
+			pos++;
+			return {
+				kind: "const",
+				value: t.value
+			};
+		}
+		if (t.op === "(") {
+			pos++;
+			const inner = orExpr();
+			if (!isOp(peek(), ")")) {
+				if (peek()) throw new ExpressionError(`第 ${line} 行第 ${peek().col} 個字：看不懂「${peek().text}」`);
+				throw new ExpressionError(`第 ${line} 行第 ${t.col} 個字：括號沒有關起來`);
+			}
+			pos++;
+			return inner;
+		}
+		if (t.op === ")") throw new ExpressionError(`第 ${line} 行第 ${t.col} 個字：多了一個「)」`);
+		throw new ExpressionError(`第 ${line} 行第 ${t.col} 個字：「${t.text}」前面少了東西`);
+	};
+	const orExpr = () => binary("or", () => binary("xor", andExpr));
+	if (tokens.length === 0) throw new ExpressionError(`第 ${line} 行：= 後面少了式子`);
+	const e = orExpr();
+	const extra = peek();
+	if (extra) throw new ExpressionError(isOp(extra, ")") ? `第 ${line} 行第 ${extra.col} 個字：多了一個「)」` : `第 ${line} 行第 ${extra.col} 個字：看不懂「${extra.text}」`);
+	return e;
+}
+function variablesOf(e, out) {
+	if (e.kind === "var") out.add(e.name);
+	else if (e.kind === "not") variablesOf(e.arg, out);
+	else if (e.kind !== "const") for (const a of e.args) variablesOf(a, out);
+	return out;
+}
+var collator$1 = new Intl.Collator("en", { numeric: true });
+/** 讀好幾行布林式；輸入是所有變數依字母排序（A2 在 A10 前面）。 */
+function parseExpressions(text) {
+	const filled = [...text].map((c) => FULL_WIDTH[c] ?? c).join("").split(/\r?\n/).map((l, i) => ({
+		text: l,
+		line: i + 1
+	})).filter((l) => l.text.trim() !== "");
+	if (filled.length === 0) return {
+		ok: false,
+		reason: "先輸入布林式，例如 X = AB + A'C"
+	};
+	try {
+		let unnamed = 0;
+		const outputs = filled.map(({ text: l, line }) => {
+			const eq = l.indexOf("=");
+			if (eq >= 0 && l.indexOf("=", eq + 1) >= 0) throw new ExpressionError(`第 ${line} 行：只能有一個 =`);
+			const name = eq >= 0 ? l.slice(0, eq).trim() : filled.length === 1 ? "F" : `F${++unnamed}`;
+			if (eq >= 0 && name === "") throw new ExpressionError(`第 ${line} 行：要寫成「輸出名稱 = 式子」`);
+			const offset = eq >= 0 ? eq + 1 : 0;
+			return {
+				name,
+				expr: parseLine(tokenize(l.slice(offset), offset, line), line)
+			};
+		});
+		const vars = /* @__PURE__ */ new Set();
+		for (const o of outputs) variablesOf(o.expr, vars);
+		return {
+			ok: true,
+			outputs,
+			inputs: [...vars].sort(collator$1.compare)
+		};
+	} catch (err) {
+		if (err instanceof ExpressionError) return {
+			ok: false,
+			reason: err.message
+		};
+		throw err;
+	}
+}
+function evaluate(e, env) {
+	switch (e.kind) {
+		case "var": return env.get(e.name) ?? 0;
+		case "const": return e.value;
+		case "not": return evaluate(e.arg, env) === 1 ? 0 : 1;
+		case "and": return e.args.every((a) => evaluate(a, env) === 1) ? 1 : 0;
+		case "or": return e.args.some((a) => evaluate(a, env) === 1) ? 1 : 0;
+		case "xor": return e.args.reduce((n, a) => n + evaluate(a, env), 0) % 2;
+	}
+}
+/** 用布林式建立題目：每個輸出逐列算出 0 / 1。名稱、個數的檢查和建立題目一樣。 */
+function taskFromExpressions(text) {
+	const parsed = parseExpressions(text);
+	if (!parsed.ok) return parsed;
+	const made = createTask(parsed.inputs, parsed.outputs.map((o) => o.name));
+	if (!made.ok) return made;
+	const task = made.task;
+	const rows = task.rows.map((_, r) => {
+		const bits = rowBits(task, r);
+		const env = new Map(task.inputs.map((name, i) => [name, bits[i]]));
+		return parsed.outputs.map((o) => evaluate(o.expr, env));
+	});
+	return {
+		ok: true,
+		task: {
+			...task,
+			rows
+		}
 	};
 }
 //#endregion
@@ -34809,11 +35043,12 @@ function taskSummary(task) {
 function taskSet(f, args) {
 	const modes = [
 		args.inputs !== void 0 || args.outputs !== void 0,
+		args.expressions !== void 0,
 		args.from_diagram === true,
 		args.clear === true
 	].filter(Boolean).length;
-	if (modes > 1) return fail("inputs / outputs、from_diagram、clear 只能選一種");
-	if (modes === 0) return fail("要給 inputs 與 outputs（直接寫題目）、from_diagram: true（用邏輯圖的真值表）或 clear: true（刪除題目）");
+	if (modes > 1) return fail("inputs / outputs、expressions、from_diagram、clear 只能選一種");
+	if (modes === 0) return fail("要給 inputs 與 outputs（直接寫題目）、expressions（布林式）、from_diagram: true（用邏輯圖的真值表）或 clear: true（刪除題目）");
 	if (args.clear) {
 		if (!f.logic.task) return { text: "檔案裡沒有題目" };
 		return {
@@ -34826,7 +35061,10 @@ function taskSet(f, args) {
 	}
 	let made;
 	let how;
-	if (args.from_diagram) {
+	if (args.expressions !== void 0) {
+		made = taskFromExpressions(args.expressions);
+		how = "用布林式建立題目";
+	} else if (args.from_diagram) {
 		if (f.logic.nodes.length === 0) return fail("檔案裡還沒有邏輯圖；用 logic_set 寫入，或用 inputs / outputs 直接寫題目");
 		made = taskFromDiagram(f.logic);
 		how = "用邏輯圖的真值表建立題目";
@@ -35265,14 +35503,16 @@ var output = object({
 server.registerTool("task_set", {
 	title: "寫入真值表題目",
 	description: [
-		"寫入（取代）電路檔裡的真值表題目，邏輯圖不動。三種用法選一種：",
+		"寫入（取代）電路檔裡的真值表題目，邏輯圖不動。四種用法選一種：",
 		"inputs + outputs 直接寫題目（輸入最多 6 個、輸出最多 8 個；每一列的輸入照二進位從全 0 數到全 1，第一個輸入是最高位元）；",
+		"expressions 用布林式建立（例如 \"X = AB + A'C\"，每行一個輸出；A' 是反相、連寫是 AND、+ 是 OR、⊕ 或 ^ 是 XOR；輸入依字母排序）；",
 		"from_diagram: true 用檔案裡邏輯圖的真值表建立；clear: true 刪除題目。"
 	].join(""),
 	inputSchema: {
 		file,
 		inputs: array(string()).optional().describe("輸入名稱，第一個是最高位元，例如 [\"A\", \"B\", \"C\"]"),
 		outputs: array(output).optional().describe("每個輸出一個物件，例如 [{ \"name\": \"X\", \"ones\": [3, 5, 6, 7] }]"),
+		expressions: string().optional().describe("布林式，每行一個輸出，例如 \"X = AB + A'C\\nY = A ⊕ B\""),
 		from_diagram: boolean().optional().describe("用檔案裡邏輯圖的真值表建立題目"),
 		clear: boolean().optional().describe("刪除題目")
 	}
