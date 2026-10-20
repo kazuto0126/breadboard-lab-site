@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.19（commit 6e600e3）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.20（commit a31033b）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process$1 from "node:process";
@@ -27619,7 +27619,7 @@ function setLabel(circuit, id, index, text) {
 		};
 	});
 }
-/** 手動接線：兩孔之間的一條直線導線（可以斜）。 */
+/** 手動接線：兩孔之間的一條直線導線（子專案 39 起只能水平或垂直，由 straightWireProblem 把關）。 */
 function addWire$1(circuit, start, end, color) {
 	const id = nextWireId(circuit);
 	const a = {
@@ -29844,6 +29844,21 @@ function checkWires(circuit, index, report) {
 	const endsAt = /* @__PURE__ */ new Map();
 	for (const w of circuit.wires) for (const p of [w.start, w.end]) pushTo(endsAt, nodeIdOf(p), w.id);
 	for (const w of circuit.wires) {
+		const segments = wireSegments(w, lattice);
+		if (segments.length > 1) report({
+			code: "WIRE_BENT",
+			severity: "error",
+			message: `導線 ${w.id} 在一條線裡轉彎：要轉彎請分成兩條直線`,
+			wireIds: [w.id],
+			points: [w.start, w.end]
+		});
+		else if (segments.some((s) => s.a.x !== s.b.x && s.a.y !== s.b.y)) report({
+			code: "WIRE_DIAGONAL",
+			severity: "error",
+			message: `導線 ${w.id} 是斜的：導線只能水平或垂直，要轉彎請分成兩條`,
+			wireIds: [w.id],
+			points: [w.start, w.end]
+		});
 		const issues = pathIssues(w, isOnBoard, lattice);
 		if (issues.length > 0) report({
 			code: "WIRE_PATH_INVALID",
@@ -29908,6 +29923,16 @@ function checkWires(circuit, index, report) {
 		wireIds,
 		points
 	});
+	for (const x of analyzeWireInteractions(circuit.wires, lattice).crossings) {
+		const at = parseNodeId(x.nodeId);
+		report({
+			code: "WIRE_CROSSING",
+			severity: "error",
+			message: `導線 ${x.wireIds[0]} 與 ${x.wireIds[1]} 交叉（在 ${holeLabel$1(index, at)}）`,
+			wireIds: [...x.wireIds],
+			points: [at]
+		});
+	}
 }
 function checkElectrical(index, nets, report) {
 	const byPin = netByPin(nets);
@@ -30208,7 +30233,8 @@ function mergeConfig(overrides) {
 //#region src/core/routing/legality.ts
 /**
 * 獨立於佈線器的檢查（規格 2026-10-10 routing-standard 第 3 節）：任何一項不通過，autoRoute 就不能輸出那個 Net 的線。
-* 每條線是水平或垂直的直線；兩端插在這個 Net 的終端排或空的五孔排（轉接排）；一孔一線；不經過元件腳、本體、線端；不重疊；連接關係不變。
+* 每條線是水平或垂直的直線；兩端插在這個 Net 的終端排或空的五孔排（轉接排）；一孔一線；不經過元件腳、本體、線端；不重疊；
+* 子專案 39：不交叉；連接關係不變。
 */
 function checkRoutingLegality(circuit, wires) {
 	const index = indexCircuit(circuit);
@@ -30264,15 +30290,20 @@ function checkRoutingLegality(circuit, wires) {
 		});
 	}
 	const netOfWire = new Map(wires.map((w) => [w.id, w.netId]));
-	for (const o of analyzeWireInteractions(wires, lattice).overlaps) {
-		const netIds = [...new Set(o.wireIds.map((id) => netOfWire.get(id)).filter((n) => n !== void 0))].sort(compareIds);
-		out.push({
-			code: "OVERLAP",
-			wireIds: [...o.wireIds],
-			netIds,
-			detail: o.nodeId
-		});
-	}
+	const netsOf = (ids) => [...new Set(ids.map((id) => netOfWire.get(id)).filter((n) => n !== void 0))].sort(compareIds);
+	const interactions = analyzeWireInteractions(wires, lattice);
+	for (const o of interactions.overlaps) out.push({
+		code: "OVERLAP",
+		wireIds: [...o.wireIds],
+		netIds: netsOf(o.wireIds),
+		detail: o.nodeId
+	});
+	for (const x of interactions.crossings) out.push({
+		code: "CROSSING",
+		wireIds: [...x.wireIds],
+		netIds: netsOf(x.wireIds),
+		detail: x.nodeId
+	});
 	for (const netId of mismatchedNets(index, reference, wires)) out.push({
 		code: "NET_MISMATCH",
 		wireIds: wires.filter((w) => w.netId === netId).map((w) => w.id),
@@ -31532,8 +31563,9 @@ function isFreeHoleWith(occ, p) {
 }
 /**
 * 規格（2026-10-10 straight-wires）第 1 節：手動直線（新拉的線、拖曳端點後的線）合不合法；不合法時回傳第一個原因。
-* 一孔多線可以；端點不能是元件腳或本體；線不能和別條線重疊，不能經過元件腳、本體、別條線的端點；
+* 一孔多線可以；端點不能是元件腳或本體；線不能和別條線重疊，不能經過元件腳、本體（例如 IC）、別條線的端點；
 * 端點也不能落在別條線經過的孔上（那條線就會變成經過障礙）。ignoreWireId：拖曳端點時忽略被移動的那條線。
+* 子專案 39（規格 2026-10-20 wiring-rules）：只能水平或垂直（轉彎要分成兩條），也不能和別條線十字交叉。MCP 的 add_wire 也用這個檢查。
 */
 function straightWireProblem(circuit, start, end, ignoreWireId) {
 	const index = indexCircuit(circuit);
@@ -31551,6 +31583,9 @@ function straightWireProblem(circuit, start, end, ignoreWireId) {
 	}
 	const lattice = buildLattice(circuit.boards);
 	if (lattice.groupOf.get(start.boardId) !== lattice.groupOf.get(end.boardId)) return { kind: "other-group" };
+	const a = latticeOf(lattice, start);
+	const b = latticeOf(lattice, end);
+	if (a && b && a.x !== b.x && a.y !== b.y) return { kind: "diagonal" };
 	const probe = {
 		id: "__new",
 		color: "",
@@ -31566,6 +31601,15 @@ function straightWireProblem(circuit, start, end, ignoreWireId) {
 		kind: "overlap",
 		wireId: w.id
 	};
+	for (const w of others) for (const s of wireSegments(w, lattice)) {
+		const x = segmentCrossing(mine, s);
+		const at = x && pointAt(lattice, Math.round(x.x), Math.round(x.y));
+		if (at) return {
+			kind: "crossing",
+			wireId: w.id,
+			point: at
+		};
+	}
 	const ends = new Set(others.flatMap((w) => [nodeIdOf(w.start), nodeIdOf(w.end)]));
 	for (const p of cellsUnder(probe, lattice)) {
 		const id = nodeIdOf(p);
@@ -31592,8 +31636,10 @@ function straightProblemText(circuit, problem) {
 		case "same-hole": return "起點和終點是同一個孔";
 		case "pin": return `導線不能接在元件腳或被元件蓋住的孔（${label(problem.point)}）`;
 		case "other-group": return "兩端要在同一塊板，或貼在一起的板子上";
-		case "obstacle": return `直線不能經過元件或其他導線的端點（經過 ${label(problem.point)}）`;
+		case "diagonal": return "導線只能水平或垂直，不能斜著拉；要轉彎請分成兩條線（轉角接在同一排相通的孔）";
+		case "obstacle": return `導線不能跨過元件（例如 IC）或經過其他導線的端點（經過 ${label(problem.point)}）`;
 		case "overlap": return `直線不能和導線 ${problem.wireId} 重疊`;
+		case "crossing": return `導線不能和導線 ${problem.wireId} 交叉（在 ${label(problem.point)}）`;
 		case "covered": return `${label(problem.point)} 上面有導線 ${problem.wireId} 經過，不能接在這裡`;
 	}
 }
@@ -31863,19 +31909,75 @@ function railHoles(circuit, boardId, rail, x, exclude = []) {
 function railHole(circuit, boardId, rail, x, exclude = []) {
 	return railHoles(circuit, boardId, rail, x, exclude)[0] ?? null;
 }
+/** 建議的第一條線（還沒真的接上；放進電路裡，用來檢查第二條線會不會和它衝突）。 */
+var suggested = (a, b) => ({
+	id: "__suggested__",
+	color: "",
+	source: "manual",
+	straight: true,
+	start: a,
+	end: b,
+	path: [a, b]
+});
 /**
-* 從 point 那一排的空孔拉一條直線到軌上的空孔：靠近軌的孔先試、軌上 x 近的先試，直線不能經過障礙（手動接線的規則）。
-* 找不到時回傳 null。
+* 從 point 那一排的空孔拉線到軌上的空孔：靠近軌的孔先試、軌上 x 近的先試，線要符合手動接線的規則。
+* 子專案 39（規格 2026-10-20 wiring-rules）：線只能水平或垂直、不能交叉、不能跨過 IC。一條直線接不到時（例如中間隔著 IC），
+* 先橫著接到旁邊一排空的孔（左右 4 欄內），再從那一排直的接到軌，挑總長最短的。找不到時回傳 null。
 */
 function wireToRail(circuit, point, rail, exclude = []) {
 	const holes = freeHolesInGroup(circuit, point);
 	const ordered = (railsNear(circuit, point.boardId, rail.endsWith("+") ? "+" : "-", point.y).find((r) => r.rail === rail)?.y ?? 0) < point.y ? holes : [...holes].reverse();
-	for (const from of ordered) for (const to of railHoles(circuit, point.boardId, rail, from.x, exclude).slice(0, 8)) if (!straightWireProblem(circuit, from, to)) return {
-		from,
-		to,
-		path: [from, to]
-	};
-	return null;
+	const toRail = (c, from) => railHoles(c, from.boardId, rail, from.x, exclude).slice(0, 8).find((to) => !straightWireProblem(c, from, to)) ?? null;
+	for (const from of ordered) {
+		const to = toRail(circuit, from);
+		if (to) return {
+			from,
+			to,
+			wires: [[from, to]]
+		};
+	}
+	let best = null;
+	let bestLength = Infinity;
+	for (const from of ordered) for (const dx of [
+		-1,
+		1,
+		-2,
+		2,
+		-3,
+		3,
+		-4,
+		4
+	]) {
+		const mid = {
+			boardId: from.boardId,
+			x: from.x + dx,
+			y: from.y
+		};
+		if (!groupIdAt(circuit, mid) || !groupIsEmpty(circuit, mid) || straightWireProblem(circuit, from, mid)) continue;
+		const withFirst = {
+			...circuit,
+			wires: [...circuit.wires, suggested(from, mid)]
+		};
+		for (const via of freeHolesInGroup(withFirst, mid)) {
+			const to = toRail(withFirst, via);
+			const length = Math.abs(dx) + (to ? Math.abs(to.y - via.y) + Math.abs(to.x - via.x) : 0);
+			if (to && length < bestLength) {
+				best = {
+					from,
+					to,
+					wires: [[from, mid], [via, to]]
+				};
+				bestLength = length;
+			}
+		}
+	}
+	return best;
+}
+/** 子專案 39：WirePlan 的那一步怎麼說（一條線，或轉彎的兩條線）；fromText 是「從」後面的說法（英文開頭時前面加空白），lead / tail 接在前後。 */
+function wirePlanStep(plan, fromText, railText, lead = "", tail = "") {
+	if (plan.wires.length === 1) return step(`${lead}從${fromText}的空孔 {0}，拉一條線到${railText} {1}${tail}。`, plan.from, plan.to);
+	const [[a, b], [c, d]] = plan.wires;
+	return step(`${lead}從${fromText}的空孔 {0} 拉一條線到旁邊空的一排 {1}，再從那一排的 {2} 拉一條線到${railText} {3}${tail}。`, a, b, c, d);
 }
 function step(text, ...holes) {
 	return {
@@ -31964,6 +32066,18 @@ var ISSUE_TEXT = {
 	WIRE_OVERLAP: {
 		why: "兩條線在板上疊在同一段，實際上插不下，也很難看出誰接誰。",
 		fix: "刪掉其中一條改走別的路，或按「AI 標準佈線」重新排。"
+	},
+	WIRE_DIAGONAL: {
+		why: "導線只能水平或垂直（子專案 39 的接線規則）：斜的線在實體麵包板上不好插，也不好對照。",
+		fix: "刪掉這條線，改成水平或垂直的線；要轉彎就分成兩條，轉角接在同一排相通的孔。或按「AI 標準佈線」。"
+	},
+	WIRE_BENT: {
+		why: "一條線不能轉彎（子專案 39 的接線規則）：實體跳線是一段直的，要轉彎就要用兩條線。",
+		fix: "刪掉這條線，改成兩條直線，轉角接在同一排相通的孔。或按「AI 標準佈線」。"
+	},
+	WIRE_CROSSING: {
+		why: "兩條線不能十字交叉（子專案 39 的接線規則）：交叉的地方疊在一起，很難看出誰接誰，也容易插錯。",
+		fix: "刪掉其中一條改走別的路（繞到旁邊空的一排再轉彎），或按「AI 標準佈線」重新排。"
 	},
 	IC_PIN_SHORT: {
 		why: "IC 的兩隻腳插在同一條導通排上，等於被接在一起（通常是 IC 沒有跨在中間凹槽上）。",
@@ -32063,12 +32177,15 @@ function explainLedNoResistor(circuit, issue) {
 				...withResistor,
 				wires: withResistor.wires.filter((x) => x.id !== w.id)
 			};
-			const target = freeHolesInGroup(without, spot.far).filter((p) => !used.some((u) => samePoint(u, p))).sort((a, b) => distance(a, other) - distance(b, other) || a.y - b.y || a.x - b.x).find((p) => !straightWireProblem(without, p, other));
-			if (!target) return fallback;
-			used.push(target);
-			steps.push(step(`把 ${w.id} 插在 {0} 的那一端拔起來，改插到 {1}。`, end, target));
+			const targets = freeHolesInGroup(without, spot.far).filter((p) => !used.some((u) => samePoint(u, p))).sort((a, b) => distance(a, other) - distance(b, other) || a.y - b.y || a.x - b.x);
+			const target = targets.find((p) => !straightWireProblem(without, p, other));
+			const moved = target ? [target, other] : targets.flatMap((p) => freeHolesInGroup(without, other).filter((q) => q.x === p.x || q.y === p.y).map((q) => [p, q])).find(([p, q]) => !straightWireProblem(without, p, q)) ?? null;
+			if (!moved) return fallback;
+			used.push(moved[0]);
+			if (samePoint(moved[1], other)) steps.push(step(`把 ${w.id} 插在 {0} 的那一端拔起來，改插到 {1}。`, end, moved[0]));
+			else steps.push(step(`把 ${w.id} 拔起來，改成從 {0} 接到 {1}。`, moved[0], moved[1]));
 			removeWireIds.push(w.id);
-			wires.push([target, other]);
+			wires.push(moved);
 		}
 		return explanation(why, steps, wires, removeWireIds);
 	}
@@ -32080,8 +32197,8 @@ function explainLedNoResistor(circuit, issue) {
 		const at = railHole(withResistor, spot.far.boardId, rail, 0, [plan.to]);
 		if (at) steps.push(step(`先從元件庫放一個 GND 到${RAIL_TEXT[rail]}，例如 {0}。`, at));
 	}
-	steps.push(step(`從電阻另一腳那一排的空孔 {0}，拉一條線到${RAIL_TEXT[rail]} {1}。`, plan.from, plan.to));
-	return explanation(why, steps, [plan.path]);
+	steps.push(wirePlanStep(plan, "電阻另一腳那一排", RAIL_TEXT[rail]));
+	return explanation(why, steps, plan.wires.map(([a, b]) => [a, b]));
 }
 //#endregion
 //#region src/editor/explain/short.ts
@@ -32139,10 +32256,10 @@ function connectToRail(circuit, hit, polarity, lead = "", tail = "") {
 			from: null
 		};
 	}
-	steps.push(step(`${lead}從 ${pinLabel(hit)}那一排的空孔 {0}，拉一條線到${RAIL_TEXT[rail]} {1}${tail}。`, plan.from, plan.to));
+	steps.push(wirePlanStep(plan, ` ${pinLabel(hit)}那一排`, RAIL_TEXT[rail], lead, tail));
 	return {
 		steps,
-		wires: [plan.path],
+		wires: plan.wires.map(([a, b]) => [a, b]),
 		from: plan.from
 	};
 }
@@ -32319,7 +32436,8 @@ function holeRule(circuit) {
 	"【AI 標準佈線的規則】",
 	"每條線都是水平或垂直的直線，兩端插在孔上；要轉彎時停在一排相通的孔（轉接排），下一條線從同一排的另一個孔出發。",
 	"轉接排只用空的五孔排或這個 Net 自己的排。每個孔最多插一條線；線不能經過元件腳、元件本體、別條線的端點，也不能和別條線重疊。",
-	"優先順序：最少交叉，其次線的條數少，再其次總長度短。元件的位置不會被移動（除非學生選了「可以移動 IC」）。"
+	"接線規則：每條線只能水平或垂直，要轉彎就分成兩條（轉角接在同一排相通的孔）；不能重疊、不能交叉、不能跨過 IC。",
+	"優先順序：先把所有連線接完（不能交叉），其次線的條數少，再其次總長度短。元件的位置不會被移動（除非學生選了「可以移動 IC」）。"
 ].join("\n");
 var NET_KIND = {
 	power: "電源",
@@ -32844,10 +32962,15 @@ function conflictCost(params, count, history) {
 function endCost(state, cell, params) {
 	return conflictCost(params, state.ends[cell].length + state.lines[cell * 2].length + state.lines[cell * 2 + 1].length, state.histEnd[cell]);
 }
-/** 線從 cell 上方經過（方向 o）：別條線的端點、同方向的線是衝突；垂直的線是交叉；別的 Net 的終端空孔加擁擠成本。 */
+/**
+* 線從 cell 上方經過（方向 o）：別條線的端點、同方向的線是衝突；垂直的線是交叉；別的 Net 的終端空孔加擁擠成本。
+* 子專案 39（規格 2026-10-20 wiring-rules）：交叉不准：嚴格模式不能交叉；協商時先算很貴的成本，之後當成衝突排開。
+*/
 function passCost(problem, state, netId, cell, o, params) {
+	const crossing = state.lines[cell * 2 + (1 - o)].length;
+	if (crossing > 0 && params.overlap.kind === "hard") return Infinity;
 	let cost = conflictCost(params, state.ends[cell].length + state.lines[cell * 2 + o].length, state.histLine[cell * 2 + o]);
-	cost += params.weights.crossing * state.lines[cell * 2 + (1 - o)].length;
+	if (crossing > 0) cost += conflictCost(params, crossing, state.histLine[cell * 2 + (1 - o)]);
 	const g = problem.groupAt[cell];
 	if (problem.terminalHole[cell] && !(g && state.owns(netId, g))) cost += params.weights.congestion;
 	return cost;
@@ -33106,6 +33229,10 @@ var StraightState = class {
 				cell: c,
 				o
 			});
+			if (this.lines[c * 2].length > 0 && this.lines[c * 2 + 1].length > 0) out.push({
+				kind: "cross",
+				cell: c
+			});
 		}
 		for (const [group, m] of [...this.viaUse].sort((x, y) => x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0)) if (m.size > 1) out.push({
 			kind: "via",
@@ -33123,13 +33250,17 @@ var StraightState = class {
 			...this.lines[x.cell * 2 + 1]
 		]);
 		else if (x.kind === "line") add(this.lines[x.cell * 2 + x.o]);
+		else if (x.kind === "cross") add([...this.lines[x.cell * 2], ...this.lines[x.cell * 2 + 1]]);
 		else for (const id of this.viaUse.get(x.group)?.keys() ?? []) nets.add(id);
 		return nets;
 	}
 	bumpHistory(conflicts, increment) {
 		for (const x of conflicts) if (x.kind === "end" || x.kind === "pass") this.histEnd[x.cell] += increment;
 		else if (x.kind === "line") this.histLine[x.cell * 2 + x.o] += increment;
-		else this.histVia.set(x.group, (this.histVia.get(x.group) ?? 0) + increment);
+		else if (x.kind === "cross") {
+			this.histLine[x.cell * 2] += increment;
+			this.histLine[x.cell * 2 + 1] += increment;
+		} else this.histVia.set(x.group, (this.histVia.get(x.group) ?? 0) + increment);
 	}
 };
 //#endregion
@@ -33770,14 +33901,21 @@ function drivers(d) {
 		return [`${w.to.node}#${w.to.pin}`, k === "HIGH" ? "VCC" : k === "LOW" ? "GND" : signalOf(w.from, w.fromPin)];
 	}));
 }
-/** 規格第 3 節的拆法：OR / NOR 用 2 輸入 OR 串起來，NAND 前面先用 AND，最後一級才反相。 */
+/**
+* 規格第 3 節的拆法：OR / NOR 用 2 輸入 OR 串起來，NAND 前面先用 AND，最後一級才反相。
+* 子專案 38：好幾個 OR / NOR 都用到同一對訊號時，那一對只做一個 2 輸入 OR（見 shareOrPairs）；沒有可以共用的時候拆法和以前一樣。
+*/
 function decompose(d) {
 	const driver = drivers(d);
-	const units = [];
-	for (const node of d.nodes) {
-		if (!isGate(node.kind)) continue;
+	const gates = d.nodes.filter((node) => isGate(node.kind));
+	const lists = new Map(gates.map((node) => {
 		const n = node.kind === "NOT" ? 1 : node.kind === "XOR" ? 2 : node.inputs ?? 2;
-		const xs = Array.from({ length: n }, (_, i) => driver.get(`${node.id}#${i}`) ?? "");
+		return [node.id, Array.from({ length: n }, (_, i) => driver.get(`${node.id}#${i}`) ?? "")];
+	}));
+	const units = shareOrPairs(gates, lists);
+	for (const node of gates) {
+		const xs = lists.get(node.id);
+		const n = xs.length;
 		let k = 0;
 		const temp = () => `${node.id}~${++k}`;
 		/** 用 2 輸入的 OR 把 xs 併成一個訊號，最後一級輸出到 out。 */
@@ -33855,6 +33993,62 @@ function decompose(d) {
 		}
 	}
 	return units;
+}
+/**
+* 子專案 38（規格 2026-10-19 shared-gates-one-row）：3、4 輸入的 OR（與 NOR 前面的 OR）裡，出現在最多閘的一對訊號只做一個 2 輸入 OR，
+* 那些閘的輸入換成它的輸出（已經有一個 2 輸入 OR 剛好是那一對時直接用它）；一直做到沒有一對出現在 2 個以上的閘。
+* 例如 X = E + F + G + H、Y = C + D + G + H：G + H 只做一次，9 個 2 輸入 OR 變 8 個（2 片 74LS32）。
+* 共用的一對一定是那個閘自己的輸入，所以不會產生迴圈。會改 lists（每個閘拆開前的輸入），回傳新增的 2 輸入 OR。
+*/
+function shareOrPairs(gates, lists) {
+	const shared = [];
+	const reducible = (node) => (node.kind === "OR" || node.kind === "NOR") && lists.get(node.id).length >= 3;
+	const SEP = "\0";
+	for (;;) {
+		const count = /* @__PURE__ */ new Map();
+		const provider = /* @__PURE__ */ new Map();
+		for (const node of gates) {
+			const list = lists.get(node.id);
+			if (node.kind === "OR" && list.length === 2 && list[0] !== list[1]) {
+				const key = [...list].sort().join(SEP);
+				if (!provider.has(key)) {
+					provider.set(key, node.id);
+					count.set(key, (count.get(key) ?? 0) + 1);
+				}
+				continue;
+			}
+			if (!reducible(node)) continue;
+			const uniq = [...new Set(list)];
+			for (let i = 0; i < uniq.length; i++) for (let j = i + 1; j < uniq.length; j++) {
+				const key = [uniq[i], uniq[j]].sort().join(SEP);
+				count.set(key, (count.get(key) ?? 0) + 1);
+			}
+		}
+		let best = null;
+		let most = 1;
+		for (const [key, c] of count) if (c > most) {
+			best = key;
+			most = c;
+		}
+		if (!best) return shared;
+		const [a, b] = best.split(SEP);
+		const signal = provider.get(best) ?? `shared~${shared.length + 1}`;
+		if (!provider.has(best)) shared.push({
+			kind: "OR2",
+			inputs: [a, b],
+			output: signal
+		});
+		for (const node of gates) {
+			if (!reducible(node)) continue;
+			const list = lists.get(node.id);
+			const ia = list.indexOf(a);
+			const ib = list.indexOf(b);
+			if (ia < 0 || ib < 0) continue;
+			const next = list.filter((_, i) => i !== ia && i !== ib);
+			next.splice(Math.min(ia, ib), 0, signal);
+			lists.set(node.id, next);
+		}
+	}
 }
 /** 從元件定義的 logic.gates 讀出每一組閘的輸入、輸出腳號。 */
 function gateSlots(defId) {
@@ -34069,6 +34263,10 @@ function simplify(input, keep) {
 }
 //#endregion
 //#region src/logic/toBreadboard.ts
+/** 子專案 38：零件清單裡開關那一項（「8 位元指撥開關 × 1」「4 位元指撥開關 × 2」「按鈕 × 3」）。 */
+function switchText(bom) {
+	return bom.switch ? `${bom.switch === "dipsw-4" ? "4" : "8"} 位元指撥開關 × ${bom.switches}` : `按鈕 × ${bom.buttons}`;
+}
 var VCC = "VCC";
 var GND = "GND";
 var BOARD_ID = "b1";
@@ -34133,15 +34331,14 @@ function toBreadboard(d, options, variant = DEFAULT_LAYOUT) {
 }
 function build(d, options, layout, variant) {
 	const eic = layout === "EIC1106";
-	const hole = (name, area) => holeOn(BOARD_ID, eic ? `${area}-${name}` : name, layout);
+	const inOneRow = !eic || variant.oneRow === true;
+	const hole = (name, area) => holeOn(BOARD_ID, eic ? `${inOneRow ? 2 : area}-${name}` : name, layout);
 	const { inputs, outputs: sinks } = sortedIo(d);
 	const outputs = sinks.filter((n) => n.kind === "OUTPUT");
 	const displays = sinks.filter((n) => n.kind === "DISPLAY");
 	const driver = drivers(d);
 	const plans = assignIcs(unitsFor(d, options));
 	const chips = d.nodes.filter((n) => n.kind === "BLOCK" && n.chip);
-	const swDef = inputs.length <= 4 ? "dipsw-4" : "dipsw-8";
-	const swPins = swDef === "dipsw-4" ? 8 : 16;
 	const components = [];
 	const netOf = {};
 	const tie = (pin, net) => netOf[pin] = net;
@@ -34162,8 +34359,14 @@ function build(d, options, layout, variant) {
 	};
 	const pullDown = options.switchTo === "vcc";
 	const uprightPulls = options.pulls === true && options.inputs !== "button";
-	const flatPull = uprightPulls && inputs.length >= 6 ? 5 : -1;
-	const pullRail = pullDown ? eic ? "P3-" : "B-" : eic ? "P2+" : "T+";
+	const splitSwitches = variant.splitSwitches === true && uprightPulls && inputs.length > 4;
+	const flatPull = uprightPulls && inputs.length >= 6 && !splitSwitches ? 5 : -1;
+	/** 每個開關接的輸入（依名稱排序；拆開時前 4 個在 SW1、其他在 SW2）。 */
+	const switches = splitSwitches ? [inputs.slice(0, 4), inputs.slice(4)] : [inputs];
+	const swDef = splitSwitches || inputs.length <= 4 ? "dipsw-4" : "dipsw-8";
+	const swPins = swDef === "dipsw-4" ? 8 : 16;
+	const switchBlocks = [];
+	const pullRail = pullDown ? !eic ? "B-" : inOneRow ? "P4-" : "P3-" : !eic ? "T+" : inOneRow ? "P3+" : "P2+";
 	const pullRow = pullDown ? "J" : "A";
 	const useButtons = options.inputs === "button";
 	const buttonIds = inputs.map((_, k) => `BTN${k + 1}`);
@@ -34179,45 +34382,52 @@ function build(d, options, layout, variant) {
 		tie(`${id}#1`, options.switchTo === "vcc" ? VCC : GND);
 		tie(`${id}#3`, node.id);
 	});
-	else blocks[1].push({
-		width: swPins / 2,
-		align: uprightPulls ? (x) => inputs.every((_, k) => k === flatPull !== railHole(pullRail, x + k)) : void 0,
-		place: (x) => {
-			components.push(comp("SW1", swDef, hole(`F${x}`, 1), {
-				board: BOARD_ID,
-				props: {
-					switchStates: Array(swPins / 2).fill(false),
-					labels: Array.from({ length: swPins / 2 }, (_, k) => inputs[k]?.name ?? "")
-				}
-			}));
-			if (!uprightPulls) return;
-			inputs.forEach((node, k) => {
-				if (k === flatPull || !railHole(pullRail, x + k)) return;
-				const id = `R${k + 1}`;
-				const at = hole(`${pullRow}${x + k}`, 1);
-				const span = Math.abs(holeOn(BOARD_ID, `${pullRail}${x + k}`, layout).y - at.y);
-				components.push(comp(id, "resistor", at, {
+	else switches.forEach((group, s) => {
+		const id = `SW${s + 1}`;
+		const first = s * 4;
+		switchBlocks.push({
+			width: swPins / 2,
+			align: uprightPulls ? (x) => group.every((_, j) => first + j === flatPull !== railHole(pullRail, x + j)) : void 0,
+			place: (x) => {
+				components.push(comp(id, swDef, hole(`F${x}`, 1), {
 					board: BOARD_ID,
-					rotation: pullDown ? 90 : 270,
-					span,
-					props: { resistance: pullDown ? 330 : 1e3 }
+					props: {
+						switchStates: Array(swPins / 2).fill(false),
+						labels: Array.from({ length: swPins / 2 }, (_, j) => group[j]?.name ?? "")
+					}
 				}));
-				tie(`${id}#1`, node.id);
-				tie(`${id}#2`, pullDown ? GND : VCC);
-			});
-		}
+				if (!uprightPulls) return;
+				group.forEach((node, j) => {
+					const k = first + j;
+					if (k === flatPull || !railHole(pullRail, x + j)) return;
+					const rid = `R${k + 1}`;
+					const at = hole(`${pullRow}${x + j}`, 1);
+					const span = Math.abs(holeOn(BOARD_ID, `${pullRail}${x + j}`, layout).y - at.y);
+					components.push(comp(rid, "resistor", at, {
+						board: BOARD_ID,
+						rotation: pullDown ? 90 : 270,
+						span,
+						props: { resistance: pullDown ? 330 : 1e3 }
+					}));
+					tie(`${rid}#1`, node.id);
+					tie(`${rid}#2`, pullDown ? GND : VCC);
+				});
+			}
+		});
+		group.forEach((node, j) => {
+			const top = `${id}#${swPins - j}`;
+			const bottom = `${id}#${j + 1}`;
+			if (options.switchTo === "vcc") {
+				tie(bottom, node.id);
+				tie(top, VCC);
+			} else {
+				tie(top, node.id);
+				tie(bottom, GND);
+			}
+		});
 	});
-	if (!useButtons) inputs.forEach((node, k) => {
-		const top = `SW1#${swPins - k}`;
-		const bottom = `SW1#${k + 1}`;
-		if (options.switchTo === "vcc") {
-			tie(bottom, node.id);
-			tie(top, VCC);
-		} else {
-			tie(top, node.id);
-			tie(bottom, GND);
-		}
-	});
+	const laterSwitches = splitSwitches && inOneRow ? switchBlocks.slice(1) : [];
+	blocks[1].push(...switchBlocks.filter((b) => !laterSwitches.includes(b)));
 	for (const plan of plans) {
 		icBlocks.push({
 			width: 7,
@@ -34389,7 +34599,7 @@ function build(d, options, layout, variant) {
 			const ledBlocks = [];
 			if (variant.leds === "straddle") {
 				const half = Math.floor(units.length / 2);
-				const chunks = variant.split && !eic && units.length >= 4 ? [units.slice(0, half), units.slice(half)] : [units];
+				const chunks = variant.split && inOneRow && units.length >= 4 ? [units.slice(0, half), units.slice(half)] : [units];
 				for (const chunk of chunks) ledBlocks.push({
 					width: chunk.length * 2,
 					place: (x) => chunk.forEach(([res, led], j) => {
@@ -34417,7 +34627,7 @@ function build(d, options, layout, variant) {
 					})
 				});
 			}
-			if (variant.split && !eic && units.length >= 4 && ledBlocks.length >= 2) {
+			if (variant.split && inOneRow && units.length >= 4 && ledBlocks.length >= 2) {
 				const before = Math.floor(ledBlocks.length / 2);
 				ledsBefore.push(...ledBlocks.slice(0, before));
 				blocks[3].push(...ledBlocks.slice(before));
@@ -34445,12 +34655,14 @@ function build(d, options, layout, variant) {
 			}))
 		});
 	}
-	if (eic) blocks[2].push(...icBlocks);
+	if (!inOneRow) blocks[2].push(...icBlocks);
 	else {
 		blocks[1] = [
 			...ledsBefore,
 			...blocks[1],
-			...icBlocks,
+			...icBlocks.slice(0, 1),
+			...laterSwitches,
+			...icBlocks.slice(1),
 			...blocks[3]
 		];
 		blocks[3] = [];
@@ -34478,15 +34690,7 @@ function build(d, options, layout, variant) {
 		const fp = resolveFootprint(c, getComponentDefinition(c.defId));
 		return [...fp.pins.map((p) => p.point), ...fp.blocked].map((p) => `${p.x},${p.y}`);
 	}));
-	const power = eic ? [[
-		"V1",
-		"vcc",
-		"P2+"
-	], [
-		"G1",
-		"gnd",
-		"P3-"
-	]] : [[
+	const power = !eic ? [[
 		"V1",
 		"vcc",
 		"T+"
@@ -34494,6 +34698,22 @@ function build(d, options, layout, variant) {
 		"G1",
 		"gnd",
 		"B-"
+	]] : inOneRow ? [[
+		"V1",
+		"vcc",
+		"P3+"
+	], [
+		"G1",
+		"gnd",
+		"P4-"
+	]] : [[
+		"V1",
+		"vcc",
+		"P2+"
+	], [
+		"G1",
+		"gnd",
+		"P3-"
 	]];
 	for (const [id, defId, rail] of power) {
 		let at = null;
@@ -34578,6 +34798,7 @@ function build(d, options, layout, variant) {
 		bom: {
 			ics,
 			switch: useButtons ? null : swDef,
+			switches: useButtons ? 0 : switches.length,
 			buttons: useButtons ? inputs.length : 0,
 			resistors: components.filter((c) => c.defId === "resistor").length,
 			leds: outputs.length,
@@ -34626,10 +34847,42 @@ var LAYOUT_VARIANTS = {
 			gap: 2,
 			leds: "pair",
 			split: true
+		},
+		{
+			gap: 2,
+			leds: "pair",
+			split: false,
+			splitSwitches: true
 		}
 	],
 	EIC1106: [
 		DEFAULT_LAYOUT,
+		{
+			gap: 3,
+			leds: "straddle",
+			split: false,
+			oneRow: true
+		},
+		{
+			gap: 2,
+			leds: "pair",
+			split: false,
+			oneRow: true
+		},
+		{
+			gap: 2,
+			leds: "pair",
+			split: false,
+			oneRow: true,
+			splitSwitches: true
+		},
+		{
+			gap: 3,
+			leds: "straddle",
+			split: false,
+			oneRow: true,
+			splitSwitches: true
+		},
 		{
 			gap: 4,
 			leds: "straddle",
@@ -34703,11 +34956,14 @@ function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
 			tried++;
 			ranked.push({
 				result,
-				routed: route(result.circuit, { placement: {
-					...power,
+				routed: route(result.circuit, {
 					timeBudgetMs: quickMs,
-					maxPasses: 1
-				} })
+					placement: {
+						...power,
+						timeBudgetMs: quickMs,
+						maxPasses: 1
+					}
+				})
 			});
 		}
 		ranked.sort((a, b) => isBetterRouting(a.routed, b.routed) ? -1 : isBetterRouting(b.routed, a.routed) ? 1 : 0);
@@ -35189,28 +35445,44 @@ function logicToBreadboard(f, args) {
 	};
 	const converted = convertAndRoute(f.logic, options);
 	if (!converted.ok) return fail(converted.reason);
+	return convertedReply(f, options, converted);
+}
+/**
+* logic_to_breadboard 的回覆與要寫入的檔案（測試時可以給假的佈線結果）。
+* 子專案 39（規格 2026-10-20 wiring-rules）：佈線沒有完成時不寫入檔案：預定的連線是元件腳之間的直線，常常是斜的、會交叉，
+* 不符合接線規則；改成說明哪幾個 Net 沒接好（接在哪些腳）。
+*/
+function convertedReply(f, options, converted) {
 	const { result: r, routed, tried } = converted;
 	const notes = [`試了 ${tried} 種擺法，用佈線最好的一種。`];
-	const circuit = routed.status === "success" ? applyRouting(r.circuit, routed) : r.circuit;
+	const done = routed.status === "success";
+	const circuit = done ? applyRouting(r.circuit, routed) : r.circuit;
 	const bom = r.bom;
 	const parts = [
 		...Object.entries(bom.ics).map(([id, n]) => `${id} × ${n}`),
-		bom.switch ? `${bom.switch === "dipsw-4" ? "4" : "8"} 位元指撥開關 × 1` : `按鈕 × ${bom.buttons}`,
+		switchText(bom),
 		`電阻 × ${bom.resistors}`,
 		`LED × ${bom.leds}`,
 		...bom.displays > 0 ? [`7 段顯示器 × ${bom.displays}（${options.display === "cc" ? "共陰極" : "共陽極"}）`] : []
 	];
+	const lines = [
+		`轉成麵包板（${bom.layout === "MB102" ? "MB-102" : "EIC-1106"}）：${parts.join("、")}。`,
+		...notes,
+		...routingSummaryText(summarizeRouting(circuit, {
+			beforeScore: analyzeCircuit(r.circuit).routing,
+			result: routed
+		}))
+	];
+	if (!done) {
+		const nets = new Map(extractNets(r.circuit).map((n) => [n.id, n]));
+		const pins = (netId) => (nets.get(netId)?.pins ?? []).map((p) => `${p.componentId} 第 ${p.pinNumber} 腳`).join("、") || "找不到接在哪些腳";
+		const missing = routed.failedNets.map((n) => `${n.netId}（${pins(n.netId)}）`).join("；");
+		lines.push(`佈線沒有完成，沒有寫入檔案：還沒接好的連線不能用斜的或交叉的線代替（每條線只能水平或垂直、不能交叉、不能跨過 IC）。沒接好的是 ${missing}。`, "可以改用 board: \"EIC1106\"、加上 / 下拉電阻或只用一種閘再轉一次。");
+		return { text: lines.join("\n") };
+	}
+	lines.push(`比對：${diagramCheckText(f.logic, circuit)}`);
 	return {
-		text: [
-			`轉成麵包板（${bom.layout === "MB102" ? "MB-102" : "EIC-1106"}）：${parts.join("、")}。`,
-			...notes,
-			...routingSummaryText(summarizeRouting(circuit, {
-				beforeScore: analyzeCircuit(r.circuit).routing,
-				result: routed
-			})),
-			...routed.status === "success" ? [] : ["佈線沒有完成：存下來的是還沒佈線的麵包板（手動接線版），可以用 auto_route 再試。"],
-			`比對：${diagramCheckText(f.logic, circuit)}`
-		].join("\n"),
+		text: lines.join("\n"),
 		file: {
 			...f,
 			circuit
@@ -35523,7 +35795,7 @@ function folderFromArgs(argv, cwd) {
 * 工具的邏輯在 src/mcp/（純函式）；這裡只負責路徑檢查、讀檔、寫檔。
 */
 /** 版本號：打包時換成建置的日期（vite.mcp.config.ts），原始碼版是 1.0.0。 */
-var VERSION = "2026.10.19";
+var VERSION = "2026.10.20";
 if (process.argv.includes("--version")) {
 	console.log(VERSION);
 	process.exit(0);
@@ -35572,6 +35844,7 @@ var server = new McpServer({
 	"Breadboard Lab：在 MB-102 / EIC-1106 麵包板上放 74LS IC、電阻、LED、指撥開關並接線，可以檢查、AI 佈線、模擬，也可以把邏輯圖轉成麵包板。",
 	`工作資料夾：${ROOT}；file 參數寫相對於它的路徑（例如 circuits/xor.json），list_files 列出裡面的電路檔。`,
 	"電路檔就是網頁「匯出 JSON」的格式；做完在網頁用「檔案 → 匯入 JSON」打開。",
+	"接線規則（一定要遵守）：每條導線只能水平或垂直的直線，不能斜；要轉彎就分成兩條線（轉角接在同一排相通的五孔排）；兩條線不能重疊，也不能交叉；線不能跨過 IC（上下、左右都不行）或經過元件腳、別條線的端點。add_wire 會拒絕不合規則的線；auto_route 與 logic_to_breadboard 接出來的線都符合這些規則。",
 	"建議流程：new_circuit → list_parts（查元件名稱與腳位）→ place_part（IC 第 1 腳放在 F 列，跨過凹槽）→ add_wire → check_circuit → auto_route → simulate。",
 	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
 	"從真值表題目開始：task_set → task_show → task_to_diagram → logic_to_breadboard → task_check。"
@@ -35616,7 +35889,7 @@ server.registerTool("circuit_summary", {
 }, async (args) => withFile(args.file, (lab) => circuitSummary(lab)));
 server.registerTool("check_circuit", {
 	title: "檢查電路",
-	description: "錯誤與警告（短路、IC 沒接電源、輸入懸空…），每一項附原因與建議的接法。",
+	description: "錯誤與警告（短路、IC 沒接電源、輸入懸空、斜的線、一條線裡轉彎、線交叉或重疊…），每一項附原因與建議的接法。",
 	inputSchema: { file }
 }, async (args) => withFile(args.file, (lab) => checkCircuit(lab)));
 server.registerTool("list_parts", {
@@ -35640,7 +35913,7 @@ server.registerTool("place_part", {
 }, async ({ file: f, ...args }) => withFile(f, (lab) => placePart(lab, args)));
 server.registerTool("add_wire", {
 	title: "接線",
-	description: "在兩個孔之間接一條直線導線。導線不能經過元件、不能和別條線重疊；不合法時說明原因。",
+	description: "在兩個孔之間接一條直線導線。只能水平或垂直，不能斜；要轉彎就分成兩條（轉角接在同一排相通的孔）；不能和別條線重疊，也不能交叉；不能跨過 IC 或經過元件腳、別條線的端點。不合規則時說明原因。",
 	inputSchema: {
 		file,
 		from: hole("起點"),
@@ -35675,7 +35948,7 @@ server.registerTool("remove", {
 }, async ({ file: f, ...args }) => withFile(f, (lab) => remove(lab, args)));
 server.registerTool("auto_route", {
 	title: "AI 標準佈線",
-	description: "重新算出只走水平 / 垂直、不重疊、不穿過元件的標準接線（保留目前接線定義的連接），回覆這次佈線的說明。",
+	description: "重新算出只走水平 / 垂直、轉彎分成兩條、不重疊、不交叉、不穿過元件的標準接線（保留目前接線定義的連接），回覆這次佈線的說明。排不完時不改檔案。",
 	inputSchema: {
 		file,
 		move_ics: boolean().optional().describe("允許搬動 IC（找更好的位置）"),
