@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.20（commit a31033b）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.23（commit 1700fce）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process$1 from "node:process";
@@ -35000,6 +35000,184 @@ function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
 	};
 }
 //#endregion
+//#region src/logic/formula.ts
+var ThroughBlock = class extends Error {};
+/** 展開後有幾個字母（共用的部分記下來，不會真的展開）。 */
+function letterCount(e, memo) {
+	const known = memo.get(e);
+	if (known !== void 0) return known;
+	const n = e.kind === "not" ? letterCount(e.arg, memo) : e.kind === "and" || e.kind === "or" || e.kind === "xor" ? e.args.reduce((sum, a) => sum + letterCount(a, memo), 0) : 1;
+	memo.set(e, n);
+	return n;
+}
+/** 優先順序：OR < XOR < AND < 反相、字母、常數。 */
+var level = (e) => e.kind === "or" ? 1 : e.kind === "xor" ? 2 : e.kind === "and" ? 3 : 4;
+/** 「輸入布林式」能讀的名稱是一個英文字母加數字；其他名稱（例如 Cin）連寫會看不出是哪幾個字，AND 改用 `·`。 */
+var needsDot = (names) => names.some((n) => !/^[A-Za-z][0-9]*$/.test(n));
+/** 式子的文字，只在需要時加括號。 */
+function exprText(e, dot) {
+	switch (e.kind) {
+		case "var": return e.name;
+		case "const": return String(e.value);
+		case "missing": return "?";
+		case "not": return level(e.arg) === 4 ? `${exprText(e.arg, dot)}'` : `(${exprText(e.arg, dot)})'`;
+		case "and": return e.args.map((a) => level(a) < 3 ? `(${exprText(a, dot)})` : exprText(a, dot)).reduce((text, part) => text === "" ? part : dot || /[A-Za-z0-9]$/.test(text) && /^[0-9]/.test(part) ? `${text}·${part}` : text + part, "");
+		case "xor": return e.args.map((a) => level(a) < 2 ? `(${exprText(a, dot)})` : exprText(a, dot)).join(" ⊕ ");
+		case "or": return e.args.map((a) => exprText(a, dot)).join(" + ");
+	}
+}
+/** 照圖從輸出往回寫；經過 IC 方塊就丟出 ThroughBlock。 */
+function reader(d) {
+	const byId = new Map(d.nodes.map((n) => [n.id, n]));
+	const driver = new Map(d.wires.map((w) => [`${w.to.node}#${w.to.pin}`, w]));
+	const pin = (node, i) => {
+		const w = driver.get(`${node.id}#${i}`);
+		return w ? source(w.from, w.fromPin) : { kind: "missing" };
+	};
+	const memo = /* @__PURE__ */ new Map();
+	const source = (id, fromPin) => {
+		const key = signalOf(id, fromPin);
+		let f = memo.get(key);
+		if (!f) memo.set(key, f = build(id, fromPin));
+		return f;
+	};
+	const build = (id, fromPin) => {
+		const node = byId.get(id);
+		if (!node) return { kind: "missing" };
+		if (node.kind === "INPUT") return {
+			kind: "var",
+			name: node.name ?? node.id
+		};
+		if (node.kind === "HIGH") return {
+			kind: "const",
+			value: 1
+		};
+		if (node.kind === "LOW") return {
+			kind: "const",
+			value: 0
+		};
+		if (node.kind === "BLOCK") throw new ThroughBlock(`${node.chip ?? "IC"}（${signalOf(id, fromPin)}）`);
+		if (!isGate(node.kind)) return { kind: "missing" };
+		const args = Array.from({ length: inputCountOf(node) }, (_, i) => pin(node, i));
+		switch (node.kind) {
+			case "NOT": return {
+				kind: "not",
+				arg: args[0]
+			};
+			case "AND":
+			case "OR":
+			case "XOR": return {
+				kind: node.kind === "AND" ? "and" : node.kind === "OR" ? "or" : "xor",
+				args
+			};
+			case "NAND": return {
+				kind: "not",
+				arg: {
+					kind: "and",
+					args
+				}
+			};
+			case "NOR": return {
+				kind: "not",
+				arg: {
+					kind: "or",
+					args
+				}
+			};
+		}
+	};
+	return (output) => pin(output, 0);
+}
+/** 化簡結果寫成式子：沒有項是 0，有一項沒有字母是 1。 */
+function sumOfProducts(n, ones, names) {
+	const terms = minimize(n, ones, []);
+	if (terms.length === 0) return {
+		kind: "const",
+		value: 0
+	};
+	const products = terms.map((t) => literalsOf(t, names));
+	if (products.some((p) => p.length === 0)) return {
+		kind: "const",
+		value: 1
+	};
+	const factor = (l) => l.negated ? {
+		kind: "not",
+		arg: {
+			kind: "var",
+			name: l.name
+		}
+	} : {
+		kind: "var",
+		name: l.name
+	};
+	const sum = products.map((p) => p.length === 1 ? factor(p[0]) : {
+		kind: "and",
+		args: p.map(factor)
+	});
+	return sum.length === 1 ? sum[0] : {
+		kind: "or",
+		args: sum
+	};
+}
+/** 每個輸出端（依名稱排序）的兩種式子；displays：圖上有 7 段顯示器（不列式子）。 */
+function diagramFormulas(d) {
+	const { inputs, outputs: sinks } = sortedIo(d);
+	const displays = sinks.some((n) => n.kind === "DISPLAY");
+	const outputs = sinks.filter((n) => n.kind === "OUTPUT");
+	const base = (n) => ({
+		id: n.id,
+		name: n.name ?? n.id
+	});
+	if (topoOrder(d).loop) {
+		const problem = "邏輯圖有迴圈，寫不出布林式";
+		return {
+			outputs: outputs.map((n) => ({
+				...base(n),
+				read: null,
+				readProblem: problem,
+				simplified: null,
+				simplifiedProblem: problem
+			})),
+			displays
+		};
+	}
+	const dot = needsDot(inputs.map((n) => n.name ?? n.id));
+	const read = reader(d);
+	const counted = /* @__PURE__ */ new Map();
+	const table = truthTable(d);
+	return {
+		displays,
+		outputs: outputs.map((n) => {
+			const f = {
+				...base(n),
+				read: null,
+				simplified: null
+			};
+			try {
+				const e = read(n);
+				if (letterCount(e, counted) > 200) f.readProblem = `照圖寫出來超過 200 個字母，太長不列出`;
+				else f.read = exprText(e, dot);
+			} catch (err) {
+				if (!(err instanceof ThroughBlock)) throw err;
+				f.readProblem = `經過 IC 方塊 ${err.message}，照圖寫不出布林式`;
+			}
+			if (!table.ok) {
+				f.simplifiedProblem = table.reason === "too-many" ? "輸入超過 8 個，真值表太長，不化簡" : "算不出真值表";
+				return f;
+			}
+			const k = sinks.indexOf(n);
+			const column = table.rows.map((r) => r.out[k]);
+			if (column.some((v) => v !== 0 && v !== 1)) {
+				f.simplifiedProblem = "有輸入沒接，化簡不出來";
+				return f;
+			}
+			const ones = column.flatMap((v, r) => v === 1 ? [r] : []);
+			f.simplified = exprText(sumOfProducts(table.inputs.length, ones, table.inputs), dot);
+			return f;
+		})
+	};
+}
+//#endregion
 //#region src/mcp/tools.ts
 var fail = (text) => ({
 	text,
@@ -35415,6 +35593,14 @@ function logicTruthTable(f) {
 	}
 	const cell = (v) => v === "X" ? "?" : String(v);
 	const lines = [`${t.inputs.join(" ")} | ${t.outputs.join(" ")}`, ...t.rows.map((r) => `${r.in.join(" ")} | ${r.out.map(cell).join(" ")}`)];
+	const formulas = diagramFormulas(f.logic).outputs;
+	if (formulas.length > 0) {
+		lines.push("", "布林式：");
+		for (const o of formulas) {
+			lines.push(o.read === null ? `- ${o.name}：${o.readProblem}` : `- ${o.name} = ${o.read}（照圖寫出來）`);
+			lines.push(o.simplified === null ? `  化簡：${o.simplifiedProblem}` : `  化簡：${o.name} = ${o.simplified}`);
+		}
+	}
 	const issues = checkDiagram(f.logic);
 	if (issues.length > 0) lines.push("", "檢查：", ...issues.map((i) => `- ${i.message}`));
 	return { text: lines.join("\n") };
@@ -35795,7 +35981,7 @@ function folderFromArgs(argv, cwd) {
 * 工具的邏輯在 src/mcp/（純函式）；這裡只負責路徑檢查、讀檔、寫檔。
 */
 /** 版本號：打包時換成建置的日期（vite.mcp.config.ts），原始碼版是 1.0.0。 */
-var VERSION = "2026.10.20";
+var VERSION = "2026.10.23";
 if (process.argv.includes("--version")) {
 	console.log(VERSION);
 	process.exit(0);
@@ -35981,7 +36167,7 @@ server.registerTool("logic_set", {
 }, async ({ file: f, diagram }) => withFile(f, (lab) => logicSet(lab, { diagram })));
 server.registerTool("logic_truth_table", {
 	title: "真值表",
-	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元）與檢查結果。",
+	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元）、每個輸出的布林式（照圖寫出來與化簡後）與檢查結果。",
 	inputSchema: { file }
 }, async (args) => withFile(args.file, (lab) => logicTruthTable(lab)));
 server.registerTool("logic_to_breadboard", {
