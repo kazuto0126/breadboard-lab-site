@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.23（commit 1700fce）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.24（commit 214d5af）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process$1 from "node:process";
@@ -33635,8 +33635,9 @@ function isBetterRouting(a, b) {
 /**
 * 規格 2026-10-10 ic-placement：「AI 佈線（可移動 IC）」。起點是「IC 都不動」的佈線；每顆 IC 輪流試粗估最好的幾個位置、
 * 實際佈線，比目前最好的結果好才採用。回傳的結果一定有 moves（沒有搬動時是空陣列）。
+* 子專案 41：from 是同一個電路之前的結果（例如轉成麵包板的快速試），從它接著搬，不重做已經做過的。
 */
-function autoPlaceAndRoute(circuit, overrides) {
+function autoPlaceAndRoute(circuit, overrides, from) {
 	const started = performance.now();
 	const config = mergeConfig(overrides);
 	const { candidatesPerIc, maxPasses, timeBudgetMs } = config.placement;
@@ -33657,16 +33658,16 @@ function autoPlaceAndRoute(circuit, overrides) {
 			}
 		};
 	};
-	let moves = [];
-	let best = route(moves, overrides);
-	const candidateIterations = Math.min(config.negotiation.maxIterations, Math.max(config.placement.candidateIterations, 2 * best.stats.iterations));
-	const candidateOptions = {
+	let moves = from?.moves ?? [];
+	let best = from ?? route(moves, overrides);
+	const optionsFor = (r) => ({
 		...overrides,
 		negotiation: {
 			...overrides?.negotiation,
-			maxIterations: candidateIterations
+			maxIterations: Math.min(config.negotiation.maxIterations, Math.max(config.placement.candidateIterations, 2 * r.stats.iterations))
 		}
-	};
+	});
+	let candidateOptions = optionsFor(best);
 	for (let pass = 0; pass < maxPasses && !outOfTime(); pass++) {
 		let improved = false;
 		for (const id of movableIcs(circuit, nets)) {
@@ -33683,6 +33684,7 @@ function autoPlaceAndRoute(circuit, overrides) {
 				if (result && isBetterRouting(result, best)) {
 					best = result;
 					moves = next;
+					candidateOptions = optionsFor(best);
 					improved = true;
 				}
 			}
@@ -34910,8 +34912,11 @@ var POLISHED = 2;
 * 慢的電腦（或很忙的時候）快速試的時間不夠，小電路常常只差 1 條（2026-10-20 量測：比較器差 1 條、編碼器差 4–5 條）。
 */
 var CLOSE_NETS = 2;
-/** route：佈線用的函式（測試時換成假的，不用真的等時間）。 */
-function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
+/**
+* 子專案 41（規格 2026-10-24 faster-conversion）：轉換的步驟。每次 yield 一批互不相關的佈線（同一塊板的快速試、要排到最好的那幾種），
+* 拿到這一批的結果再往下走。parallel：同時能跑幾件（網頁用好幾個 Worker；MCP 一次一件），只影響時間怎麼分，每件分到的時間和一次一件時一樣。
+*/
+function* convertSteps(d, options, budget = {}, parallel = 1) {
 	const problem = convertProblem(d);
 	if (problem) return {
 		ok: false,
@@ -34922,6 +34927,7 @@ function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
 	const hasDisplay = d.nodes.some((n) => n.kind === "DISPLAY");
 	const boards = options.board !== "auto" ? [options.board] : hasDisplay ? ["EIC1106"] : ["MB102", "EIC1106"];
 	const power = { nearestPowerRail: true };
+	const lanes = Math.max(1, Math.floor(parallel));
 	let tried = 0;
 	let failure = "";
 	for (const [i, board] of boards.entries()) {
@@ -34951,21 +34957,22 @@ function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
 		const boardStart = performance.now();
 		const boardMs = Math.max(0, (total - (boardStart - started)) / (boards.length - i));
 		const quickMs = Math.min(MAX_QUICK_MS, Math.max(MIN_QUICK_MS, boardMs * .4 / candidates.length));
-		const ranked = [];
-		for (const result of candidates) {
-			tried++;
-			ranked.push({
-				result,
-				routed: route(result.circuit, {
+		tried += candidates.length;
+		const quick = yield candidates.map((result) => ({
+			circuit: result.circuit,
+			config: {
+				timeBudgetMs: quickMs,
+				placement: {
+					...power,
 					timeBudgetMs: quickMs,
-					placement: {
-						...power,
-						timeBudgetMs: quickMs,
-						maxPasses: 1
-					}
-				})
-			});
-		}
+					maxPasses: 1
+				}
+			}
+		}));
+		const ranked = candidates.map((result, k) => ({
+			result,
+			routed: quick[k]
+		}));
 		ranked.sort((a, b) => isBetterRouting(a.routed, b.routed) ? -1 : isBetterRouting(b.routed, a.routed) ? 1 : 0);
 		let best = ranked[0];
 		const last = i === boards.length - 1;
@@ -34973,18 +34980,26 @@ function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
 		if (last || best.routed.status === "success" || close) {
 			const top = ranked.slice(0, last || !close ? POLISHED : 1);
 			const until = last || !close ? boardStart + boardMs : Math.max(boardStart + boardMs, (performance.now() + started + total) / 2);
-			for (const [k, entry] of top.entries()) {
+			const together = lanes >= top.length;
+			for (let k = 0; k < top.length; k += together ? top.length : 1) {
+				const group = together ? top : [top[k]];
 				const polishMs = (until - performance.now()) / (top.length - k);
 				if (polishMs <= MIN_QUICK_MS) break;
-				const polished = route(entry.result.circuit, { placement: {
-					...power,
-					timeBudgetMs: polishMs
-				} });
-				const routed = isBetterRouting(polished, entry.routed) ? polished : entry.routed;
-				if (isBetterRouting(routed, best.routed) || entry === best) best = {
-					result: entry.result,
-					routed
-				};
+				const polished = yield group.map((entry) => ({
+					circuit: entry.result.circuit,
+					config: { placement: {
+						...power,
+						timeBudgetMs: polishMs
+					} },
+					from: entry.routed
+				}));
+				for (const [j, entry] of group.entries()) {
+					const routed = isBetterRouting(polished[j], entry.routed) ? polished[j] : entry.routed;
+					if (isBetterRouting(routed, best.routed) || entry === best) best = {
+						result: entry.result,
+						routed
+					};
+				}
 			}
 		}
 		if (best.routed.status === "success" || last) return {
@@ -34998,6 +35013,13 @@ function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
 		ok: false,
 		reason: failure || "轉換失敗：沒有放得下的擺法"
 	};
+}
+/** 一次跑一件（MCP、測試、沒有 Worker 的環境）。route：佈線用的函式（測試時換成假的，不用真的等時間）。 */
+function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
+	const steps = convertSteps(d, options, budget, 1);
+	let step = steps.next();
+	while (!step.done) step = steps.next(step.value.map((job) => route(job.circuit, job.config, job.from)));
+	return step.value;
 }
 //#endregion
 //#region src/logic/formula.ts
@@ -35981,7 +36003,7 @@ function folderFromArgs(argv, cwd) {
 * 工具的邏輯在 src/mcp/（純函式）；這裡只負責路徑檢查、讀檔、寫檔。
 */
 /** 版本號：打包時換成建置的日期（vite.mcp.config.ts），原始碼版是 1.0.0。 */
-var VERSION = "2026.10.23";
+var VERSION = "2026.10.24";
 if (process.argv.includes("--version")) {
 	console.log(VERSION);
 	process.exit(0);
