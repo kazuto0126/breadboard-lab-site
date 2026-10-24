@@ -1,7 +1,9 @@
-// Breadboard Lab MCP 伺服器 2026.10.24（commit 214d5af）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.24（commit 4d9cdbe）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
 import process$1 from "node:process";
+import { availableParallelism } from "node:os";
 //#region \0rolldown/runtime.js
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -35021,6 +35023,13 @@ function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
 	while (!step.done) step = steps.next(step.value.map((job) => route(job.circuit, job.config, job.from)));
 	return step.value;
 }
+/** 同時跑好幾件（網頁：每一批交給 routeMany，例如分給好幾個 Worker）。 */
+async function convertAndRouteParallel(d, options, routeMany, parallel, budget = {}) {
+	const steps = convertSteps(d, options, budget, parallel);
+	let step = steps.next();
+	while (!step.done) step = steps.next(await routeMany(step.value));
+	return step.value;
+}
 //#endregion
 //#region src/logic/formula.ts
 var ThroughBlock = class extends Error {};
@@ -35641,17 +35650,26 @@ function checkAgainstDiagram(f) {
 	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
 	return { text: diagramCheckText(f.logic, f.circuit) };
 }
+var convertOptionsOf = (args) => ({
+	switchTo: args.switch_to ?? "vcc",
+	board: args.board ?? "auto",
+	gates: args.gates ?? "direct",
+	pulls: args.pulls ?? false,
+	inputs: args.inputs ?? "switch",
+	display: args.display ?? "ca"
+});
 function logicToBreadboard(f, args) {
 	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
-	const options = {
-		switchTo: args.switch_to ?? "vcc",
-		board: args.board ?? "auto",
-		gates: args.gates ?? "direct",
-		pulls: args.pulls ?? false,
-		inputs: args.inputs ?? "switch",
-		display: args.display ?? "ca"
-	};
+	const options = convertOptionsOf(args);
 	const converted = convertAndRoute(f.logic, options);
+	if (!converted.ok) return fail(converted.reason);
+	return convertedReply(f, options, converted);
+}
+/** 子專案 42：同樣的轉換，佈線交給 routeMany（MCP 伺服器用好幾個執行緒同時跑）。 */
+async function logicToBreadboardParallel(f, args, routeMany, parallel) {
+	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
+	const options = convertOptionsOf(args);
+	const converted = await convertAndRouteParallel(f.logic, options, routeMany, parallel);
 	if (!converted.ok) return fail(converted.reason);
 	return convertedReply(f, options, converted);
 }
@@ -35944,6 +35962,127 @@ function listCircuitFiles(folder) {
 	};
 }
 //#endregion
+//#region scripts/mcp-pool.ts
+/**
+* 子專案 42（規格 2026-10-24 mcp-parallel）：MCP 的「轉成麵包板」也同時試好幾種擺法。
+* Node 的 worker_threads：每個執行緒跑「可移動 IC」佈線（和網頁的 Worker 一樣），主執行緒照 convertSteps 排程。
+*
+* 執行緒的程式就是這個檔案所在的模組：原始碼版是 scripts/mcp-pool.ts（繼承 --import tsx），
+* 打包版是 breadboard-lab-mcp.mjs 整個檔案（伺服器只在主執行緒連上 AI 工具，見 mcp-server.ts）。
+*/
+var ROLE = "breadboard-lab-routing";
+/** 這個模組在佈線執行緒裡載入時：收到工作就佈線，回傳結果。 */
+if (!isMainThread && workerData?.role === ROLE && parentPort) {
+	const port = parentPort;
+	port.on("message", ({ id, job }) => {
+		try {
+			port.postMessage({
+				id,
+				ok: true,
+				result: autoPlaceAndRoute(job.circuit, job.config, job.from),
+				threadId
+			});
+		} catch (err) {
+			port.postMessage({
+				id,
+				ok: false,
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	});
+}
+/**
+* 同時用幾個執行緒（保留一個核心給伺服器，最多 4 個）；1 代表不用執行緒，一次一件。
+* 環境變數 BREADBOARD_LAB_MCP_THREADS 可以指定（測試時減少負擔；1 是不用執行緒）。
+*/
+function poolSize(cores = availableParallelism(), env = process.env.BREADBOARD_LAB_MCP_THREADS) {
+	const wanted = Number(env);
+	if (Number.isInteger(wanted) && wanted >= 1) return Math.min(4, wanted);
+	return Math.max(1, Math.min(4, cores - 1));
+}
+/**
+* 執行緒第一次用到時才建立，之後留著給下一次轉換（unref：閒著的時候不會讓伺服器關不掉）。
+* url：執行緒要載入的模組（預設是這個模組本身）；execArgv：給執行緒的 Node 參數（預設繼承，原始碼版會有 --import tsx）。
+*/
+function createRoutingPool(size, options = {}) {
+	const url = options.url ?? new URL(import.meta.url);
+	const workers = [];
+	let nextId = 1;
+	let threads = [];
+	const spawn = () => {
+		const w = new Worker(url, {
+			workerData: { role: ROLE },
+			argv: process.argv.slice(2),
+			...options.execArgv ? { execArgv: options.execArgv } : {},
+			stdout: true,
+			stderr: true
+		});
+		w.unref();
+		w.on("exit", () => {
+			const k = workers.indexOf(w);
+			if (k >= 0) workers.splice(k, 1);
+		});
+		workers.push(w);
+		return w;
+	};
+	const run = (w, job) => new Promise((resolve, reject) => {
+		const id = nextId++;
+		const onMessage = (msg) => {
+			if (msg.id !== id) return;
+			cleanup();
+			if (msg.ok) resolve({
+				result: msg.result,
+				threadId: msg.threadId
+			});
+			else reject(new Error(msg.error));
+		};
+		const onError = (err) => {
+			cleanup();
+			reject(err);
+		};
+		const onExit = (code) => {
+			cleanup();
+			reject(/* @__PURE__ */ new Error(`佈線執行緒結束了（${code}）`));
+		};
+		const cleanup = () => {
+			w.off("message", onMessage);
+			w.off("error", onError);
+			w.off("exit", onExit);
+		};
+		w.on("message", onMessage);
+		w.on("error", onError);
+		w.on("exit", onExit);
+		w.postMessage({
+			id,
+			job
+		});
+	});
+	return {
+		size,
+		async routeMany(jobs) {
+			const lanes = Math.min(size, jobs.length);
+			while (workers.length < lanes) spawn();
+			const results = new Array(jobs.length);
+			const used = new Array(jobs.length);
+			let next = 0;
+			await Promise.all(workers.slice(0, lanes).map(async (w) => {
+				while (next < jobs.length) {
+					const k = next++;
+					const r = await run(w, jobs[k]);
+					results[k] = r.result;
+					used[k] = r.threadId;
+				}
+			}));
+			threads = used;
+			return results;
+		},
+		lastThreads: () => threads,
+		async close() {
+			await Promise.all(workers.splice(0).map((w) => w.terminate()));
+		}
+	};
+}
+//#endregion
 //#region scripts/mcp-paths.ts
 /**
 * 規格（2026-10-17 mcp-server）第 1 節：MCP 工具只能讀寫工作資料夾裡的 .json 檔；
@@ -36035,14 +36174,30 @@ function withFile(file, run) {
 	const lab = load(where.path);
 	if (typeof lab === "string") return reply(lab, true);
 	try {
-		const r = run(lab);
-		if (r.error || !r.file) return reply(r.text, r.error === true);
-		save(where.path, r.file);
-		return reply(`${r.text}\n已存到 ${shown(where.path)}；在網頁用「檔案 → 匯入 JSON」打開。`);
+		return saved(where.path, run(lab));
 	} catch (err) {
 		return reply(`工具執行失敗（程式的問題）：${err instanceof Error ? err.message : String(err)}`, true);
 	}
 }
+/** 子專案 42：同上，工具要等一段時間（轉成麵包板用好幾個執行緒同時佈線）。 */
+async function withFileAsync(file, run) {
+	const where = insideProject(ROOT, file);
+	if (!where.ok) return reply(where.error, true);
+	const lab = load(where.path);
+	if (typeof lab === "string") return reply(lab, true);
+	try {
+		return saved(where.path, await run(lab));
+	} catch (err) {
+		return reply(`工具執行失敗（程式的問題）：${err instanceof Error ? err.message : String(err)}`, true);
+	}
+}
+function saved(path, r) {
+	if (r.error || !r.file) return reply(r.text, r.error === true);
+	save(path, r.file);
+	return reply(`${r.text}\n已存到 ${shown(path)}；在網頁用「檔案 → 匯入 JSON」打開。`);
+}
+/** 子專案 42：轉成麵包板的佈線執行緒（核心數 − 1，最多 4 個；只有 1 個時不用執行緒）。 */
+var pool = isMainThread && poolSize() > 1 ? createRoutingPool(poolSize()) : null;
 var file = string().describe("電路檔的路徑（工作資料夾裡的 .json 檔，例如 circuits/xor.json）");
 var hole = (what) => string().describe(`${what}：孔位名稱，寫法和網頁一樣，例如 F10、A3、T+10（上方 + 軌）、B-3（下方 − 軌）；EIC-1106 寫 1-F10、P2+12；有好幾塊板時加板子 ID，例如 b2:F10`);
 var server = new McpServer({
@@ -36212,7 +36367,7 @@ server.registerTool("logic_to_breadboard", {
 		display: _enum(["ca", "cc"]).optional().describe("7 段顯示器用共陽極 + 74LS47（預設）或共陰極 + 74LS48"),
 		pulls: boolean().optional().describe("加上 / 下拉電阻（預設不加）")
 	}
-}, async ({ file: f, ...args }) => withFile(f, (lab) => logicToBreadboard(lab, args)));
+}, async ({ file: f, ...args }) => pool ? withFileAsync(f, (lab) => logicToBreadboardParallel(lab, args, pool.routeMany, pool.size)) : withFile(f, (lab) => logicToBreadboard(lab, args)));
 server.registerTool("check_against_diagram", {
 	title: "和邏輯圖比對",
 	description: "依名稱把麵包板的開關、LED、7 段顯示器對應到邏輯圖，逐列模擬比對真值表；列出不一致的列或還不能比對的原因。",
@@ -36268,6 +36423,6 @@ server.registerTool("task_check", {
 	description: "拿題目和檔案裡的邏輯圖、麵包板比對（依名稱對應輸入與輸出，不在乎的格子不比），列出不一致的列或還不能比對的原因。",
 	inputSchema: { file }
 }, async (args) => withFile(args.file, (lab) => taskCheck(lab)));
-await server.connect(new StdioServerTransport());
+if (isMainThread) await server.connect(new StdioServerTransport());
 //#endregion
 export {};
