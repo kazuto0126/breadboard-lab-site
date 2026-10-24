@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.24（commit 4d9cdbe）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.24（commit 90a3c2c）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -8764,7 +8764,7 @@ var ZodType = /*@__PURE__*/ $constructor("ZodType", (inst, def) => {
 		return intersection(this, arg);
 	},
 	transform(tx) {
-		return pipe(this, transform(tx));
+		return pipe$1(this, transform(tx));
 	},
 	default(d) {
 		return _default(this, d);
@@ -8776,7 +8776,7 @@ var ZodType = /*@__PURE__*/ $constructor("ZodType", (inst, def) => {
 		return _catch(this, params);
 	},
 	pipe(target) {
-		return pipe(this, target);
+		return pipe$1(this, target);
 	},
 	readonly() {
 		return readonly(this);
@@ -9560,7 +9560,7 @@ var ZodPipe = /*@__PURE__*/ $constructor("ZodPipe", (inst, def) => {
 	inst.in = def.in;
 	inst.out = def.out;
 });
-function pipe(in_, out) {
+function pipe$1(in_, out) {
 	return new ZodPipe({
 		type: "pipe",
 		in: in_,
@@ -29117,6 +29117,9 @@ function toCircuitFile(circuit, name, now = /* @__PURE__ */ new Date(), checklis
 	if (logic && (logic.nodes.length > 0 || logic.task || logic.notes)) file.logic = logic;
 	return file;
 }
+function serializeCircuitFile(circuit, name, now, logic) {
+	return JSON.stringify(toCircuitFile(circuit, name, now, void 0, logic), null, 2);
+}
 var FormatError = class extends Error {};
 function fail$1(path, message) {
 	throw new FormatError(path ? `${path}：${message}` : message);
@@ -32496,6 +32499,32 @@ function circuitBrief(circuit) {
 	].join("\n");
 }
 //#endregion
+//#region src/editor/shareLink.ts
+/**
+* 子專案 43（規格 2026-10-24 share-link）：用連結開啟電路。電路檔（和「匯出 JSON」一樣）用 deflate 壓縮、base64url 編碼後
+* 放在網址 `#c=` 後面；`#` 後面不會送到伺服器。網頁與 MCP 共用（CompressionStream 在瀏覽器與 Node 都有）。
+*/
+/** 線上版的網址：離線版（file://）與 MCP 做的連結從這裡開始。 */
+var SITE_URL = "https://kazuto0126.github.io/breadboard-lab-site/";
+var PREFIX = "#c=";
+function toBase64Url(bytes) {
+	let binary = "";
+	for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function pipe(bytes, transform) {
+	const stream = new Blob([bytes]).stream().pipeThrough(transform);
+	return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+/** 電路檔的文字做成連結。 */
+async function makeShareLink(base, fileText) {
+	return `${base}${PREFIX}${toBase64Url(await pipe(new TextEncoder().encode(fileText), new CompressionStream("deflate-raw")))}`;
+}
+/** 字數說明（太長時加上提醒）。 */
+function linkLengthNote(link) {
+	return link.length > 8e3 ? `連結有 ${link.length} 個字，有些通訊軟體會截斷很長的網址；大電路建議改用「匯出 JSON」。` : `連結有 ${link.length} 個字。`;
+}
+//#endregion
 //#region src/core/circuit/powerRails.ts
 var POWER_COLORS = {
 	"+": "#d32f2f",
@@ -35265,6 +35294,15 @@ function pinsText(circuit, instance) {
 		return `第 ${fp.pinNumber} 腳${name && name !== String(fp.pinNumber) ? ` ${name}` : ""} @ ${holeLabel(circuit, fp.point)}`;
 	}).join("、");
 }
+/** 子專案 43（規格 2026-10-24 share-link）：電路檔做成連結，使用者點開就在網頁上看到（不用匯入）。 */
+async function shareLink(f) {
+	const link = await makeShareLink(SITE_URL, serializeCircuitFile(f.circuit, f.name, void 0, f.logic));
+	return { text: [
+		`把這個連結給使用者，點開就在網頁上看到這個電路（麵包板、邏輯圖、題目）：`,
+		link,
+		linkLengthNote(link)
+	].join("\n") };
+}
 function circuitSummary(f) {
 	return { text: circuitBrief(f.circuit) };
 }
@@ -36206,7 +36244,7 @@ var server = new McpServer({
 }, { instructions: [
 	"Breadboard Lab：在 MB-102 / EIC-1106 麵包板上放 74LS IC、電阻、LED、指撥開關並接線，可以檢查、AI 佈線、模擬，也可以把邏輯圖轉成麵包板。",
 	`工作資料夾：${ROOT}；file 參數寫相對於它的路徑（例如 circuits/xor.json），list_files 列出裡面的電路檔。`,
-	"電路檔就是網頁「匯出 JSON」的格式；做完在網頁用「檔案 → 匯入 JSON」打開。",
+	"電路檔就是網頁「匯出 JSON」的格式；做完用 share_link 給使用者一個連結（點開就在網頁上看到），或請使用者在網頁用「檔案 → 匯入 JSON」打開。",
 	"接線規則（一定要遵守）：每條導線只能水平或垂直的直線，不能斜；要轉彎就分成兩條線（轉角接在同一排相通的五孔排）；兩條線不能重疊，也不能交叉；線不能跨過 IC（上下、左右都不行）或經過元件腳、別條線的端點。add_wire 會拒絕不合規則的線；auto_route 與 logic_to_breadboard 接出來的線都符合這些規則。",
 	"建議流程：new_circuit → list_parts（查元件名稱與腳位）→ place_part（IC 第 1 腳放在 F 列，跨過凹槽）→ add_wire → check_circuit → auto_route → simulate。",
 	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
@@ -36250,6 +36288,11 @@ server.registerTool("circuit_summary", {
 	description: "列出元件與每一隻腳所在的孔、導線、連在一起的腳（Net）、沒接的腳。",
 	inputSchema: { file }
 }, async (args) => withFile(args.file, (lab) => circuitSummary(lab)));
+server.registerTool("share_link", {
+	title: "分享連結",
+	description: "把電路檔（麵包板、邏輯圖、題目）做成網址，使用者點開就在網頁上看到這個電路，不用匯入檔案。做完電路後給使用者這個連結。",
+	inputSchema: { file }
+}, async (args) => withFileAsync(args.file, (lab) => shareLink(lab)));
 server.registerTool("check_circuit", {
 	title: "檢查電路",
 	description: "錯誤與警告（短路、IC 沒接電源、輸入懸空、斜的線、一條線裡轉彎、線交叉或重疊…），每一項附原因與建議的接法。",
