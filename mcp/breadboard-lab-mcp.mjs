@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.24（commit 90a3c2c）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.24（commit 8e1141f）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -33912,13 +33912,19 @@ var IC_FOR = {
 	XOR2: "74LS86"
 };
 var ORDER = Object.keys(IC_FOR);
+/** 子專案 44（規格 2026-10-24 display-resistors）：沒指定時 1 個顯示器每段一顆電阻、2 個以上共用一顆。 */
+function displayResistorsOf(d, chosen) {
+	return chosen ?? (d.nodes.filter((n) => n.kind === "DISPLAY").length >= 2 ? "shared" : "each");
+}
 /** 規格第 6 節：不能轉的原因；可以轉時回傳 null。 */
-function convertProblem(d) {
+function convertProblem(d, options = {}) {
 	const issues = checkDiagram(d);
 	if (issues.some((i) => i.code === "LOGIC_LOOP")) return "邏輯圖有迴圈，不能轉成麵包板";
 	const { inputs, outputs } = sortedIo(d);
 	if (inputs.length === 0 || outputs.length === 0) return "邏輯圖要有輸入端和輸出端才能轉";
-	if (d.nodes.filter((n) => n.kind === "DISPLAY").length > 2) return `7 段顯示器最多 2 個（零件太多，佈線接不完）`;
+	const displayCount = d.nodes.filter((n) => n.kind === "DISPLAY").length;
+	if (displayCount > 2) return `7 段顯示器最多 2 個（零件太多，佈線接不完）`;
+	if (displayCount > 1 && displayResistorsOf(d, options.displayResistors) === "each") return "每段一顆電阻時 7 段顯示器最多 1 個；兩個請選「共用一顆電阻」";
 	if (inputs.length > 8) return `輸入端最多 8 個（指撥開關最多 8 位元）`;
 	if (issues.some((i) => i.code === "LOGIC_INPUT_OPEN" || i.code === "LOGIC_OUTPUT_OPEN")) return "還有沒接好的腳（到「檢查」分頁看是哪些），請先接好";
 	return null;
@@ -34341,7 +34347,7 @@ function displayInverters(d, options) {
 }
 /** 規格（2026-10-13 logic-to-breadboard）第 4、5 節。 */
 function toBreadboard(d, options, variant = DEFAULT_LAYOUT) {
-	const problem = convertProblem(d);
+	const problem = convertProblem(d, options);
 	if (problem) return {
 		ok: false,
 		reason: problem
@@ -34570,10 +34576,14 @@ function build(d, options, layout, variant) {
 		leds[node.id] = `D${k + 1}`;
 	});
 	const displayIds = {};
+	const shared = displayResistorsOf(d, options.displayResistors) === "shared";
 	for (const { node, ic, ds } of displayParts) {
-		for (const [p, s] of directPins(node)) {
-			const signal = driver.get(`${node.id}#${p}`);
-			if (!signal) continue;
+		/** 一段：每段一顆電阻時經過 220 Ω，共用時直接接。 */
+		const segment = (signal, s) => {
+			if (shared) {
+				pinNo(dsDef, s).forEach((n) => tie(`${ds}#${n}`, signal));
+				return;
+			}
 			const into = `${ds}:${s}`;
 			pinNo(dsDef, s).forEach((n) => tie(`${ds}#${n}`, into));
 			twoLeads.push({
@@ -34581,10 +34591,14 @@ function build(d, options, layout, variant) {
 				defId: "resistor",
 				props: { resistance: 220 },
 				span: RESISTOR_SPAN,
-				nets: [cc ? signal : `inv~${node.id}~${p}`, into],
+				nets: [signal, into],
 				area: 3,
 				group: ds
 			});
+		};
+		for (const [p, s] of directPins(node)) {
+			const signal = driver.get(`${node.id}#${p}`);
+			if (signal) segment(cc ? signal : `inv~${node.id}~${p}`, s);
 		}
 		if (ic) for (const s of [
 			"a",
@@ -34596,21 +34610,23 @@ function build(d, options, layout, variant) {
 			"g"
 		]) {
 			const out = `${ic}:${segOut(s)}`;
-			const into = `${ds}:${s}`;
 			pinNo(decoder, segOut(s)).forEach((p) => tie(`${ic}#${p}`, out));
-			pinNo(dsDef, s).forEach((p) => tie(`${ds}#${p}`, into));
+			segment(out, s);
+		}
+		const common = cc ? "CC" : "CA";
+		if (shared) {
+			const at = `${ds}:${common}`;
+			pinNo(dsDef, common).forEach((p) => tie(`${ds}#${p}`, at));
 			twoLeads.push({
 				id: `R${++r}`,
 				defId: "resistor",
-				props: { resistance: 220 },
+				props: { resistance: 100 },
 				span: RESISTOR_SPAN,
-				nets: [out, into],
+				nets: cc ? [at, GND] : [VCC, at],
 				area: 3,
 				group: ds
 			});
-		}
-		if (cc) pinNo(dsDef, "CC").forEach((p) => tie(`${ds}#${p}`, GND));
-		else pinNo(dsDef, "CA").forEach((p) => tie(`${ds}#${p}`, VCC));
+		} else pinNo(dsDef, common).forEach((p) => tie(`${ds}#${p}`, cc ? GND : VCC));
 		displayIds[node.id] = ds;
 	}
 	for (const t of twoLeads) {
@@ -34948,7 +34964,7 @@ var CLOSE_NETS = 2;
 * 拿到這一批的結果再往下走。parallel：同時能跑幾件（網頁用好幾個 Worker；MCP 一次一件），只影響時間怎麼分，每件分到的時間和一次一件時一樣。
 */
 function* convertSteps(d, options, budget = {}, parallel = 1) {
-	const problem = convertProblem(d);
+	const problem = convertProblem(d, options);
 	if (problem) return {
 		ok: false,
 		reason: problem
@@ -35694,7 +35710,8 @@ var convertOptionsOf = (args) => ({
 	gates: args.gates ?? "direct",
 	pulls: args.pulls ?? false,
 	inputs: args.inputs ?? "switch",
-	display: args.display ?? "ca"
+	display: args.display ?? "ca",
+	...args.display_resistors ? { displayResistors: args.display_resistors } : {}
 });
 function logicToBreadboard(f, args) {
 	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
@@ -36408,6 +36425,7 @@ server.registerTool("logic_to_breadboard", {
 		]).optional().describe("照種類對應（預設）、只用 NAND（74LS00）或只用 NOR（74LS02）"),
 		inputs: _enum(["switch", "button"]).optional().describe("輸入用指撥開關（預設）或每個輸入一顆按鈕"),
 		display: _enum(["ca", "cc"]).optional().describe("7 段顯示器用共陽極 + 74LS47（預設）或共陰極 + 74LS48"),
+		display_resistors: _enum(["each", "shared"]).optional().describe("7 段顯示器的電阻：each 每段一顆 220 Ω（亮度一致，最多 1 個顯示器）或 shared 共同腳共用一顆 100 Ω（線比較少，最多 2 個；亮的段越多越暗）。沒給時 1 個顯示器 each、2 個 shared"),
 		pulls: boolean().optional().describe("加上 / 下拉電阻（預設不加）")
 	}
 }, async ({ file: f, ...args }) => pool ? withFileAsync(f, (lab) => logicToBreadboardParallel(lab, args, pool.routeMany, pool.size)) : withFile(f, (lab) => logicToBreadboard(lab, args)));
