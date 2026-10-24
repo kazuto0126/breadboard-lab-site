@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.24（commit e6cac1f）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.24（commit 3b709b7）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -30481,7 +30481,8 @@ var DEFAULT_ROUTING_CONFIG = {
 		wire: 6,
 		via: 3,
 		crossing: 1e3,
-		congestion: 2
+		congestion: 2,
+		rail: 200
 	},
 	negotiation: {
 		overlapBase: 50,
@@ -30581,7 +30582,7 @@ function checkRoutingLegality(circuit, wires) {
 			const node = nodeAt(index, end);
 			const id = nodeIdOf(end);
 			const g = node?.groupId ?? null;
-			const groupOk = g !== null && allowed !== void 0 && (allowed.has(g) || groupInfo(index, g)?.kind !== "rail" && !pinGroups.has(g));
+			const groupOk = g !== null && allowed !== void 0 && (allowed.has(g) || !pinGroups.has(g));
 			if (!(node !== void 0 && node.kind === "hole" && groupOk && !index.pinsAt.has(id) && !index.bodiesAt.has(id) && (endsAt.get(id)?.length ?? 0) === 1)) out.push({
 				code: "ENDPOINT_INVALID",
 				wireIds: [w.id],
@@ -33412,15 +33413,19 @@ function passCost(problem, state, netId, cell, o, params) {
 	if (problem.terminalHole[cell] && !(g && state.owns(netId, g))) cost += params.weights.congestion;
 	return cost;
 }
-/** 線端可以插在 group 嗎：自己的排（終端排、用過的轉接排），或空的五孔排（新的轉接排）。 */
+/**
+* 線端可以插在 group 嗎：自己的排（終端排、用過的轉接排），或空的五孔排（新的轉接排）。
+* 子專案 47：沒有接電源、沒有元件腳的電源軌也可以當轉接排（整條相通，等於一條長的訊號通道）；有電源的軌是電源 Net 的終端排，別的 Net 不能用。
+*/
 function groupUse(problem, state, netId, group) {
 	if (state.owns(netId, group)) return "own";
-	if (problem.railGroups.has(group) || problem.pinGroups.has(group)) return null;
+	if (problem.pinGroups.has(group)) return null;
 	const owner = problem.groupOwner.get(group);
 	return owner === void 0 || owner === netId ? "via" : null;
 }
-function viaCost(state, netId, group, params) {
-	return params.weights.via + conflictCost(params, state.viaOthers(netId, group), state.histVia.get(group) ?? 0);
+function viaCost(problem, state, netId, group, params) {
+	const rail = problem.railGroups.has(group) ? params.weights.rail : 0;
+	return params.weights.via + rail + conflictCost(params, state.viaOthers(netId, group), state.histVia.get(group) ?? 0);
 }
 var DX = [
 	1,
@@ -33484,7 +33489,7 @@ function findRoute(problem, state, net, sources, targets, params) {
 					const use = groupUse(problem, state, net.netId, gq);
 					if (use) {
 						let cost = acc + params.weights.distance * len + endCost(state, q, params);
-						if (use === "via") cost += viaCost(state, net.netId, gq, params);
+						if (use === "via") cost += viaCost(problem, state, net.netId, gq, params);
 						relax(q * 2, cost, s);
 					}
 				}
@@ -33509,7 +33514,7 @@ function wireCost(problem, state, net, line, params) {
 	let cost = endCost(state, line.a, params) + params.weights.wire + params.weights.distance * (line.cells.length + 1) + endCost(state, line.b, params);
 	for (const c of line.cells) cost += passCost(problem, state, net.netId, c, line.o, params);
 	const g = problem.groupAt[line.b];
-	if (g && groupUse(problem, state, net.netId, g) === "via") cost += viaCost(state, net.netId, g, params);
+	if (g && groupUse(problem, state, net.netId, g) === "via") cost += viaCost(problem, state, net.netId, g, params);
 	return cost;
 }
 //#endregion
@@ -34726,6 +34731,8 @@ var DEFAULT_LAYOUT = {
 	split: false
 };
 var NoRoom = class extends Error {};
+/** 子專案 47：相鄰的兩顆 IC 之間至少空幾欄（使用者 2026-10-25：「IC 與 IC 不要並聯，至少空兩行」）。 */
+var IC_GAP = 2;
 /** 拆好的單元；只用 NAND / NOR 時再換成那一種 2 輸入閘（輸出端接的訊號一定保留）。 */
 function unitsFor(d, options) {
 	const extra = displayInverters(d, options);
@@ -34832,7 +34839,7 @@ function build(d, options, layout, variant) {
 	};
 	const pullDown = options.switchTo === "vcc";
 	const uprightPulls = options.pulls === true && options.inputs !== "button";
-	const splitSwitches = variant.splitSwitches === true && uprightPulls && inputs.length > 4;
+	const splitSwitches = inputs.length > 4 && (variant.splitSwitches === true || uprightPulls && inputs.length >= 6);
 	const flatPull = uprightPulls && inputs.length >= 6 && !splitSwitches ? 5 : -1;
 	/** 每個開關接的輸入（依名稱排序）；拆開時依「哪顆 IC 先用到」分組（子專案 45），開關比較靠近用到它的 IC。 */
 	const switches = splitSwitches ? splitByIc(inputs, icOrderOf(d, plans, chips)) : [inputs];
@@ -34910,6 +34917,7 @@ function build(d, options, layout, variant) {
 	blocks[1].push(...switchBlocks.filter((b) => !laterSwitches.includes(b)));
 	for (const plan of plans) {
 		icBlocks.push({
+			ic: true,
 			width: 7,
 			place: (x) => components.push(comp(plan.id, plan.defId, hole(`F${x}`, icArea), { board: BOARD_ID }))
 		});
@@ -34930,6 +34938,7 @@ function build(d, options, layout, variant) {
 		const ic = `U${plans.length + k + 1}`;
 		const def = getComponentDefinition(chip);
 		icBlocks.push({
+			ic: true,
 			width: def.pins.length / 2,
 			place: (x) => components.push(comp(ic, chip, hole(`F${x}`, icArea), { board: BOARD_ID }))
 		});
@@ -34959,6 +34968,7 @@ function build(d, options, layout, variant) {
 	for (const { node, ic } of displayParts) {
 		if (!ic) continue;
 		icBlocks.push({
+			ic: true,
 			width: 8,
 			place: (x) => components.push(comp(ic, decoder, hole(`F${x}`, icArea), { board: BOARD_ID }))
 		});
@@ -35172,10 +35182,14 @@ function build(d, options, layout, variant) {
 		if (free < list.length + 1) throw new NoRoom();
 		const gap = Math.min(variant.gap, Math.floor(free / (list.length + 1)));
 		let x = 2 + gap;
+		let lastIcEnd = -Infinity;
 		for (const b of list) {
+			if (b.ic) x = Math.max(x, lastIcEnd + IC_GAP + 1);
 			for (let i = 0; i < 6 && b.align && !b.align(x); i++) x++;
 			if (b.align && !b.align(x)) throw new NoRoom();
+			if (x + b.width - 1 > LAST_COLUMN) throw new NoRoom();
 			b.place(x);
+			if (b.ic) lastIcEnd = x + b.width - 1;
 			x += b.width + gap;
 		}
 		if (x - gap > 64) throw new NoRoom();
@@ -35759,6 +35773,19 @@ function pinsText(circuit, instance) {
 		return `第 ${fp.pinNumber} 腳${name && name !== String(fp.pinNumber) ? ` ${name}` : ""} @ ${holeLabel(circuit, fp.point)}`;
 	}).join("、");
 }
+/** 子專案 47（規格 2026-10-25 convert-improvements 第 5 節）：改電路檔裡的名稱（網頁左上角顯示的名稱；不改檔名）。 */
+function renameCircuit(f, args) {
+	const name = args.name.trim();
+	if (!name) return fail("名稱不能是空的");
+	if (name.length > 60) return fail("名稱最多 60 個字");
+	return {
+		text: `電路名稱改成「${name}」（原本是「${f.name}」）。`,
+		file: {
+			...f,
+			name
+		}
+	};
+}
 /** 子專案 43（規格 2026-10-24 share-link）：電路檔做成連結，使用者點開就在網頁上看到（不用匯入）。 */
 async function shareLink(f) {
 	const link = await makeShareLink(SITE_URL, serializeCircuitFile(f.circuit, f.name, void 0, f.logic));
@@ -36177,7 +36204,7 @@ var convertOptionsOf = (args) => ({
 	switchTo: args.switch_to ?? "vcc",
 	board: args.board ?? "auto",
 	gates: args.gates ?? "direct",
-	pulls: args.pulls ?? false,
+	pulls: args.pulls ?? true,
 	inputs: args.inputs ?? "switch",
 	display: args.display ?? "ca",
 	...args.display_resistors ? { displayResistors: args.display_resistors } : {}
@@ -36775,6 +36802,14 @@ server.registerTool("circuit_summary", {
 	description: "列出元件與每一隻腳所在的孔、導線、連在一起的腳（Net）、沒接的腳。",
 	inputSchema: { file }
 }, async (args) => withFile(args.file, (lab) => circuitSummary(lab)));
+server.registerTool("rename_circuit", {
+	title: "改電路名稱",
+	description: "改電路檔裡的名稱（網頁左上角顯示的名稱，最多 60 個字；不改檔名）。",
+	inputSchema: {
+		file,
+		name: string().describe("新的電路名稱")
+	}
+}, async (args) => withFile(args.file, (lab) => renameCircuit(lab, { name: args.name })));
 server.registerTool("share_link", {
 	title: "分享連結",
 	description: "把電路檔（麵包板、邏輯圖、題目）做成網址，使用者點開就在網頁上看到這個電路，不用匯入檔案。做完電路後給使用者這個連結。",
@@ -36900,7 +36935,7 @@ server.registerTool("logic_to_breadboard", {
 		inputs: _enum(["switch", "button"]).optional().describe("輸入用指撥開關（預設）或每個輸入一顆按鈕"),
 		display: _enum(["ca", "cc"]).optional().describe("7 段顯示器用共陽極 + 74LS47（預設）或共陰極 + 74LS48"),
 		display_resistors: _enum(["each", "shared"]).optional().describe("7 段顯示器的電阻：each 每段一顆 220 Ω（亮度一致，最多 1 個顯示器）或 shared 共同腳共用一顆 100 Ω（線比較少，最多 2 個；亮的段越多越暗）。沒給時 1 個顯示器 each、2 個 shared"),
-		pulls: boolean().optional().describe("加上 / 下拉電阻（預設不加）")
+		pulls: boolean().optional().describe("加上 / 下拉電阻（預設加上；電阻直立插在開關那一排、另一端插進電源軌）")
 	}
 }, async ({ file: f, ...args }) => pool ? withFileAsync(f, (lab) => logicToBreadboardParallel(lab, args, pool.routeMany, pool.size)) : withFile(f, (lab) => logicToBreadboard(lab, args)));
 server.registerTool("check_against_diagram", {
