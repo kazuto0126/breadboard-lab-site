@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.25（commit 0d56a27）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.25（commit 8df5ac6）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -33850,7 +33850,7 @@ function dropConflicts(problem, state, active, hard, onFail) {
 /** 子專案 48：拆線重接最多拆幾個 Net、最多幾輪、最多多用時間限制的幾成。 */
 var MAX_VICTIMS = 3;
 var REPAIR_ROUNDS = 3;
-var REPAIR_SHARE = .2;
+var REPAIR_SHARE = .1;
 /**
 * 子專案 48：允許重疊把 net 接上，拆掉和它衝突的 Net（最多 MAX_VICTIMS 個），在不准碰的條件下依原本的順序重接。
 * 全部接得上才回傳 true；否則還原成原本的線。
@@ -34385,6 +34385,10 @@ var IC_FOR = {
 	XOR2: "74LS86"
 };
 var ORDER = Object.keys(IC_FOR);
+/** 子專案 49：這些顯示器一塊 EIC-1106 放不下、要用兩塊（共用電阻 3 個、每段一顆 2 個）。 */
+function displaysNeedTwoBoards(count, resistors) {
+	return resistors === "each" ? count >= 2 : count >= 3;
+}
 /** 子專案 44（規格 2026-10-24 display-resistors）：沒指定時 1 個顯示器每段一顆電阻、2 個以上共用一顆。 */
 function displayResistorsOf(d, chosen) {
 	return chosen ?? (d.nodes.filter((n) => n.kind === "DISPLAY").length >= 2 ? "shared" : "each");
@@ -34396,8 +34400,10 @@ function convertProblem(d, options = {}) {
 	const { inputs, outputs } = sortedIo(d);
 	if (inputs.length === 0 && !d.nodes.some((n) => n.kind === "CLOCK") || outputs.length === 0) return "邏輯圖要有輸入端和輸出端才能轉";
 	const displayCount = d.nodes.filter((n) => n.kind === "DISPLAY").length;
-	if (displayCount > 2) return `7 段顯示器最多 2 個（零件太多，佈線接不完）`;
-	if (displayCount > 1 && displayResistorsOf(d, options.displayResistors) === "each") return "每段一顆電阻時 7 段顯示器最多 1 個；兩個請選「共用一顆電阻」";
+	if (displayCount > 3) return `7 段顯示器最多 3 個（零件太多，佈線接不完）`;
+	const resistors = displayResistorsOf(d, options.displayResistors);
+	if (displayCount > 2 && resistors === "each") return `每段一顆電阻時 7 段顯示器最多 2 個；3 個請選「共用一顆電阻」`;
+	if (options.board !== void 0 && options.board !== "auto" && displaysNeedTwoBoards(displayCount, resistors)) return `${displayCount} 個 7 段顯示器${resistors === "each" ? "（每段一顆電阻）" : ""}要用兩塊 EIC-1106，請把麵包板選「自動」`;
 	if (inputs.length > 8) return `輸入端最多 8 個（指撥開關最多 8 位元）`;
 	if (issues.some((i) => i.code === "LOGIC_INPUT_OPEN" || i.code === "LOGIC_OUTPUT_OPEN")) return "還有沒接好的腳（到「檢查」分頁看是哪些），請先接好";
 	return null;
@@ -34804,6 +34810,18 @@ var TWO_BOARD_LAYOUT = {
 	boards: 2,
 	orderIcs: true
 };
+/** 子專案 49：顯示器多到要兩塊板時的預設擺法（每個顯示器和它的解碼 IC 在同一塊板）。 */
+var TWO_BOARD_DISPLAY_LAYOUT = {
+	gap: 6,
+	leds: "pair",
+	split: false,
+	boards: 2,
+	displayBoards: true
+};
+/** 子專案 49：自動選板時，這張圖的顯示器一塊 EIC-1106 放不下、一定要兩塊。 */
+function needsTwoBoards(d, options) {
+	return displaysNeedTwoBoards(d.nodes.filter((n) => n.kind === "DISPLAY").length, displayResistorsOf(d, options.displayResistors));
+}
 var NoRoom = class extends Error {};
 /** 子專案 47：相鄰的兩顆 IC 之間至少空幾欄（使用者 2026-10-25：「IC 與 IC 不要並聯，至少空兩行」）。 */
 var IC_GAP = 2;
@@ -34940,13 +34958,17 @@ function splitByIc(inputs, order) {
 }
 /** 規格（2026-10-13 logic-to-breadboard）第 4、5 節。 */
 function toBreadboard(d, options, variant = DEFAULT_LAYOUT) {
-	const problem = convertProblem(d, options);
+	const problem = convertProblem(d, variant.boards === 2 ? {
+		...options,
+		board: "auto"
+	} : options);
 	if (problem) return {
 		ok: false,
 		reason: problem
 	};
 	const hasDisplay = d.nodes.some((n) => n.kind === "DISPLAY");
-	const layouts = options.board !== "auto" ? [options.board] : hasDisplay ? ["EIC1106"] : ["MB102", "EIC1106"];
+	const twoNeeded = options.board === "auto" && needsTwoBoards(d, options);
+	const layouts = options.board !== "auto" ? [options.board] : twoNeeded ? [] : hasDisplay ? ["EIC1106"] : ["MB102", "EIC1106"];
 	for (const layout of layouts) try {
 		return build(d, options, layout, variant);
 	} catch (err) {
@@ -34957,7 +34979,7 @@ function toBreadboard(d, options, variant = DEFAULT_LAYOUT) {
 		reason: "MB-102 放不下，請改用 EIC-1106"
 	};
 	if (options.board === "auto") try {
-		return build(d, options, "EIC1106", TWO_BOARD_LAYOUT);
+		return build(d, options, "EIC1106", twoNeeded ? TWO_BOARD_DISPLAY_LAYOUT : TWO_BOARD_LAYOUT);
 	} catch (err) {
 		if (!(err instanceof NoRoom)) throw err;
 	}
@@ -34999,7 +35021,7 @@ function build(d, options, layout, variant) {
 	};
 	const pullDown = options.switchTo === "vcc";
 	const uprightPulls = options.pulls === true && options.inputs !== "button";
-	const splitSwitches = inputs.length > 4 && (variant.splitSwitches === true || uprightPulls && inputs.length >= 6);
+	const splitSwitches = inputs.length > 4 && (variant.splitSwitches === true || two && variant.displayBoards === true || uprightPulls && inputs.length >= 6);
 	const flatPull = uprightPulls && inputs.length >= 6 && !splitSwitches ? 5 : -1;
 	/** 每個開關接的輸入（依名稱排序）；拆開時依「哪顆 IC 先用到」分組（子專案 45），開關比較靠近用到它的 IC。 */
 	const switches = splitSwitches ? splitByIc(inputs, icOrderOf(d, plans, chips)) : [inputs];
@@ -35125,10 +35147,13 @@ function build(d, options, layout, variant) {
 		ic: node.segments ? null : `U${++nextIc}`,
 		ds: `DS${k + 1}`
 	}));
-	for (const { node, ic } of displayParts) {
+	/** 子專案 49：第 k 個顯示器放在哪一塊板（只有兩塊板、displayBoards 時）。 */
+	const displayBoard = (k) => two && variant.displayBoards && k >= 0 ? Math.floor(k * 2 / displayParts.length) : void 0;
+	for (const [k, { node, ic }] of displayParts.entries()) {
 		if (!ic) continue;
 		icBlocks.push({
 			ic,
+			board: displayBoard(k),
 			width: 8,
 			place: (x, area) => components.push(comp(ic, decoder, hole(`F${x}`, area), { board: boardNow }))
 		});
@@ -35299,9 +35324,11 @@ function build(d, options, layout, variant) {
 			continue;
 		}
 		const size = 2;
+		const onBoard = displayBoard(displayParts.findIndex((p) => p.ds === group));
 		for (let i = 0; i < list.length; i += size) {
 			const pair = list.slice(i, i + size);
 			blocks[eic ? area : area === 1 ? 1 : 3].push({
+				board: onBoard,
 				width: Math.max(...pair.map((t) => t.span)) + 1,
 				place: (x) => pair.forEach((t, j) => components.push(comp(t.id, t.defId, hole(`${j === 0 ? "A" : "J"}${x}`, eic ? area : void 0), {
 					board: boardNow,
@@ -35312,6 +35339,7 @@ function build(d, options, layout, variant) {
 		}
 		const shown = displayParts.find((p) => p.ds === group);
 		if (shown) blocks[3].push({
+			board: onBoard,
 			width: 5,
 			place: (x) => components.push(comp(shown.ds, dsDef, hole(`H${x}`, eic ? 3 : void 0), {
 				board: boardNow,
@@ -35323,6 +35351,7 @@ function build(d, options, layout, variant) {
 		const order = orderIcs(icBlocks.map((blk) => [...new Set(Object.entries(netOf).filter(([pin, net]) => pin.startsWith(`${blk.ic}#`) && net !== VCC && net !== GND).map(([, net]) => net))]), new Set(inputs.map((n) => n.id)), new Set(outputs.map((n) => driver.get(`${n.id}#0`))), inOneRow);
 		icBlocks.splice(0, icBlocks.length, ...order.map((k) => icBlocks[k]));
 	}
+	icBlocks.sort((a, b) => (a.board ?? 0) - (b.board ?? 0));
 	if (!inOneRow) blocks[2].push(...icBlocks);
 	else {
 		blocks[1] = [
@@ -35351,6 +35380,11 @@ function build(d, options, layout, variant) {
 		let x = 2 + gap;
 		let lastIcEnd = -Infinity;
 		for (const b of list) {
+			if (b.board !== void 0 && b.board > onBoard) {
+				onBoard = b.board;
+				x = 2;
+				lastIcEnd = -Infinity;
+			}
 			for (;;) {
 				let at = b.ic ? Math.max(x, lastIcEnd + IC_GAP + 1) : x;
 				for (let i = 0; i < 6 && b.align && !b.align(at); i++) at++;
@@ -35638,6 +35672,14 @@ var TWO_BOARD_VARIANTS = [
 		leds: "pair",
 		split: false,
 		boards: 2
+	},
+	TWO_BOARD_DISPLAY_LAYOUT,
+	{
+		gap: 3,
+		leds: "pair",
+		split: false,
+		boards: 2,
+		displayBoards: true
 	}
 ];
 /** 總時間預設 40 秒：每塊板先用短時間試每一種擺法（每種最多 4 秒），剩下的時間給最好的兩種。 */
@@ -35667,13 +35709,14 @@ function* convertSteps(d, options, budget = {}, parallel = 1) {
 		layout,
 		variants: LAYOUT_VARIANTS[layout]
 	});
-	const boards = options.board !== "auto" ? [single(options.board)] : [
+	const two = {
+		layout: "EIC1106",
+		variants: TWO_BOARD_VARIANTS
+	};
+	const boards = options.board !== "auto" ? [single(options.board)] : needsTwoBoards(d, options) ? [two] : [
 		...hasDisplay ? [] : [single("MB102")],
 		single("EIC1106"),
-		{
-			layout: "EIC1106",
-			variants: TWO_BOARD_VARIANTS
-		}
+		two
 	];
 	const power = { nearestPowerRail: true };
 	const lanes = Math.max(1, Math.floor(parallel));
@@ -37178,7 +37221,7 @@ server.registerTool("logic_to_breadboard", {
 		]).optional().describe("照種類對應（預設）、只用 NAND（74LS00）或只用 NOR（74LS02）"),
 		inputs: _enum(["switch", "button"]).optional().describe("輸入用指撥開關（預設）或每個輸入一顆按鈕"),
 		display: _enum(["ca", "cc"]).optional().describe("7 段顯示器用共陽極 + 74LS47（預設）或共陰極 + 74LS48"),
-		display_resistors: _enum(["each", "shared"]).optional().describe("7 段顯示器的電阻：each 每段一顆 220 Ω（亮度一致，最多 1 個顯示器）或 shared 共同腳共用一顆 100 Ω（線比較少，最多 2 個；亮的段越多越暗）。沒給時 1 個顯示器 each、2 個 shared"),
+		display_resistors: _enum(["each", "shared"]).optional().describe("7 段顯示器的電阻：each 每段一顆 220 Ω（亮度一致，最多 2 個顯示器）或 shared 共同腳共用一顆 100 Ω（線比較少，最多 3 個；亮的段越多越暗）。each 2 個、shared 3 個時要兩塊 EIC-1106（board 要是 auto）。沒給時 1 個顯示器 each、2 個以上 shared"),
 		pulls: boolean().optional().describe("加上 / 下拉電阻（預設加上；電阻直立插在開關那一排、另一端插進電源軌）")
 	}
 }, async ({ file: f, ...args }) => pool ? withFileAsync(f, (lab) => logicToBreadboardParallel(lab, args, pool.routeMany, pool.size)) : withFile(f, (lab) => logicToBreadboard(lab, args)));
