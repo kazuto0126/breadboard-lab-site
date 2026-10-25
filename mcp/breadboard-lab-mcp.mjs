@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.25（commit 6e2c3da）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.25（commit e1ef18b）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -27856,6 +27856,25 @@ var BLOCK_PINS = {
 			"/CO",
 			"/BO"
 		]
+	},
+	DFF: {
+		inputs: [
+			"D",
+			"CLK",
+			"/PRE",
+			"/CLR"
+		],
+		outputs: ["Q", "/Q"]
+	},
+	JKFF: {
+		inputs: [
+			"J",
+			"CLK",
+			"K",
+			"/PRE",
+			"/CLR"
+		],
+		outputs: ["Q", "/Q"]
 	}
 };
 /**
@@ -27919,7 +27938,28 @@ var BLOCK_DEFAULTS = {
 		B: 0,
 		C: 0,
 		D: 0
+	},
+	DFF: {
+		D: 0,
+		CLK: 1,
+		"/PRE": 1,
+		"/CLR": 1
+	},
+	JKFF: {
+		J: 0,
+		CLK: 1,
+		K: 0,
+		"/PRE": 1,
+		"/CLR": 1
 	}
+};
+/**
+* 子專案 51：單顆正反器用哪顆 IC（模擬用那顆 IC 第 1 組的腳；轉成麵包板時兩顆合用一片，第二顆用第 2 組）。
+* 腳名就是 IC 的腳名去掉組別（1D → D）。
+*/
+var HALF_CHIP = {
+	DFF: "74LS74",
+	JKFF: "74LS76"
 };
 /** 子專案 46：時序 IC（有狀態、看時脈邊緣）。 */
 var isSequentialChip = (chip) => chip !== void 0 && chip in BLOCK_DEFAULTS;
@@ -28723,7 +28763,9 @@ function blockOutputs(chip, inputs) {
 	});
 }
 var models = /* @__PURE__ */ new Map();
-function modelOf(chip) {
+/** 子專案 51：單顆正反器用那顆 IC 的模型。 */
+function modelOf(block) {
+	const chip = HALF_CHIP[block] ?? block;
 	if (!models.has(chip)) {
 		const spec = getComponentDefinition(chip)?.logic;
 		if (!spec) return null;
@@ -28732,15 +28774,28 @@ function modelOf(chip) {
 	return models.get(chip);
 }
 var bitOf = (v) => v === 0 || v === 1 ? v : "X";
+/** 子專案 51：模型的腳名換成方塊的腳名（單顆正反器是 IC 的第 1 組：1D → D）；第 2 組的腳不是方塊的腳（undefined）。 */
+function blockPin(chip, pin) {
+	if (!HALF_CHIP[chip]) return pin;
+	const own = pin.slice(1);
+	return pin.startsWith("1") && (BLOCK_PINS[chip].inputs.includes(own) || BLOCK_PINS[chip].outputs.includes(own)) ? own : void 0;
+}
+/** 方塊的輸出腳在模型裡的名稱。 */
+var modelOutput = (chip, name) => HALF_CHIP[chip] ? `1${name}` : name;
+/** 沒接的輸入：方塊自己的值；單顆正反器另一組的腳用那顆 IC 沒接時的值。 */
+function defaultOf(chip, pin) {
+	const own = blockPin(chip, pin);
+	const base = HALF_CHIP[chip];
+	return (own === void 0 ? void 0 : BLOCK_DEFAULTS[chip]?.[own]) ?? (base ? BLOCK_DEFAULTS[base]?.[pin] : void 0) ?? 1;
+}
 /** 上電狀態：模型的初始狀態，輸出用沒接時的值算（不記下時脈，第一次真的求值時不會看成邊緣）。 */
 function powerOn(chip) {
 	const model = modelOf(chip);
-	const defaults = BLOCK_DEFAULTS[chip] ?? {};
 	const state = model.init();
-	const out = model.evaluate((pin) => defaults[pin] ?? 1, state).outputs;
+	const out = model.evaluate((pin) => defaultOf(chip, pin), state).outputs;
 	return {
 		state,
-		out: BLOCK_PINS[chip].outputs.map((name) => bitOf(out[name]))
+		out: BLOCK_PINS[chip].outputs.map((name) => bitOf(out[modelOutput(chip, name)]))
 	};
 }
 /** 子專案 46：時序方塊最多重算幾次（漣波計數器一級一級傳下去）。 */
@@ -28765,12 +28820,13 @@ function evaluate$1(d, values = {}, state) {
 	for (const node of sequential) seq[node.id] = state?.[node.id] ?? powerOn(node.chip);
 	/** 時序方塊的輸入：沒接時用 BLOCK_DEFAULTS 的值。 */
 	const readOf = (node, current) => {
-		const names = BLOCK_PINS[node.chip].inputs;
-		const defaults = BLOCK_DEFAULTS[node.chip] ?? {};
+		const chip = node.chip;
+		const names = BLOCK_PINS[chip].inputs;
 		return (pin) => {
-			const i = names.indexOf(pin);
+			const own = blockPin(chip, pin);
+			const i = own === void 0 ? -1 : names.indexOf(own);
 			const from = i < 0 ? void 0 : driver.get(`${node.id}#${i}`);
-			return from === void 0 ? defaults[pin] ?? 1 : current.get(from) ?? "X";
+			return from === void 0 ? defaultOf(chip, pin) : current.get(from) ?? "X";
 		};
 	};
 	let result = combinational(order, driver, values, seq);
@@ -28778,7 +28834,7 @@ function evaluate$1(d, values = {}, state) {
 		let changed = false;
 		for (const node of sequential) {
 			const ev = modelOf(node.chip).evaluate(readOf(node, result.nodes), seq[node.id].state);
-			const out = BLOCK_PINS[node.chip].outputs.map((name) => bitOf(ev.outputs[name]));
+			const out = BLOCK_PINS[node.chip].outputs.map((name) => bitOf(ev.outputs[modelOutput(node.chip, name)]));
 			if (out.some((b, k) => b !== seq[node.id].out[k])) changed = true;
 			seq[node.id] = {
 				state: ev.state,
@@ -34601,6 +34657,59 @@ function assignIcs(units) {
 	}
 	return plans;
 }
+//#endregion
+//#region src/logic/flipFlops.ts
+/**
+* 子專案 51（規格 2026-10-25 single-flip-flops 第 3 節）：轉成麵包板前把單顆正反器兩顆一組合成一片 IC
+* （DFF → 74LS74、JKFF → 74LS76）：依位置（上到下、左到右）配對，第一顆用第 1 組的腳、第二顆用第 2 組。
+* 合好的 IC 沿用第一顆的 id；沒有單顆正反器時回傳原本的圖。
+*/
+function packFlipFlops(d) {
+	/** 單顆正反器 id → 合成的 IC 與用第幾組。 */
+	const into = /* @__PURE__ */ new Map();
+	const packed = [];
+	for (const [half, chip] of Object.entries(HALF_CHIP)) {
+		const singles = d.nodes.filter((n) => n.kind === "BLOCK" && n.chip === half).sort((a, b) => a.y - b.y || a.x - b.x);
+		for (let k = 0; k < singles.length; k += 2) {
+			const first = singles[k];
+			packed.push({
+				id: first.id,
+				kind: "BLOCK",
+				x: first.x,
+				y: first.y,
+				chip
+			});
+			singles.slice(k, k + 2).forEach((n, g) => into.set(n.id, {
+				id: first.id,
+				chip,
+				half,
+				group: g === 0 ? 1 : 2
+			}));
+		}
+	}
+	if (into.size === 0) return d;
+	const wires = d.wires.map((w) => {
+		const src = into.get(w.from);
+		const dst = into.get(w.to.node);
+		const next = { ...w };
+		if (src) {
+			const fromPin = BLOCK_PINS[src.chip].outputs.indexOf(`${src.group}${BLOCK_PINS[src.half].outputs[w.fromPin ?? 0]}`);
+			next.from = src.id;
+			if (fromPin > 0) next.fromPin = fromPin;
+			else delete next.fromPin;
+		}
+		if (dst) next.to = {
+			node: dst.id,
+			pin: BLOCK_PINS[dst.chip].inputs.indexOf(`${dst.group}${BLOCK_PINS[dst.half].inputs[w.to.pin]}`)
+		};
+		return next;
+	});
+	return {
+		...d,
+		nodes: [...d.nodes.filter((n) => !into.has(n.id)), ...packed],
+		wires
+	};
+}
 var referenceBoard = getBoard("MB102", "b1");
 function hole$1(name) {
 	const p = parseHoleName(referenceBoard, name);
@@ -34958,7 +35067,8 @@ function splitByIc(inputs, order) {
 	return [byName(sorted.slice(0, 4)), byName(sorted.slice(4))];
 }
 /** 規格（2026-10-13 logic-to-breadboard）第 4、5 節。 */
-function toBreadboard(d, options, variant = DEFAULT_LAYOUT) {
+function toBreadboard(diagram, options, variant = DEFAULT_LAYOUT) {
+	const d = packFlipFlops(diagram);
 	const problem = convertProblem(d, variant.boards === 2 ? {
 		...options,
 		board: "auto"
@@ -37072,7 +37182,7 @@ var server = new McpServer({
 	"建議流程：new_circuit → list_parts（查元件名稱與腳位）→ place_part（IC 第 1 腳放在 F 列，跨過凹槽）→ add_wire → check_circuit → auto_route → simulate。",
 	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
 	"從真值表題目開始：task_set → task_show → task_to_diagram → logic_to_breadboard → task_check。",
-	"時序電路（正反器、計數器）：logic_set 用 CLOCK 節點與 74LS74 / 76 / 90 / 93 / 161 / 193 方塊 → logic_truth_table 看時序表與文字波形 → logic_to_breadboard。"
+	"時序電路（正反器、計數器）：logic_set 用 CLOCK 節點與 74LS74 / 76 / 90 / 93 / 161 / 193 方塊或單顆正反器 DFF / JKFF → logic_truth_table 看時序表與文字波形 → logic_to_breadboard。"
 ].join("\n") });
 server.registerTool("list_files", {
 	title: "電路檔清單",
@@ -37206,7 +37316,7 @@ server.registerTool("logic_set", {
 	title: "寫入邏輯圖",
 	description: [
 		"寫入（取代）電路檔裡的邏輯圖。節點種類：AND、OR、NAND、NOR（inputs 2–4）、NOT、XOR、INPUT、OUTPUT（要有 name；activeLow: true 是低態致動，0 時亮，轉成麵包板時 LED 正極接 +5 V、負極經過電阻接到輸出）、DISPLAY（7 段顯示器，name）、",
-		"HIGH（5V）、LOW（GND）、BLOCK（chip：74LS83、74LS151、74LS153、74LS138、74LS85；時序 IC：74LS74 雙 D 正反器、74LS76 雙 JK 正反器、74LS90、74LS93、74LS161、74LS193 計數器，輸入可以不接：清除 / 預設 / 載入不用、資料 0、時脈 1）、",
+		"HIGH（5V）、LOW（GND）、BLOCK（chip：74LS83、74LS151、74LS153、74LS138、74LS85；時序 IC：74LS74 雙 D 正反器、74LS76 雙 JK 正反器、74LS90、74LS93、74LS161、74LS193 計數器；單顆正反器 DFF（D、CLK、/PRE、/CLR → Q、/Q）、JKFF（J、CLK、K、/PRE、/CLR → Q、/Q），轉成麵包板時兩顆合用一片 74LS74 / 74LS76；輸入可以不接：清除 / 預設 / 載入不用、資料 0、時脈 1）、",
 		"CLOCK（時脈，name，一張圖最多一個；接到正反器、計數器的 CLK）。腳的順序用 BLOCK 的腳名（和 74LS 資料表一樣），fromPin 是第幾個輸出。",
 		"線：{ id, from, fromPin?（方塊的第幾個輸出）, to: { node, pin } }。節點沒有 x、y 時自動排版。"
 	].join(""),
