@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.10.25（commit 8df5ac6）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.10.25（commit 6e2c3da）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -28954,6 +28954,7 @@ function sequenceTable(d, pulses = 16, values = {}) {
 		ok: true,
 		clock: clock.name ?? clock.id,
 		outputs: outputs.map((n) => n.name ?? n.id),
+		display: outputs.map((n) => n.kind === "DISPLAY"),
 		rows
 	};
 }
@@ -35822,6 +35823,27 @@ async function convertAndRouteParallel(d, options, routeMany, parallel, budget =
 	return step.value;
 }
 //#endregion
+//#region src/logic/waveform.ts
+/** 時序表的每一欄變成一條線：最上面是時脈，再依表格的順序放輸出端與顯示器。 */
+function waveLanes(t) {
+	return [{
+		name: t.clock,
+		kind: "clock",
+		values: t.rows.map((r) => r.pulse === 0 ? 0 : 1)
+	}, ...t.outputs.map((name, i) => ({
+		name,
+		kind: t.display[i] ? "value" : "bit",
+		values: t.rows.map((r) => r.out[i])
+	}))];
+}
+/** 給 AI 看的文字波形：每格一個字元，1 是 ‾、0 是 _、不確定是 ?；時脈每格前有脈衝寫 |。顯示器不畫（值在時序表裡）。 */
+function waveText(t) {
+	const lanes = waveLanes(t).filter((l) => l.kind !== "value");
+	const width = Math.max(...lanes.map((l) => l.name.length));
+	const cell = (l, v) => l.kind === "clock" ? v === 1 ? "|" : "." : v === 1 ? "‾" : v === 0 ? "_" : "?";
+	return lanes.map((l) => `${l.name.padEnd(width)} ${l.values.map((v) => cell(l, v)).join("")}`).join("\n");
+}
+//#endregion
 //#region src/logic/formula.ts
 var ThroughBlock = class extends Error {};
 /** 展開後有幾個字母（共用的部分記下來，不會真的展開）。 */
@@ -36469,6 +36491,7 @@ function sequenceReply(d, pulses) {
 		`${t.clock} 第幾次 | ${t.outputs.join(" ")}`,
 		...t.rows.map((r) => `${r.pulse} | ${r.out.map(cell).join(" ")}`)
 	];
+	if (t.display.some((d) => !d)) lines.push("", "波形（每格是那次脈衝之後的值；‾ 是 1、_ 是 0、? 是不確定；時脈每個 | 是一個脈衝）：", waveText(t));
 	const issues = checkDiagram(d);
 	if (issues.length > 0) lines.push("", "檢查：", ...issues.map((i) => `- ${i.message}`));
 	return { text: lines.join("\n") };
@@ -37049,7 +37072,7 @@ var server = new McpServer({
 	"建議流程：new_circuit → list_parts（查元件名稱與腳位）→ place_part（IC 第 1 腳放在 F 列，跨過凹槽）→ add_wire → check_circuit → auto_route → simulate。",
 	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
 	"從真值表題目開始：task_set → task_show → task_to_diagram → logic_to_breadboard → task_check。",
-	"時序電路（正反器、計數器）：logic_set 用 CLOCK 節點與 74LS74 / 76 / 90 / 93 / 161 / 193 方塊 → logic_truth_table 看時序表 → logic_to_breadboard。"
+	"時序電路（正反器、計數器）：logic_set 用 CLOCK 節點與 74LS74 / 76 / 90 / 93 / 161 / 193 方塊 → logic_truth_table 看時序表與文字波形 → logic_to_breadboard。"
 ].join("\n") });
 server.registerTool("list_files", {
 	title: "電路檔清單",
@@ -37197,7 +37220,7 @@ server.registerTool("logic_set", {
 }, async ({ file: f, diagram }) => withFile(f, (lab) => logicSet(lab, { diagram })));
 server.registerTool("logic_truth_table", {
 	title: "真值表",
-	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元）、每個輸出的布林式（照圖寫出來與化簡後）與檢查結果。時序電路（有正反器、計數器或時脈）回傳時序表：從重設開始每次脈衝之後的輸出。",
+	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元）、每個輸出的布林式（照圖寫出來與化簡後）與檢查結果。時序電路（有正反器、計數器或時脈）回傳時序表：從重設開始每次脈衝之後的輸出，再加一段文字波形（每格一個字元，‾ 是 1、_ 是 0）。",
 	inputSchema: {
 		file,
 		pulses: number().int().min(1).max(64).optional().describe("時序表列到第幾次脈衝（預設 16）")
