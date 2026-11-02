@@ -1,6 +1,6 @@
-// Breadboard Lab MCP 伺服器 2026.10.28（commit 0e60821）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+// Breadboard Lab MCP 伺服器 2026.11.2（commit bc2c034）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
 import process$1 from "node:process";
 import { availableParallelism } from "node:os";
@@ -21591,6 +21591,526 @@ var StdioServerTransport = class {
 	}
 };
 //#endregion
+//#region src/core/breadboard/naming.ts
+function nodeIdOf(p) {
+	return `${p.boardId}:${p.x},${p.y}`;
+}
+function parseNodeId(id) {
+	const colon = id.lastIndexOf(":");
+	const [x, y] = id.slice(colon + 1).split(",").map(Number);
+	return {
+		boardId: id.slice(0, colon),
+		x,
+		y
+	};
+}
+function getNode(board, x, y) {
+	if (!Number.isInteger(x) || !Number.isInteger(y)) return void 0;
+	if (x < 1 || y < 1 || x > board.width || y > board.height) return void 0;
+	return board.nodes[(y - 1) * board.width + (x - 1)];
+}
+function holeName(board, p) {
+	if (p.boardId !== board.id) return null;
+	return getNode(board, p.x, p.y)?.name ?? null;
+}
+var LABEL_PATTERN = /^(T\+|T-|B\+|B-|P[1-5][+-]|[1-3]-[A-J]|[A-J])(\d+)$/;
+/** 接受 "A12"、"b1:A12"、小寫 "a12"、全形減號 "B−30"。 */
+function parseHoleName(board, raw) {
+	const text = raw.trim().replace(/[−–]/g, "-");
+	const colon = text.lastIndexOf(":");
+	if (colon >= 0 && text.slice(0, colon) !== board.id) return null;
+	const local = text.slice(colon + 1);
+	const exact = board.nodes.find((n) => n.name !== null && n.name === local);
+	if (exact) return {
+		boardId: board.id,
+		x: exact.x,
+		y: exact.y
+	};
+	const match = LABEL_PATTERN.exec(local.toUpperCase());
+	if (!match) return null;
+	const name = `${match[1]}${Number(match[2])}`;
+	const node = board.nodes.find((n) => n.name === name);
+	return node ? {
+		boardId: board.id,
+		x: node.x,
+		y: node.y
+	} : null;
+}
+//#endregion
+//#region src/core/breadboard/buildBoard.ts
+function buildBoard(layout, boardId) {
+	const nodes = [];
+	const groups = {};
+	const rowByY = new Map(layout.rows.map((row) => [row.y, row]));
+	const postAt = new Map((layout.posts ?? []).map((p) => [`${p.x},${p.y}`, p]));
+	for (let y = 1; y <= layout.height; y++) {
+		const row = rowByY.get(y) ?? {
+			y,
+			kind: "surface"
+		};
+		for (let x = 1; x <= layout.width; x++) {
+			let kind = "surface";
+			let name = null;
+			let groupId = null;
+			const post = postAt.get(`${x},${y}`);
+			if (post) {
+				kind = "hole";
+				name = post.name;
+				groupId = `${boardId}:post-${post.color}`;
+			} else if (row.kind === "terminal") {
+				kind = "hole";
+				name = `${row.area ? `${row.area}-` : ""}${row.label}${x}`;
+				groupId = `${boardId}:${row.area ? `a${row.area}-` : ""}c${x}-${row.half}`;
+			} else if (row.kind === "rail" && row.holeColumns.includes(x)) {
+				kind = "hole";
+				name = `${row.label}${x}`;
+				groupId = `${boardId}:rail-${row.label}`;
+			}
+			const id = `${boardId}:${x},${y}`;
+			nodes.push({
+				id,
+				boardId,
+				x,
+				y,
+				kind,
+				name,
+				groupId
+			});
+			if (groupId) (groups[groupId] ??= {
+				id: groupId,
+				boardId,
+				kind: post || row.kind === "rail" ? "rail" : "terminal",
+				nodeIds: [],
+				...post?.source ? { source: post.source } : {}
+			}).nodeIds.push(id);
+		}
+	}
+	return {
+		id: boardId,
+		layoutId: layout.id,
+		width: layout.width,
+		height: layout.height,
+		nodes,
+		groups
+	};
+}
+//#endregion
+//#region src/core/breadboard/layouts.ts
+var RAIL_COLUMNS = [];
+for (let group = 0; group < 10; group++) for (let i = 0; i < 5; i++) RAIL_COLUMNS.push(3 + group * 6 + i);
+var TOP_ROWS = [
+	"A",
+	"B",
+	"C",
+	"D",
+	"E"
+];
+var BOTTOM_ROWS = [
+	"F",
+	"G",
+	"H",
+	"I",
+	"J"
+];
+/** MB-102：63 欄 × A–J，上下各兩條 50 孔全長導通的電源軌。 */
+var MB102_LAYOUT = {
+	id: "MB102",
+	name: "MB-102",
+	width: 63,
+	height: 18,
+	rows: [
+		{
+			y: 1,
+			kind: "rail",
+			label: "T-",
+			holeColumns: RAIL_COLUMNS
+		},
+		{
+			y: 2,
+			kind: "rail",
+			label: "T+",
+			holeColumns: RAIL_COLUMNS
+		},
+		{
+			y: 3,
+			kind: "surface"
+		},
+		...TOP_ROWS.map((label, i) => ({
+			y: 4 + i,
+			kind: "terminal",
+			label,
+			half: "top"
+		})),
+		{
+			y: 9,
+			kind: "surface"
+		},
+		{
+			y: 10,
+			kind: "surface"
+		},
+		...BOTTOM_ROWS.map((label, i) => ({
+			y: 11 + i,
+			kind: "terminal",
+			label,
+			half: "bot"
+		})),
+		{
+			y: 16,
+			kind: "surface"
+		},
+		{
+			y: 17,
+			kind: "rail",
+			label: "B+",
+			holeColumns: RAIL_COLUMNS
+		},
+		{
+			y: 18,
+			kind: "rail",
+			label: "B-",
+			holeColumns: RAIL_COLUMNS
+		}
+	]
+};
+var terminalArea = (area, top) => [...TOP_ROWS.map((label, i) => ({
+	y: top + i,
+	kind: "terminal",
+	label,
+	half: "top",
+	area
+})), ...BOTTOM_ROWS.map((label, i) => ({
+	y: top + 7 + i,
+	kind: "terminal",
+	label,
+	half: "bot",
+	area
+}))];
+var railPair = (n, y) => [{
+	y,
+	kind: "rail",
+	label: `P${n}+`,
+	holeColumns: RAIL_COLUMNS
+}, {
+	y: y + 1,
+	kind: "rail",
+	label: `P${n}-`,
+	holeColumns: RAIL_COLUMNS
+}];
+//#endregion
+//#region src/core/breadboard/registry.ts
+var LAYOUTS = {
+	MB102: MB102_LAYOUT,
+	EIC1106: {
+		id: "EIC1106",
+		name: "EIC-1106",
+		width: 63,
+		height: 56,
+		rows: [
+			...railPair(1, 4),
+			...railPair(2, 7),
+			...terminalArea(1, 10),
+			...railPair(3, 23),
+			...terminalArea(2, 26),
+			...railPair(4, 39),
+			...terminalArea(3, 42),
+			...railPair(5, 55)
+		],
+		posts: [
+			{
+				x: 20,
+				y: 2,
+				name: "紅",
+				color: "red",
+				source: "vcc"
+			},
+			{
+				x: 28,
+				y: 2,
+				name: "黑",
+				color: "black",
+				source: "gnd"
+			},
+			{
+				x: 36,
+				y: 2,
+				name: "黃",
+				color: "yellow"
+			},
+			{
+				x: 44,
+				y: 2,
+				name: "綠",
+				color: "green"
+			}
+		]
+	}
+};
+function getLayout(layoutId) {
+	const layout = LAYOUTS[layoutId];
+	if (!layout) throw new Error(`Unknown board layout: ${layoutId}`);
+	return layout;
+}
+var cache$4 = /* @__PURE__ */ new Map();
+/** 回傳快取的板子模型。回傳值是共用物件，呼叫端不可修改。 */
+function getBoard(layoutId, boardId) {
+	const key = `${layoutId}/${boardId}`;
+	let board = cache$4.get(key);
+	if (!board) {
+		board = buildBoard(getLayout(layoutId), boardId);
+		cache$4.set(key, board);
+	}
+	return board;
+}
+//#endregion
+//#region src/core/breadboard/lattice.ts
+/** 1 格 = 0.1 吋。板子位置以 mm 記錄，換算成格數後四捨五入，所有板子共用同一張全域格子。 */
+var MM_PER_UNIT = 2.54;
+function unitsFromMm(mm) {
+	const u = Math.round(mm / MM_PER_UNIT);
+	return u === 0 ? 0 : u;
+}
+/** 兩塊板是否「邊對邊貼合且完全對齊」：上下排 x 相同、左右排 y 相同。 */
+function alignedAdjacent(a, b) {
+	if (a.ox === b.ox && a.width === b.width && (a.oy + a.height === b.oy || b.oy + b.height === a.oy)) return "vertical";
+	if (a.oy === b.oy && a.height === b.height && (a.ox + a.width === b.ox || b.ox + b.width === a.ox)) return "horizontal";
+	return null;
+}
+var cache$3 = /* @__PURE__ */ new WeakMap();
+function buildLattice(instances) {
+	const cached = cache$3.get(instances);
+	if (cached) return cached;
+	const boards = instances.map((inst) => {
+		const board = getBoard(inst.layoutId, inst.id);
+		return {
+			id: inst.id,
+			board,
+			ox: unitsFromMm(inst.x),
+			oy: unitsFromMm(inst.y),
+			width: board.width + 2,
+			height: board.height + 2
+		};
+	});
+	const parent = new Map(boards.map((b) => [b.id, b.id]));
+	const find = (x) => {
+		const p = parent.get(x);
+		if (p === x) return x;
+		const root = find(p);
+		parent.set(x, root);
+		return root;
+	};
+	for (let i = 0; i < boards.length; i++) for (let j = i + 1; j < boards.length; j++) {
+		if (!alignedAdjacent(boards[i], boards[j])) continue;
+		const a = find(boards[i].id);
+		const b = find(boards[j].id);
+		if (a !== b) parent.set(a < b ? b : a, a < b ? a : b);
+	}
+	const groupOf = new Map(boards.map((b) => [b.id, find(b.id)]));
+	const lattice = {
+		boards,
+		byId: new Map(boards.map((b) => [b.id, b])),
+		groupOf
+	};
+	cache$3.set(instances, lattice);
+	return lattice;
+}
+/** 格點的全域座標；板子不存在時回傳 null。 */
+function latticeOf(lattice, p) {
+	const b = lattice.byId.get(p.boardId);
+	return b ? {
+		x: b.ox + p.x,
+		y: b.oy + p.y
+	} : null;
+}
+/** 全域座標落在哪一塊板的板面上（板子互不重疊，所以最多一塊）。 */
+function boardAt(lattice, x, y) {
+	for (const b of lattice.boards) if (x >= b.ox && y >= b.oy && x < b.ox + b.width && y < b.oy + b.height) return b;
+	return null;
+}
+/** 全域座標 → 正規格點（以板面所在的那塊板表示）。不在任何板面上時回傳 null。 */
+function pointAt(lattice, x, y) {
+	const b = boardAt(lattice, x, y);
+	return b ? {
+		boardId: b.id,
+		x: x - b.ox,
+		y: y - b.oy
+	} : null;
+}
+/** 格點是否在自己那塊板的板面範圍內（含留白）。 */
+function isSurfacePoint(lattice, p) {
+	const b = lattice.byId.get(p.boardId);
+	return !!b && p.x >= 0 && p.y >= 0 && p.x < b.width && p.y < b.height;
+}
+function isNodePoint(lattice, p) {
+	const b = lattice.byId.get(p.boardId);
+	return !!b && getNode(b.board, p.x, p.y) !== void 0;
+}
+var DIRS = [
+	[
+		"N",
+		0,
+		-1
+	],
+	[
+		"E",
+		1,
+		0
+	],
+	[
+		"S",
+		0,
+		1
+	],
+	[
+		"W",
+		-1,
+		0
+	]
+];
+/** 接縫：留白中、緊鄰同一群組另一塊板的格子。導線可以經過它跨到隔壁的板子。 */
+function isSeamPoint(lattice, p) {
+	if (!isSurfacePoint(lattice, p) || isNodePoint(lattice, p)) return false;
+	const own = lattice.byId.get(p.boardId);
+	const group = lattice.groupOf.get(own.id);
+	const at = latticeOf(lattice, p);
+	return DIRS.some(([, dx, dy]) => {
+		const other = boardAt(lattice, at.x + dx, at.y + dy);
+		return other !== null && other.id !== own.id && lattice.groupOf.get(other.id) === group;
+	});
+}
+/** 導線可以經過的格點：板上的格點（孔或板面），或同群組兩板之間的接縫。 */
+function isRoutablePoint(lattice, p) {
+	return isNodePoint(lattice, p) || isSeamPoint(lattice, p);
+}
+/** 兩點相鄰時的方向（可以跨板）；不相鄰回傳 null。 */
+function latticeStep(lattice, a, b) {
+	const pa = latticeOf(lattice, a);
+	const pb = latticeOf(lattice, b);
+	if (!pa || !pb) return null;
+	const dx = pb.x - pa.x;
+	const dy = pb.y - pa.y;
+	for (const [dir, ex, ey] of DIRS) if (dx === ex && dy === ey) return dir;
+	return null;
+}
+function canvasIndex(canvas, lattice, p) {
+	const at = latticeOf(lattice, p);
+	if (!at) return -1;
+	const x = at.x - canvas.originX;
+	const y = at.y - canvas.originY;
+	if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return -1;
+	return y * canvas.width + x;
+}
+function buildCanvas(lattice, groupId) {
+	const members = lattice.boards.filter((b) => lattice.groupOf.get(b.id) === groupId);
+	const cells = [];
+	for (const b of members) for (let y = 0; y < b.height; y++) for (let x = 0; x < b.width; x++) if (isRoutablePoint(lattice, {
+		boardId: b.id,
+		x,
+		y
+	})) cells.push({
+		x: b.ox + x,
+		y: b.oy + y
+	});
+	const originX = cells.length > 0 ? Math.min(...cells.map((c) => c.x)) : 0;
+	const originY = cells.length > 0 ? Math.min(...cells.map((c) => c.y)) : 0;
+	const width = cells.length > 0 ? Math.max(...cells.map((c) => c.x)) - originX + 1 : 0;
+	const height = cells.length > 0 ? Math.max(...cells.map((c) => c.y)) - originY + 1 : 0;
+	const size = width * height;
+	const points = new Array(size).fill(null);
+	const routable = new Uint8Array(size);
+	for (let i = 0; i < size; i++) points[i] = pointAt(lattice, originX + i % width, originY + Math.floor(i / width));
+	for (const c of cells) routable[(c.y - originY) * width + (c.x - originX)] = 1;
+	return {
+		groupId,
+		boardIds: members.map((b) => b.id).sort(),
+		originX,
+		originY,
+		width,
+		height,
+		size,
+		points,
+		routable
+	};
+}
+/** 所有群組 ID（排序後）。 */
+function latticeGroups(lattice) {
+	return [...new Set(lattice.groupOf.values())].sort();
+}
+//#endregion
+//#region src/core/circuit/footprint.ts
+/** 以螢幕座標（y 向下）順時針旋轉。用 0 - v 避免產生 -0。 */
+function rotateOffset([dx, dy], rotation) {
+	switch (rotation) {
+		case 0: return [dx, dy];
+		case 90: return [0 - dy, dx];
+		case 180: return [0 - dx, 0 - dy];
+		case 270: return [dy, 0 - dx];
+	}
+}
+function effectiveSpan(instance, def) {
+	return def.package.type === "two-lead" ? instance.span ?? def.package.defaultSpan : 0;
+}
+function localFootprint(def, span) {
+	const pkg = def.package;
+	switch (pkg.type) {
+		case "dip": {
+			const half = pkg.pinCount / 2;
+			const pins = [];
+			for (let i = 0; i < half; i++) pins.push([i + 1, [i, 0]]);
+			for (let j = 0; j < half; j++) pins.push([half + 1 + j, [half - 1 - j, -pkg.rowSpacing]]);
+			const blocked = [];
+			for (let y = -pkg.rowSpacing; y <= 0; y++) for (let x = 0; x < half; x++) blocked.push([x, y]);
+			return {
+				pins,
+				blocked
+			};
+		}
+		case "two-lead": {
+			const blocked = [];
+			if (pkg.blocksBetween) for (let x = 1; x < span; x++) blocked.push([x, 0]);
+			return {
+				pins: [[1, [0, 0]], [2, [span, 0]]],
+				blocked
+			};
+		}
+		case "single": return {
+			pins: [[1, [0, 0]]],
+			blocked: []
+		};
+		case "tactile4": {
+			const blocked = [];
+			for (let y = -3; y <= 0; y++) for (let x = 0; x <= 2; x++) blocked.push([x, y]);
+			return {
+				pins: [
+					[1, [0, 0]],
+					[2, [0, -3]],
+					[3, [2, 0]],
+					[4, [2, -3]]
+				],
+				blocked
+			};
+		}
+	}
+}
+function resolveFootprint(instance, def) {
+	const local = localFootprint(def, effectiveSpan(instance, def));
+	const place = (offset) => {
+		const [dx, dy] = rotateOffset(offset, instance.rotation);
+		return {
+			boardId: instance.boardId,
+			x: instance.anchor.x + dx,
+			y: instance.anchor.y + dy
+		};
+	};
+	return {
+		pins: local.pins.map(([pinNumber, offset]) => ({
+			pinNumber,
+			point: place(offset)
+		})),
+		blocked: local.blocked.map(place)
+	};
+}
+//#endregion
 //#region src/core/circuit/logicSpec.ts
 var GATE_OPS = /* @__PURE__ */ new Set([
 	"and",
@@ -26349,559 +26869,21 @@ function parseDefinition(raw) {
 		logic: parseLogic(id, d.logic, uniqueNames)
 	};
 }
-var cache$4 = null;
+var cache$2 = null;
 function getComponentDefinitions() {
-	if (!cache$4) {
+	if (!cache$2) {
 		const defs = RAW_DEFINITIONS.map(parseDefinition);
 		const seen = /* @__PURE__ */ new Set();
 		for (const def of defs) {
 			if (seen.has(def.id)) throw new Error(`Duplicate component definition id: ${def.id}`);
 			seen.add(def.id);
 		}
-		cache$4 = defs;
+		cache$2 = defs;
 	}
-	return cache$4;
+	return cache$2;
 }
 function getComponentDefinition(id) {
 	return getComponentDefinitions().find((def) => def.id === id);
-}
-//#endregion
-//#region src/editor/notes.ts
-var NOTE_COLORS = [
-	"yellow",
-	"blue",
-	"green",
-	"pink"
-];
-/** 元件刪除後，指向它的便條拿掉指向（沒有受影響時回傳原本的陣列）；子專案 29：板子刪除後，指向那塊板上的孔也拿掉。 */
-function dropNoteTargets(notes, removed, removedBoard) {
-	const hit = (n) => n.target !== void 0 && removed.has(n.target) || removedBoard !== void 0 && n.targetHole?.boardId === removedBoard;
-	if (!notes || !notes.some(hit)) return notes;
-	return notes.map((n) => {
-		if (!hit(n)) return n;
-		const { target: _old, targetHole: _hole, ...rest } = n;
-		return rest;
-	});
-}
-//#endregion
-//#region src/core/breadboard/naming.ts
-function nodeIdOf(p) {
-	return `${p.boardId}:${p.x},${p.y}`;
-}
-function parseNodeId(id) {
-	const colon = id.lastIndexOf(":");
-	const [x, y] = id.slice(colon + 1).split(",").map(Number);
-	return {
-		boardId: id.slice(0, colon),
-		x,
-		y
-	};
-}
-function getNode(board, x, y) {
-	if (!Number.isInteger(x) || !Number.isInteger(y)) return void 0;
-	if (x < 1 || y < 1 || x > board.width || y > board.height) return void 0;
-	return board.nodes[(y - 1) * board.width + (x - 1)];
-}
-function holeName(board, p) {
-	if (p.boardId !== board.id) return null;
-	return getNode(board, p.x, p.y)?.name ?? null;
-}
-var LABEL_PATTERN = /^(T\+|T-|B\+|B-|P[1-5][+-]|[1-3]-[A-J]|[A-J])(\d+)$/;
-/** 接受 "A12"、"b1:A12"、小寫 "a12"、全形減號 "B−30"。 */
-function parseHoleName(board, raw) {
-	const text = raw.trim().replace(/[−–]/g, "-");
-	const colon = text.lastIndexOf(":");
-	if (colon >= 0 && text.slice(0, colon) !== board.id) return null;
-	const local = text.slice(colon + 1);
-	const exact = board.nodes.find((n) => n.name !== null && n.name === local);
-	if (exact) return {
-		boardId: board.id,
-		x: exact.x,
-		y: exact.y
-	};
-	const match = LABEL_PATTERN.exec(local.toUpperCase());
-	if (!match) return null;
-	const name = `${match[1]}${Number(match[2])}`;
-	const node = board.nodes.find((n) => n.name === name);
-	return node ? {
-		boardId: board.id,
-		x: node.x,
-		y: node.y
-	} : null;
-}
-//#endregion
-//#region src/core/breadboard/buildBoard.ts
-function buildBoard(layout, boardId) {
-	const nodes = [];
-	const groups = {};
-	const rowByY = new Map(layout.rows.map((row) => [row.y, row]));
-	const postAt = new Map((layout.posts ?? []).map((p) => [`${p.x},${p.y}`, p]));
-	for (let y = 1; y <= layout.height; y++) {
-		const row = rowByY.get(y) ?? {
-			y,
-			kind: "surface"
-		};
-		for (let x = 1; x <= layout.width; x++) {
-			let kind = "surface";
-			let name = null;
-			let groupId = null;
-			const post = postAt.get(`${x},${y}`);
-			if (post) {
-				kind = "hole";
-				name = post.name;
-				groupId = `${boardId}:post-${post.color}`;
-			} else if (row.kind === "terminal") {
-				kind = "hole";
-				name = `${row.area ? `${row.area}-` : ""}${row.label}${x}`;
-				groupId = `${boardId}:${row.area ? `a${row.area}-` : ""}c${x}-${row.half}`;
-			} else if (row.kind === "rail" && row.holeColumns.includes(x)) {
-				kind = "hole";
-				name = `${row.label}${x}`;
-				groupId = `${boardId}:rail-${row.label}`;
-			}
-			const id = `${boardId}:${x},${y}`;
-			nodes.push({
-				id,
-				boardId,
-				x,
-				y,
-				kind,
-				name,
-				groupId
-			});
-			if (groupId) (groups[groupId] ??= {
-				id: groupId,
-				boardId,
-				kind: post || row.kind === "rail" ? "rail" : "terminal",
-				nodeIds: [],
-				...post?.source ? { source: post.source } : {}
-			}).nodeIds.push(id);
-		}
-	}
-	return {
-		id: boardId,
-		layoutId: layout.id,
-		width: layout.width,
-		height: layout.height,
-		nodes,
-		groups
-	};
-}
-//#endregion
-//#region src/core/breadboard/layouts.ts
-var RAIL_COLUMNS = [];
-for (let group = 0; group < 10; group++) for (let i = 0; i < 5; i++) RAIL_COLUMNS.push(3 + group * 6 + i);
-var TOP_ROWS = [
-	"A",
-	"B",
-	"C",
-	"D",
-	"E"
-];
-var BOTTOM_ROWS = [
-	"F",
-	"G",
-	"H",
-	"I",
-	"J"
-];
-/** MB-102：63 欄 × A–J，上下各兩條 50 孔全長導通的電源軌。 */
-var MB102_LAYOUT = {
-	id: "MB102",
-	name: "MB-102",
-	width: 63,
-	height: 18,
-	rows: [
-		{
-			y: 1,
-			kind: "rail",
-			label: "T-",
-			holeColumns: RAIL_COLUMNS
-		},
-		{
-			y: 2,
-			kind: "rail",
-			label: "T+",
-			holeColumns: RAIL_COLUMNS
-		},
-		{
-			y: 3,
-			kind: "surface"
-		},
-		...TOP_ROWS.map((label, i) => ({
-			y: 4 + i,
-			kind: "terminal",
-			label,
-			half: "top"
-		})),
-		{
-			y: 9,
-			kind: "surface"
-		},
-		{
-			y: 10,
-			kind: "surface"
-		},
-		...BOTTOM_ROWS.map((label, i) => ({
-			y: 11 + i,
-			kind: "terminal",
-			label,
-			half: "bot"
-		})),
-		{
-			y: 16,
-			kind: "surface"
-		},
-		{
-			y: 17,
-			kind: "rail",
-			label: "B+",
-			holeColumns: RAIL_COLUMNS
-		},
-		{
-			y: 18,
-			kind: "rail",
-			label: "B-",
-			holeColumns: RAIL_COLUMNS
-		}
-	]
-};
-var terminalArea = (area, top) => [...TOP_ROWS.map((label, i) => ({
-	y: top + i,
-	kind: "terminal",
-	label,
-	half: "top",
-	area
-})), ...BOTTOM_ROWS.map((label, i) => ({
-	y: top + 7 + i,
-	kind: "terminal",
-	label,
-	half: "bot",
-	area
-}))];
-var railPair = (n, y) => [{
-	y,
-	kind: "rail",
-	label: `P${n}+`,
-	holeColumns: RAIL_COLUMNS
-}, {
-	y: y + 1,
-	kind: "rail",
-	label: `P${n}-`,
-	holeColumns: RAIL_COLUMNS
-}];
-//#endregion
-//#region src/core/breadboard/registry.ts
-var LAYOUTS = {
-	MB102: MB102_LAYOUT,
-	EIC1106: {
-		id: "EIC1106",
-		name: "EIC-1106",
-		width: 63,
-		height: 56,
-		rows: [
-			...railPair(1, 4),
-			...railPair(2, 7),
-			...terminalArea(1, 10),
-			...railPair(3, 23),
-			...terminalArea(2, 26),
-			...railPair(4, 39),
-			...terminalArea(3, 42),
-			...railPair(5, 55)
-		],
-		posts: [
-			{
-				x: 20,
-				y: 2,
-				name: "紅",
-				color: "red",
-				source: "vcc"
-			},
-			{
-				x: 28,
-				y: 2,
-				name: "黑",
-				color: "black",
-				source: "gnd"
-			},
-			{
-				x: 36,
-				y: 2,
-				name: "黃",
-				color: "yellow"
-			},
-			{
-				x: 44,
-				y: 2,
-				name: "綠",
-				color: "green"
-			}
-		]
-	}
-};
-function getLayout(layoutId) {
-	const layout = LAYOUTS[layoutId];
-	if (!layout) throw new Error(`Unknown board layout: ${layoutId}`);
-	return layout;
-}
-var cache$3 = /* @__PURE__ */ new Map();
-/** 回傳快取的板子模型。回傳值是共用物件，呼叫端不可修改。 */
-function getBoard(layoutId, boardId) {
-	const key = `${layoutId}/${boardId}`;
-	let board = cache$3.get(key);
-	if (!board) {
-		board = buildBoard(getLayout(layoutId), boardId);
-		cache$3.set(key, board);
-	}
-	return board;
-}
-//#endregion
-//#region src/core/breadboard/lattice.ts
-/** 1 格 = 0.1 吋。板子位置以 mm 記錄，換算成格數後四捨五入，所有板子共用同一張全域格子。 */
-var MM_PER_UNIT = 2.54;
-function unitsFromMm(mm) {
-	const u = Math.round(mm / MM_PER_UNIT);
-	return u === 0 ? 0 : u;
-}
-/** 兩塊板是否「邊對邊貼合且完全對齊」：上下排 x 相同、左右排 y 相同。 */
-function alignedAdjacent(a, b) {
-	if (a.ox === b.ox && a.width === b.width && (a.oy + a.height === b.oy || b.oy + b.height === a.oy)) return "vertical";
-	if (a.oy === b.oy && a.height === b.height && (a.ox + a.width === b.ox || b.ox + b.width === a.ox)) return "horizontal";
-	return null;
-}
-var cache$2 = /* @__PURE__ */ new WeakMap();
-function buildLattice(instances) {
-	const cached = cache$2.get(instances);
-	if (cached) return cached;
-	const boards = instances.map((inst) => {
-		const board = getBoard(inst.layoutId, inst.id);
-		return {
-			id: inst.id,
-			board,
-			ox: unitsFromMm(inst.x),
-			oy: unitsFromMm(inst.y),
-			width: board.width + 2,
-			height: board.height + 2
-		};
-	});
-	const parent = new Map(boards.map((b) => [b.id, b.id]));
-	const find = (x) => {
-		const p = parent.get(x);
-		if (p === x) return x;
-		const root = find(p);
-		parent.set(x, root);
-		return root;
-	};
-	for (let i = 0; i < boards.length; i++) for (let j = i + 1; j < boards.length; j++) {
-		if (!alignedAdjacent(boards[i], boards[j])) continue;
-		const a = find(boards[i].id);
-		const b = find(boards[j].id);
-		if (a !== b) parent.set(a < b ? b : a, a < b ? a : b);
-	}
-	const groupOf = new Map(boards.map((b) => [b.id, find(b.id)]));
-	const lattice = {
-		boards,
-		byId: new Map(boards.map((b) => [b.id, b])),
-		groupOf
-	};
-	cache$2.set(instances, lattice);
-	return lattice;
-}
-/** 格點的全域座標；板子不存在時回傳 null。 */
-function latticeOf(lattice, p) {
-	const b = lattice.byId.get(p.boardId);
-	return b ? {
-		x: b.ox + p.x,
-		y: b.oy + p.y
-	} : null;
-}
-/** 全域座標落在哪一塊板的板面上（板子互不重疊，所以最多一塊）。 */
-function boardAt(lattice, x, y) {
-	for (const b of lattice.boards) if (x >= b.ox && y >= b.oy && x < b.ox + b.width && y < b.oy + b.height) return b;
-	return null;
-}
-/** 全域座標 → 正規格點（以板面所在的那塊板表示）。不在任何板面上時回傳 null。 */
-function pointAt(lattice, x, y) {
-	const b = boardAt(lattice, x, y);
-	return b ? {
-		boardId: b.id,
-		x: x - b.ox,
-		y: y - b.oy
-	} : null;
-}
-/** 格點是否在自己那塊板的板面範圍內（含留白）。 */
-function isSurfacePoint(lattice, p) {
-	const b = lattice.byId.get(p.boardId);
-	return !!b && p.x >= 0 && p.y >= 0 && p.x < b.width && p.y < b.height;
-}
-function isNodePoint(lattice, p) {
-	const b = lattice.byId.get(p.boardId);
-	return !!b && getNode(b.board, p.x, p.y) !== void 0;
-}
-var DIRS = [
-	[
-		"N",
-		0,
-		-1
-	],
-	[
-		"E",
-		1,
-		0
-	],
-	[
-		"S",
-		0,
-		1
-	],
-	[
-		"W",
-		-1,
-		0
-	]
-];
-/** 接縫：留白中、緊鄰同一群組另一塊板的格子。導線可以經過它跨到隔壁的板子。 */
-function isSeamPoint(lattice, p) {
-	if (!isSurfacePoint(lattice, p) || isNodePoint(lattice, p)) return false;
-	const own = lattice.byId.get(p.boardId);
-	const group = lattice.groupOf.get(own.id);
-	const at = latticeOf(lattice, p);
-	return DIRS.some(([, dx, dy]) => {
-		const other = boardAt(lattice, at.x + dx, at.y + dy);
-		return other !== null && other.id !== own.id && lattice.groupOf.get(other.id) === group;
-	});
-}
-/** 導線可以經過的格點：板上的格點（孔或板面），或同群組兩板之間的接縫。 */
-function isRoutablePoint(lattice, p) {
-	return isNodePoint(lattice, p) || isSeamPoint(lattice, p);
-}
-/** 兩點相鄰時的方向（可以跨板）；不相鄰回傳 null。 */
-function latticeStep(lattice, a, b) {
-	const pa = latticeOf(lattice, a);
-	const pb = latticeOf(lattice, b);
-	if (!pa || !pb) return null;
-	const dx = pb.x - pa.x;
-	const dy = pb.y - pa.y;
-	for (const [dir, ex, ey] of DIRS) if (dx === ex && dy === ey) return dir;
-	return null;
-}
-function canvasIndex(canvas, lattice, p) {
-	const at = latticeOf(lattice, p);
-	if (!at) return -1;
-	const x = at.x - canvas.originX;
-	const y = at.y - canvas.originY;
-	if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return -1;
-	return y * canvas.width + x;
-}
-function buildCanvas(lattice, groupId) {
-	const members = lattice.boards.filter((b) => lattice.groupOf.get(b.id) === groupId);
-	const cells = [];
-	for (const b of members) for (let y = 0; y < b.height; y++) for (let x = 0; x < b.width; x++) if (isRoutablePoint(lattice, {
-		boardId: b.id,
-		x,
-		y
-	})) cells.push({
-		x: b.ox + x,
-		y: b.oy + y
-	});
-	const originX = cells.length > 0 ? Math.min(...cells.map((c) => c.x)) : 0;
-	const originY = cells.length > 0 ? Math.min(...cells.map((c) => c.y)) : 0;
-	const width = cells.length > 0 ? Math.max(...cells.map((c) => c.x)) - originX + 1 : 0;
-	const height = cells.length > 0 ? Math.max(...cells.map((c) => c.y)) - originY + 1 : 0;
-	const size = width * height;
-	const points = new Array(size).fill(null);
-	const routable = new Uint8Array(size);
-	for (let i = 0; i < size; i++) points[i] = pointAt(lattice, originX + i % width, originY + Math.floor(i / width));
-	for (const c of cells) routable[(c.y - originY) * width + (c.x - originX)] = 1;
-	return {
-		groupId,
-		boardIds: members.map((b) => b.id).sort(),
-		originX,
-		originY,
-		width,
-		height,
-		size,
-		points,
-		routable
-	};
-}
-/** 所有群組 ID（排序後）。 */
-function latticeGroups(lattice) {
-	return [...new Set(lattice.groupOf.values())].sort();
-}
-//#endregion
-//#region src/core/circuit/footprint.ts
-/** 以螢幕座標（y 向下）順時針旋轉。用 0 - v 避免產生 -0。 */
-function rotateOffset([dx, dy], rotation) {
-	switch (rotation) {
-		case 0: return [dx, dy];
-		case 90: return [0 - dy, dx];
-		case 180: return [0 - dx, 0 - dy];
-		case 270: return [dy, 0 - dx];
-	}
-}
-function effectiveSpan(instance, def) {
-	return def.package.type === "two-lead" ? instance.span ?? def.package.defaultSpan : 0;
-}
-function localFootprint(def, span) {
-	const pkg = def.package;
-	switch (pkg.type) {
-		case "dip": {
-			const half = pkg.pinCount / 2;
-			const pins = [];
-			for (let i = 0; i < half; i++) pins.push([i + 1, [i, 0]]);
-			for (let j = 0; j < half; j++) pins.push([half + 1 + j, [half - 1 - j, -pkg.rowSpacing]]);
-			const blocked = [];
-			for (let y = -pkg.rowSpacing; y <= 0; y++) for (let x = 0; x < half; x++) blocked.push([x, y]);
-			return {
-				pins,
-				blocked
-			};
-		}
-		case "two-lead": {
-			const blocked = [];
-			if (pkg.blocksBetween) for (let x = 1; x < span; x++) blocked.push([x, 0]);
-			return {
-				pins: [[1, [0, 0]], [2, [span, 0]]],
-				blocked
-			};
-		}
-		case "single": return {
-			pins: [[1, [0, 0]]],
-			blocked: []
-		};
-		case "tactile4": {
-			const blocked = [];
-			for (let y = -3; y <= 0; y++) for (let x = 0; x <= 2; x++) blocked.push([x, y]);
-			return {
-				pins: [
-					[1, [0, 0]],
-					[2, [0, -3]],
-					[3, [2, 0]],
-					[4, [2, -3]]
-				],
-				blocked
-			};
-		}
-	}
-}
-function resolveFootprint(instance, def) {
-	const local = localFootprint(def, effectiveSpan(instance, def));
-	const place = (offset) => {
-		const [dx, dy] = rotateOffset(offset, instance.rotation);
-		return {
-			boardId: instance.boardId,
-			x: instance.anchor.x + dx,
-			y: instance.anchor.y + dy
-		};
-	};
-	return {
-		pins: local.pins.map(([pinNumber, offset]) => ({
-			pinNumber,
-			point: place(offset)
-		})),
-		blocked: local.blocked.map(place)
-	};
 }
 //#endregion
 //#region src/core/circuit/circuitIndex.ts
@@ -27113,112 +27095,287 @@ function netHasSource(net, index, source) {
 	return net.pins.some((r) => pinDefinition(index, r)?.role === role) || net.groupIds.some((g) => groupInfo(index, g)?.source === source);
 }
 //#endregion
-//#region src/editor/ids.ts
-/** 元件編號前綴（參考電路圖的慣例）。 */
-var ID_PREFIX = {
-	ic: "U",
-	resistor: "R",
-	led: "D",
-	vcc: "V",
-	gnd: "G",
-	"dc-power": "P",
-	"dip-switch": "SW",
-	pushbutton: "BTN",
-	clock: "CLK",
-	"seven-seg": "DS",
-	capacitor: "C"
+//#region src/core/circuit/powerRails.ts
+var POWER_COLORS = {
+	"+": "#d32f2f",
+	"-": "#212121"
 };
-function nextNumbered(ids, prefix) {
-	const pattern = new RegExp(`^${prefix}(\\d+)$`);
-	let max = 0;
-	for (const id of ids) {
-		const match = pattern.exec(id);
-		if (match) max = Math.max(max, Number(match[1]));
+var SYMBOL_OF = {
+	"+": "vcc",
+	"-": "gnd"
+};
+/** 新補的符號從第幾欄開始找空孔（和轉換原本放的位置一樣靠左）。 */
+var SYMBOL_FROM_X = 3;
+/** 電源軌的極性看群組 ID 最後一個字（例如 b1:rail-T+）。 */
+var railPolarity = (board, groupId) => board.groups[groupId]?.kind !== "rail" ? null : groupId.endsWith("+") ? "+" : groupId.endsWith("-") ? "-" : null;
+/** 每個群組裡的孔。 */
+function holesByGroup(board) {
+	const out = /* @__PURE__ */ new Map();
+	for (const n of board.nodes) {
+		if (!n.groupId) continue;
+		const list = out.get(n.groupId);
+		if (list) list.push(n);
+		else out.set(n.groupId, [n]);
 	}
-	return `${prefix}${max + 1}`;
+	return out;
 }
-/** 取「目前最大號 + 1」，刪掉的編號不會被重複使用，避免和舊的存檔或截圖混淆。 */
-function nextComponentId(circuit, category) {
-	return nextNumbered(circuit.components.map((c) => c.id), ID_PREFIX[category]);
-}
-function nextWireId(circuit) {
-	return nextNumbered(circuit.wires.map((w) => w.id), "w");
-}
-//#endregion
-//#region src/editor/boards.ts
-function mmFromUnits(units) {
-	return Math.round(units * 2.54 * 1e3) / 1e3 || 0;
-}
-function boardRect(instance) {
-	const board = getBoard(instance.layoutId, instance.id);
-	return {
-		id: instance.id,
-		x: unitsFromMm(instance.x),
-		y: unitsFromMm(instance.y),
-		width: board.width + 2,
-		height: board.height + 2
-	};
-}
-function boardRects(circuit) {
-	return circuit.boards.map(boardRect);
-}
-/** 內部重疊（邊貼邊不算）。 */
-function rectsOverlap(a, b) {
-	return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
-}
-/** 由板子的位置推導出的 Board Group（至少兩塊板），依 ID 排序。ID 為 `g-` + 組內最小的板子 ID。 */
-function boardGroups(circuit) {
-	const lattice = buildLattice(circuit.boards);
-	const members = /* @__PURE__ */ new Map();
-	for (const b of lattice.boards) {
-		const root = lattice.groupOf.get(b.id);
-		const list = members.get(root);
-		if (list) list.push(b.id);
-		else members.set(root, [b.id]);
-	}
-	const groups = [];
-	for (const [root, ids] of members) {
-		if (ids.length < 2) continue;
-		const boards = ids.map((id) => lattice.byId.get(id));
-		const x = Math.min(...boards.map((b) => b.ox));
-		const y = Math.min(...boards.map((b) => b.oy));
-		const right = Math.max(...boards.map((b) => b.ox + b.width));
-		const bottom = Math.max(...boards.map((b) => b.oy + b.height));
-		groups.push({
-			id: `g-${root}`,
-			boardIds: [...ids].sort(compareIds),
-			x,
-			y,
-			width: right - x,
-			height: bottom - y,
-			rotation: 0
-		});
-	}
-	return groups.sort((a, b) => compareIds(a.id, b.id));
-}
-/** 位置對齊格點，並依幾何重新寫入每塊板的 groupId。沒有變化時回傳原本的 circuit。 */
-function normalizeBoardGroups(circuit) {
-	const aligned = circuit.boards.map((b) => {
-		const x = mmFromUnits(unitsFromMm(b.x));
-		const y = mmFromUnits(unitsFromMm(b.y));
-		return x === b.x && y === b.y ? b : {
-			...b,
-			x,
+function nearestIn(board, holes, groupId, polarity) {
+	const ys = (holes.get(groupId) ?? []).map((n) => n.y);
+	if (ys.length === 0) return null;
+	let best = null;
+	for (const id of Object.keys(board.groups).sort(compareIds)) {
+		if (railPolarity(board, id) !== polarity) continue;
+		const railYs = (holes.get(id) ?? []).map((n) => n.y);
+		if (railYs.length === 0) continue;
+		const distance = Math.min(...ys.flatMap((y) => railYs.map((ry) => Math.abs(y - ry))));
+		const y = Math.min(...railYs);
+		if (!best || distance < best.distance || distance === best.distance && y < best.y) best = {
+			id,
+			distance,
 			y
 		};
+	}
+	return best ? {
+		id: best.id,
+		distance: best.distance
+	} : null;
+}
+var nextId = (used, prefix) => {
+	let n = 1;
+	for (const id of used) {
+		const m = new RegExp(`^${prefix}(\\d+)$`).exec(id);
+		if (m) n = Math.max(n, Number(m[1]) + 1);
+	}
+	used.add(`${prefix}${n}`);
+	return `${prefix}${n}`;
+};
+/**
+* 把電源（power / ground）Net 重新接成「每個腳的群組 → 最近的同極性軌」：拿掉這些 Net 原本的導線，
+* 每個群組拉一條直線到最近的軌（群組裡離軌最近的空孔 → 軌上 x 最接近的空孔）；用到的軌沒有符號就補一個，
+* 沒有用到的軌上的 vcc / gnd 符號拿掉。訊號 Net 的導線與其他元件不動。
+*/
+function connectPowerToNearestRails(circuit) {
+	const index = indexCircuit(circuit);
+	const nets = extractNets(circuit).filter((n) => n.kind === "power" || n.kind === "ground");
+	if (nets.length === 0) return {
+		circuit,
+		added: [],
+		removed: []
+	};
+	const holes = /* @__PURE__ */ new Map();
+	const holesOf = (boardId) => {
+		if (!holes.has(boardId)) holes.set(boardId, holesByGroup(index.boards.get(boardId)));
+		return holes.get(boardId);
+	};
+	const boardOfGroup = (groupId) => groupId.slice(0, groupId.indexOf(":"));
+	const links = [];
+	for (const net of nets) {
+		const polarity = net.kind === "power" ? "+" : "-";
+		for (const cluster of terminalClusters(net, index)) {
+			let best = null;
+			for (const group of cluster) {
+				const boardId = boardOfGroup(group);
+				const board = index.boards.get(boardId);
+				if (board.groups[group]?.kind === "rail") {
+					best = null;
+					break;
+				}
+				const rail = nearestIn(board, holesOf(boardId), group, polarity);
+				if (rail && (!best || rail.distance < best.distance)) best = {
+					group,
+					rail: rail.id,
+					distance: rail.distance
+				};
+			}
+			if (best) links.push({
+				group: best.group,
+				rail: best.rail,
+				polarity
+			});
+		}
+	}
+	const powerGroups = new Set(nets.flatMap((n) => n.groupIds));
+	const touchesPower = (w) => [w.start, w.end].some((p) => {
+		const g = groupOfPoint(index, p);
+		return g !== null && powerGroups.has(g);
 	});
-	const groupOf = /* @__PURE__ */ new Map();
-	for (const g of boardGroups({ boards: aligned })) for (const id of g.boardIds) groupOf.set(id, g.id);
-	const boards = aligned.map((b) => {
-		const groupId = groupOf.get(b.id) ?? null;
-		return b.groupId === groupId ? b : {
-			...b,
-			groupId
+	const kept = circuit.wires.filter((w) => !touchesPower(w));
+	const usedRails = new Map(links.map((l) => [l.rail, l.polarity]));
+	for (const net of nets) {
+		const polarity = net.kind === "power" ? "+" : "-";
+		for (const ref of net.pins) {
+			const owner = circuit.components.find((c) => c.id === ref.componentId);
+			if (!owner || owner.defId === "vcc" || owner.defId === "gnd") continue;
+			const p = pinPoint(index, ref);
+			const g = p ? groupOfPoint(index, p) : null;
+			if (g && index.boards.get(boardOfGroup(g))?.groups[g]?.kind === "rail") usedRails.set(g, polarity);
+		}
+	}
+	const symbolRail = (c) => {
+		const p = pinPoint(index, {
+			componentId: c.id,
+			pinNumber: 1
+		});
+		return p ? groupOfPoint(index, p) : null;
+	};
+	const symbols = circuit.components.filter((c) => c.defId === "vcc" || c.defId === "gnd");
+	const removed = symbols.filter((c) => {
+		const rail = symbolRail(c);
+		return rail !== null && rail.includes(":rail-") && usedRails.get(rail) !== (c.defId === "vcc" ? "+" : "-");
+	}).map((c) => c.id);
+	const occupied = /* @__PURE__ */ new Set([...index.pinsAt.keys(), ...index.bodiesAt.keys()]);
+	for (const id of removed) {
+		const p = pinPoint(index, {
+			componentId: symbols.find((s) => s.id === id).id,
+			pinNumber: 1
+		});
+		if (p) occupied.delete(nodeIdOf(p));
+	}
+	for (const w of kept) for (const p of [w.start, w.end]) occupied.add(nodeIdOf(p));
+	const take = (n, boardId) => {
+		const p = {
+			boardId,
+			x: n.x,
+			y: n.y
 		};
-	});
-	return boards.every((b, i) => b === circuit.boards[i]) ? circuit : {
-		...circuit,
-		boards
+		occupied.add(nodeIdOf(p));
+		return p;
+	};
+	const free = (boardId, n) => !occupied.has(nodeIdOf({
+		boardId,
+		x: n.x,
+		y: n.y
+	}));
+	const ids = new Set(circuit.components.map((c) => c.id));
+	const added = [];
+	for (const [rail, polarity] of [...usedRails].sort((a, b) => compareIds(a[0], b[0]))) {
+		const defId = SYMBOL_OF[polarity];
+		if (symbols.some((c) => c.defId === defId && symbolRail(c) === rail && !removed.includes(c.id))) continue;
+		const boardId = boardOfGroup(rail);
+		const spot = (holesOf(boardId).get(rail) ?? []).filter((n) => n.x >= SYMBOL_FROM_X && free(boardId, n)).sort((a, b) => a.x - b.x)[0];
+		if (!spot) continue;
+		const at = take(spot, boardId);
+		added.push({
+			id: nextId(ids, defId === "vcc" ? "V" : "G"),
+			defId,
+			boardId,
+			anchor: {
+				x: at.x,
+				y: at.y
+			},
+			rotation: 0,
+			props: {}
+		});
+	}
+	const wireIds = new Set(kept.map((w) => w.id));
+	let n = 0;
+	const wireId = () => {
+		let id;
+		do
+			id = `pw${++n}`;
+		while (wireIds.has(id));
+		wireIds.add(id);
+		return id;
+	};
+	const wires = [];
+	for (const { group, rail, polarity } of links) {
+		const boardId = boardOfGroup(group);
+		const railHoles = holesOf(boardId).get(rail) ?? [];
+		const railY = railHoles[0]?.y ?? 0;
+		const groupHoles = [...holesOf(boardId).get(group) ?? []].sort((a, b) => Math.abs(a.y - railY) - Math.abs(b.y - railY) || a.x - b.x);
+		const from = groupHoles.find((h) => free(boardId, h)) ?? groupHoles[0];
+		if (!from) continue;
+		const start = take(from, boardId);
+		const to = [...railHoles].filter((h) => free(boardId, h)).sort((a, b) => Math.abs(a.x - start.x) - Math.abs(b.x - start.x) || a.x - b.x)[0];
+		if (!to) continue;
+		const end = take(to, boardId);
+		wires.push({
+			id: wireId(),
+			color: POWER_COLORS[polarity],
+			source: "manual",
+			straight: true,
+			start,
+			end,
+			path: [{ ...start }, { ...end }]
+		});
+	}
+	return {
+		circuit: {
+			...circuit,
+			components: [...circuit.components.filter((c) => !removed.includes(c.id)), ...added],
+			wires: [...kept, ...wires]
+		},
+		added,
+		removed
+	};
+}
+//#endregion
+//#region src/core/routing/config.ts
+/** 起始值；Task 14 會用固定測試電路校準。 */
+var DEFAULT_ROUTING_CONFIG = {
+	weights: {
+		distance: 1,
+		wire: 6,
+		via: 3,
+		crossing: 1e3,
+		congestion: 2,
+		rail: 200
+	},
+	negotiation: {
+		overlapBase: 50,
+		presentFactor: .5,
+		presentFactorGrowth: 1.6,
+		historyIncrement: 1,
+		maxIterations: 150,
+		maxImprovementPasses: 3
+	},
+	timeBudgetMs: 5e3,
+	priority: {
+		power: 1e3,
+		spread: 10,
+		scarcity: 100
+	},
+	scoring: {
+		overlap: 30,
+		crossing: 8,
+		lengthMax: 20,
+		extraBend: 1.5,
+		extraBendMax: 15,
+		shortJog: 2,
+		shortJogMax: 10
+	},
+	placement: {
+		candidatesPerIc: 3,
+		maxPasses: 2,
+		timeBudgetMs: 2e4,
+		candidateIterations: 30,
+		nearestPowerRail: false
+	}
+};
+function mergeConfig(overrides) {
+	const d = DEFAULT_ROUTING_CONFIG;
+	return {
+		weights: {
+			...d.weights,
+			...overrides?.weights
+		},
+		negotiation: {
+			...d.negotiation,
+			...overrides?.negotiation
+		},
+		timeBudgetMs: overrides?.timeBudgetMs ?? d.timeBudgetMs,
+		priority: {
+			...d.priority,
+			...overrides?.priority
+		},
+		scoring: {
+			...d.scoring,
+			...overrides?.scoring
+		},
+		placement: {
+			...d.placement,
+			...overrides?.placement
+		}
 	};
 }
 //#endregion
@@ -27467,6 +27624,1398 @@ function analyzeWireInteractions(wires, lattice) {
 		});
 	}
 	return result;
+}
+//#endregion
+//#region src/core/routing/legality.ts
+/**
+* 獨立於佈線器的檢查（規格 2026-10-10 routing-standard 第 3 節）：任何一項不通過，autoRoute 就不能輸出那個 Net 的線。
+* 每條線是水平或垂直的直線；兩端插在這個 Net 的終端排或空的五孔排（轉接排）；一孔一線；不經過元件腳、本體、線端；不重疊；
+* 子專案 39：不交叉；連接關係不變。
+*/
+function checkRoutingLegality(circuit, wires) {
+	const index = indexCircuit(circuit);
+	const reference = extractNetsWith(index, circuit.wires);
+	const terminals = new Map(reference.map((net) => [net.id, new Set(terminalGroupIds(net, index))]));
+	const lattice = buildLattice(circuit.boards);
+	const isOnBoard = (p) => isRoutablePoint(lattice, p);
+	const pinGroups = /* @__PURE__ */ new Set();
+	for (const pc of index.placed) for (const pin of pc.footprint.pins) {
+		const g = groupOfPoint(index, pin.point);
+		if (g) pinGroups.add(g);
+	}
+	const endsAt = /* @__PURE__ */ new Map();
+	for (const w of wires) for (const p of [w.start, w.end]) pushTo(endsAt, nodeIdOf(p), w.id);
+	const out = [];
+	for (const w of wires) {
+		const netIds = w.netId ? [w.netId] : [];
+		const issues = pathIssues(w, isOnBoard, lattice);
+		const a = latticeOf(lattice, w.start);
+		const b = latticeOf(lattice, w.end);
+		if (!isStraight(w)) issues.push("NOT_STRAIGHT");
+		else if (a && b && a.x !== b.x && a.y !== b.y) issues.push("DIAGONAL");
+		const groups = [w.start, w.end].map((p) => nodeAt(index, p)?.groupId ?? null);
+		if (groups[0] !== null && groups[0] === groups[1]) issues.push("SAME_GROUP");
+		if (issues.length > 0) out.push({
+			code: "PATH_INVALID",
+			wireIds: [w.id],
+			netIds,
+			detail: issues.join(", ")
+		});
+		const allowed = w.netId ? terminals.get(w.netId) : void 0;
+		for (const end of [w.start, w.end]) {
+			const node = nodeAt(index, end);
+			const id = nodeIdOf(end);
+			const g = node?.groupId ?? null;
+			const groupOk = g !== null && allowed !== void 0 && (allowed.has(g) || !pinGroups.has(g));
+			if (!(node !== void 0 && node.kind === "hole" && groupOk && !index.pinsAt.has(id) && !index.bodiesAt.has(id) && (endsAt.get(id)?.length ?? 0) === 1)) out.push({
+				code: "ENDPOINT_INVALID",
+				wireIds: [w.id],
+				netIds,
+				detail: node?.name ?? id
+			});
+		}
+		const obstacle = cellsUnder(w, lattice).find((p) => {
+			const id = nodeIdOf(p);
+			return index.pinsAt.has(id) || index.bodiesAt.has(id) || endsAt.has(id);
+		});
+		if (obstacle) out.push({
+			code: "THROUGH_OBSTACLE",
+			wireIds: [w.id],
+			netIds,
+			detail: nodeIdOf(obstacle)
+		});
+	}
+	const netOfWire = new Map(wires.map((w) => [w.id, w.netId]));
+	const netsOf = (ids) => [...new Set(ids.map((id) => netOfWire.get(id)).filter((n) => n !== void 0))].sort(compareIds);
+	const interactions = analyzeWireInteractions(wires, lattice);
+	for (const o of interactions.overlaps) out.push({
+		code: "OVERLAP",
+		wireIds: [...o.wireIds],
+		netIds: netsOf(o.wireIds),
+		detail: o.nodeId
+	});
+	for (const x of interactions.crossings) out.push({
+		code: "CROSSING",
+		wireIds: [...x.wireIds],
+		netIds: netsOf(x.wireIds),
+		detail: x.nodeId
+	});
+	for (const netId of mismatchedNets(index, reference, wires)) out.push({
+		code: "NET_MISMATCH",
+		wireIds: wires.filter((w) => w.netId === netId).map((w) => w.id),
+		netIds: [netId],
+		detail: `${netId} 的連接關係與原電路不同`
+	});
+	return out;
+}
+/** 用「元件 + wires」重新分析 Net，回傳終端群組沒連在一起、或和別的 Net 併在一起的基準 Net。 */
+function mismatchedNets(index, reference, wires) {
+	const produced = extractNetsWith(index, wires);
+	const producedOf = /* @__PURE__ */ new Map();
+	for (const net of produced) for (const g of net.groupIds) producedOf.set(g, net.id);
+	const bad = /* @__PURE__ */ new Set();
+	const owner = /* @__PURE__ */ new Map();
+	for (const net of reference) {
+		const ids = new Set(terminalGroupIds(net, index).map((g) => producedOf.get(g) ?? `missing:${g}`));
+		if (ids.size > 1) bad.add(net.id);
+		for (const pid of ids) {
+			const previous = owner.get(pid);
+			if (previous !== void 0 && previous !== net.id) {
+				bad.add(previous);
+				bad.add(net.id);
+			} else owner.set(pid, net.id);
+		}
+	}
+	return [...bad].sort(compareIds);
+}
+//#endregion
+//#region src/core/routing/colors.ts
+var POWER_COLOR = "#d32f2f";
+var GROUND_COLOR = "#212121";
+/** 黃、綠、藍、橘、白、紫、棕、灰。 */
+var SIGNAL_PALETTE = [
+	"#f9a825",
+	"#2e7d32",
+	"#1565c0",
+	"#ef6c00",
+	"#f5f5f5",
+	"#6a1b9a",
+	"#6d4c41",
+	"#9e9e9e"
+];
+function netColor(kind, signalIndex) {
+	if (kind === "power") return POWER_COLOR;
+	if (kind === "ground") return GROUND_COLOR;
+	return SIGNAL_PALETTE[Math.max(0, signalIndex) % SIGNAL_PALETTE.length];
+}
+//#endregion
+//#region src/core/routing/problem.ts
+function toPoint$1(problem, i) {
+	const p = problem.points[i];
+	if (!p) throw new Error(`Cell ${i} is not on any breadboard`);
+	return p;
+}
+var POST_COLORS = {
+	red: "紅",
+	black: "黑",
+	yellow: "黃",
+	green: "綠"
+};
+/** 導通群組的中文說明；withBoard 為 true 時加上板子 ID（多塊板時使用）。 */
+function describeGroup(groupId, withBoard = false) {
+	const colon = groupId.indexOf(":");
+	const local = groupId.slice(colon + 1);
+	const prefix = withBoard ? `${groupId.slice(0, colon)} ` : "";
+	const column = /^(?:a(\d+)-)?c(\d+)-(top|bot)$/.exec(local);
+	if (column) return `${prefix}${column[1] ? `第 ${column[1]} 區` : ""}第 ${column[2]} 欄${column[3] === "top" ? "上半（A–E）" : "下半（F–J）"}`;
+	const post = /^post-(\w+)$/.exec(local);
+	if (post) return `${prefix}${POST_COLORS[post[1]] ?? post[1]}色接線柱`;
+	return `${prefix}${local.replace("rail-", "")} 電源軌`;
+}
+var boardOfGroup = (groupId) => groupId.slice(0, groupId.indexOf(":"));
+/** 每個 Board Group 一張佈線格子；單塊板的格子索引與以前相同（x 1–63、y 1–18）。 */
+function buildRoutingProblems(circuit, config) {
+	const index = indexCircuit(circuit);
+	const lattice = buildLattice(circuit.boards);
+	const referenceNets = extractNetsWith(index, circuit.wires);
+	const routableSignals = referenceNets.filter((n) => n.kind === "signal" && terminalClusters(n, index).length >= 2).map((n) => n.id);
+	const spanning = [];
+	const netsByCanvas = /* @__PURE__ */ new Map();
+	for (const net of referenceNets) {
+		const boards = [...new Set(terminalGroupIds(net, index).map(boardOfGroup))].sort(compareIds);
+		const canvases = new Set(boards.map((b) => lattice.groupOf.get(b) ?? b));
+		if (canvases.size > 1 && terminalClusters(net, index).length >= 2) {
+			spanning.push({
+				net,
+				boardIds: boards
+			});
+			continue;
+		}
+		const canvas = [...canvases][0];
+		if (!canvas) continue;
+		const list = netsByCanvas.get(canvas);
+		if (list) list.push(net);
+		else netsByCanvas.set(canvas, [net]);
+	}
+	return {
+		problems: latticeGroups(lattice).map((groupId) => buildCanvasProblem(index, lattice, buildCanvas(lattice, groupId), referenceNets, netsByCanvas.get(groupId) ?? [], routableSignals, config)),
+		spanning
+	};
+}
+function buildCanvasProblem(index, lattice, canvas, referenceNets, canvasNets, routableSignals, config) {
+	const { width, height, size } = canvas;
+	const at = (p) => canvasIndex(canvas, lattice, p);
+	const blocked = new Uint8Array(size);
+	for (let i = 0; i < size; i++) if (!canvas.routable[i]) blocked[i] = 1;
+	for (const pc of index.placed) {
+		for (const pin of pc.footprint.pins) {
+			const i = at(pin.point);
+			if (i >= 0) blocked[i] = 1;
+		}
+		for (const cell of pc.footprint.blocked) {
+			const i = at(cell);
+			if (i >= 0) blocked[i] = 1;
+		}
+	}
+	const groupAt = canvas.points.map((p) => p ? getNode(lattice.byId.get(p.boardId).board, p.x, p.y)?.groupId ?? null : null);
+	const groupIds = canvas.boardIds.flatMap((id) => Object.keys(lattice.byId.get(id).board.groups)).sort(compareIds);
+	const freeHoles = new Map(groupIds.map((g) => [g, []]));
+	groupAt.forEach((g, i) => {
+		if (g && !blocked[i]) freeHoles.get(g)?.push(i);
+	});
+	const isRail = (g) => lattice.byId.get(boardOfGroup(g))?.board.groups[g]?.kind === "rail";
+	const nets = canvasNets.map((net) => {
+		const terminalGroups = terminalGroupIds(net, index);
+		const clusters = terminalClusters(net, index);
+		const pinsIn = (cluster) => net.pins.filter((ref) => {
+			const p = pinPoint(index, ref);
+			const g = p ? groupOfPoint(index, p) : null;
+			return g !== null && cluster.includes(g);
+		}).length;
+		let startCluster = clusters.findIndex((cl) => cl.some(isRail));
+		if (startCluster < 0) {
+			startCluster = 0;
+			for (let i = 1; i < clusters.length; i++) if (pinsIn(clusters[i]) > pinsIn(clusters[startCluster])) startCluster = i;
+		}
+		const holes = terminalGroups.flatMap((g) => freeHoles.get(g) ?? []);
+		const xs = holes.map((i) => i % width);
+		const ys = holes.map((i) => Math.floor(i / width));
+		const spread = holes.length > 0 ? Math.max(...xs) - Math.min(...xs) + (Math.max(...ys) - Math.min(...ys)) : 0;
+		const freeIn = (cluster) => cluster.reduce((sum, g) => sum + (freeHoles.get(g)?.length ?? 0), 0);
+		const minFree = clusters.length > 0 ? Math.min(...clusters.map(freeIn)) : 0;
+		const priority = (net.kind === "signal" ? 0 : config.priority.power) + spread * config.priority.spread + config.priority.scarcity / (minFree + 1);
+		return {
+			netId: net.id,
+			kind: net.kind,
+			terminalGroups,
+			clusters,
+			startCluster,
+			priority,
+			color: netColor(net.kind, routableSignals.indexOf(net.id))
+		};
+	});
+	nets.sort((a, b) => b.priority - a.priority || compareIds(a.netId, b.netId));
+	const pinGroups = /* @__PURE__ */ new Set();
+	for (const pc of index.placed) for (const pin of pc.footprint.pins) {
+		const g = groupOfPoint(index, pin.point);
+		if (g) pinGroups.add(g);
+	}
+	const railGroups = new Set(groupIds.filter(isRail));
+	const groupOwner = /* @__PURE__ */ new Map();
+	for (const net of nets) for (const g of net.terminalGroups) groupOwner.set(g, net.netId);
+	const terminalHole = new Uint8Array(size);
+	for (const net of nets) {
+		if (net.clusters.length < 2) continue;
+		for (const g of net.terminalGroups) for (const i of freeHoles.get(g) ?? []) terminalHole[i] = 1;
+	}
+	return {
+		boardIds: canvas.boardIds,
+		originX: canvas.originX,
+		originY: canvas.originY,
+		width,
+		height,
+		size,
+		points: canvas.points,
+		blocked,
+		groupAt,
+		freeHoles,
+		terminalHole,
+		pinGroups,
+		railGroups,
+		groupOwner,
+		nets,
+		referenceNets,
+		index,
+		lattice
+	};
+}
+//#endregion
+//#region src/core/routing/minHeap.ts
+/** 以 key 排序的最小堆積；key 相同時先放入者先出，確保結果確定。 */
+var MinHeap = class {
+	keys = [];
+	seqs = [];
+	values = [];
+	counter = 0;
+	get size() {
+		return this.values.length;
+	}
+	push(key, value) {
+		this.keys.push(key);
+		this.seqs.push(this.counter++);
+		this.values.push(value);
+		this.siftUp(this.values.length - 1);
+	}
+	pop() {
+		if (this.values.length === 0) return void 0;
+		const top = {
+			key: this.keys[0],
+			value: this.values[0]
+		};
+		this.swap(0, this.values.length - 1);
+		this.keys.pop();
+		this.seqs.pop();
+		this.values.pop();
+		if (this.values.length > 0) this.siftDown(0);
+		return top;
+	}
+	less(i, j) {
+		return this.keys[i] < this.keys[j] || this.keys[i] === this.keys[j] && this.seqs[i] < this.seqs[j];
+	}
+	swap(i, j) {
+		const k = this.keys[i];
+		this.keys[i] = this.keys[j];
+		this.keys[j] = k;
+		const s = this.seqs[i];
+		this.seqs[i] = this.seqs[j];
+		this.seqs[j] = s;
+		const v = this.values[i];
+		this.values[i] = this.values[j];
+		this.values[j] = v;
+	}
+	siftUp(i) {
+		while (i > 0) {
+			const parent = i - 1 >> 1;
+			if (!this.less(i, parent)) return;
+			this.swap(i, parent);
+			i = parent;
+		}
+	}
+	siftDown(i) {
+		const n = this.values.length;
+		for (;;) {
+			const left = 2 * i + 1;
+			const right = left + 1;
+			let smallest = i;
+			if (left < n && this.less(left, smallest)) smallest = left;
+			if (right < n && this.less(right, smallest)) smallest = right;
+			if (smallest === i) return;
+			this.swap(i, smallest);
+			i = smallest;
+		}
+	}
+};
+//#endregion
+//#region src/core/routing/straightSearch.ts
+/** a、b 在同一列或同一欄時，兩點之間的直線。 */
+function lineBetween(problem, a, b) {
+	const w = problem.width;
+	const o = Math.floor(a / w) === Math.floor(b / w) ? 0 : 1;
+	const step = o === 0 ? Math.sign(b - a) : Math.sign(b - a) * w;
+	if (o === 1 && a % w !== b % w) throw new Error("Cells are not in one row or column");
+	const cells = [];
+	for (let c = a + step; c !== b; c += step) cells.push(c);
+	return {
+		a,
+		b,
+		o,
+		cells
+	};
+}
+/** 已經有 count 個使用者時再用一次的成本：協商時越擠、歷史越多越貴；嚴格模式不允許。 */
+function conflictCost(params, count, history) {
+	if (count === 0) return params.overlap.kind === "negotiate" ? history : 0;
+	if (params.overlap.kind === "hard") return Infinity;
+	return (params.overlap.overlapBase + history) * (1 + params.overlap.presentFactor * count);
+}
+/** 把線端插在 cell：孔上已有的線端、從上面經過的線都算衝突。 */
+function endCost(state, cell, params) {
+	return conflictCost(params, state.ends[cell].length + state.lines[cell * 2].length + state.lines[cell * 2 + 1].length, state.histEnd[cell]);
+}
+/**
+* 線從 cell 上方經過（方向 o）：別條線的端點、同方向的線是衝突；垂直的線是交叉；別的 Net 的終端空孔加擁擠成本。
+* 子專案 39（規格 2026-10-20 wiring-rules）：交叉不准：嚴格模式不能交叉；協商時先算很貴的成本，之後當成衝突排開。
+*/
+function passCost(problem, state, netId, cell, o, params) {
+	const crossing = state.lines[cell * 2 + (1 - o)].length;
+	if (crossing > 0 && params.overlap.kind === "hard") return Infinity;
+	let cost = conflictCost(params, state.ends[cell].length + state.lines[cell * 2 + o].length, state.histLine[cell * 2 + o]);
+	if (crossing > 0) cost += conflictCost(params, crossing, state.histLine[cell * 2 + (1 - o)]);
+	const g = problem.groupAt[cell];
+	if (problem.terminalHole[cell] && !(g && state.owns(netId, g))) cost += params.weights.congestion;
+	return cost;
+}
+/**
+* 線端可以插在 group 嗎：自己的排（終端排、用過的轉接排），或空的五孔排（新的轉接排）。
+* 子專案 47：沒有接電源、沒有元件腳的電源軌也可以當轉接排（整條相通，等於一條長的訊號通道）；有電源的軌是電源 Net 的終端排，別的 Net 不能用。
+*/
+function groupUse(problem, state, netId, group) {
+	if (state.owns(netId, group)) return "own";
+	if (problem.pinGroups.has(group)) return null;
+	const owner = problem.groupOwner.get(group);
+	return owner === void 0 || owner === netId ? "via" : null;
+}
+function viaCost(problem, state, netId, group, params) {
+	const rail = problem.railGroups.has(group) ? params.weights.rail : 0;
+	return params.weights.via + rail + conflictCost(params, state.viaOthers(netId, group), state.histVia.get(group) ?? 0);
+}
+var DX = [
+	1,
+	0,
+	-1,
+	0
+];
+var DY = [
+	0,
+	1,
+	0,
+	-1
+];
+/**
+* 規格 2.1：從 sources 那些排的空孔出發、到 targets 任一排為止，最便宜的一串直線（Dijkstra）。
+* 狀態 = 孔 × {IN, OUT}：IN(h) 是一條線停在 h；OUT(h) 是一條線從 h 出發。換孔（同一排）不花成本，所以不用估計函式。
+*/
+function findRoute(problem, state, net, sources, targets, params) {
+	const { width, height, size, blocked, groupAt } = problem;
+	const dist = new Float64Array(size * 2).fill(Infinity);
+	const parent = new Int32Array(size * 2).fill(-1);
+	const heap = new MinHeap();
+	const relax = (s, cost, from) => {
+		if (!Number.isFinite(cost) || cost >= dist[s]) return;
+		dist[s] = cost;
+		parent[s] = from;
+		heap.push(cost, s);
+	};
+	for (const g of [...sources].sort()) for (const c of problem.freeHoles.get(g) ?? []) relax(c * 2 + 1, endCost(state, c, params), -1);
+	while (heap.size > 0) {
+		const top = heap.pop();
+		const s = top.value;
+		if (top.key > dist[s]) continue;
+		const c = s >> 1;
+		const g = groupAt[c];
+		if ((s & 1) === 0) {
+			if (targets.has(g)) return {
+				wires: reconstruct(problem, parent, s),
+				cost: dist[s]
+			};
+			const passed = new Set(lineBetween(problem, parent[s] >> 1, c).cells);
+			for (const h of problem.freeHoles.get(g) ?? []) if (h !== c && !passed.has(h)) relax(h * 2 + 1, dist[s] + endCost(state, h, params), s);
+			continue;
+		}
+		const before = parent[s];
+		const arrived = before >= 0 && (before & 1) === 0 ? lineBetween(problem, parent[before] >> 1, before >> 1) : null;
+		const avoid = arrived ? /* @__PURE__ */ new Set([arrived.b, ...arrived.cells]) : null;
+		for (let d = 0; d < 4; d++) {
+			const o = d % 2 === 0 ? 0 : 1;
+			let x = c % width;
+			let y = Math.floor(c / width);
+			let acc = dist[s] + params.weights.wire;
+			for (let len = 1;; len++) {
+				x += DX[d];
+				y += DY[d];
+				if (x < 0 || y < 0 || x >= width || y >= height) break;
+				const q = y * width + x;
+				if (blocked[q] || avoid?.has(q)) break;
+				const gq = groupAt[q];
+				if (gq !== null && gq !== g) {
+					const use = groupUse(problem, state, net.netId, gq);
+					if (use) {
+						let cost = acc + params.weights.distance * len + endCost(state, q, params);
+						if (use === "via") cost += viaCost(problem, state, net.netId, gq, params);
+						relax(q * 2, cost, s);
+					}
+				}
+				acc += passCost(problem, state, net.netId, q, o, params);
+				if (!Number.isFinite(acc)) break;
+			}
+		}
+	}
+	return null;
+}
+/** 狀態鏈 OUT → IN → OUT → IN …：每一對 OUT → IN 是一條線。 */
+function reconstruct(problem, parent, goal) {
+	const chain = [];
+	for (let s = goal; s !== -1; s = parent[s]) chain.push(s);
+	chain.reverse();
+	const out = [];
+	for (let i = 0; i + 1 < chain.length; i++) if ((chain[i] & 1) === 1 && (chain[i + 1] & 1) === 0) out.push(lineBetween(problem, chain[i] >> 1, chain[i + 1] >> 1));
+	return out;
+}
+/** 用和 findRoute 相同的成本定義，計算在目前 state 下放一條線的成本（改善階段比較新舊用）。 */
+function wireCost(problem, state, net, line, params) {
+	let cost = endCost(state, line.a, params) + params.weights.wire + params.weights.distance * (line.cells.length + 1) + endCost(state, line.b, params);
+	for (const c of line.cells) cost += passCost(problem, state, net.netId, c, line.o, params);
+	const g = problem.groupAt[line.b];
+	if (g && groupUse(problem, state, net.netId, g) === "via") cost += viaCost(problem, state, net.netId, g, params);
+	return cost;
+}
+//#endregion
+//#region src/core/routing/straightNet.ts
+/**
+* 規格 2.2：Prim 式生成樹。每次從「已連上的排」（終端排與用過的轉接排）找一串直線到任一還沒連上的簇，
+* 有電源軌的 Net 先只從電源軌出發（星形），找不到才從整棵樹出發；
+* 把線加進 state。呼叫前 state 裡不能有這個 Net 的線。
+*/
+function routeNet(problem, state, net, params) {
+	const holesOf = (cluster) => cluster.flatMap((g) => problem.freeHoles.get(g) ?? []);
+	const multiBoard = problem.boardIds.length > 1;
+	const describe = (cluster) => cluster.map((g) => describeGroup(g, multiBoard)).join("＋");
+	const full = net.clusters.find((cl) => holesOf(cl).length === 0);
+	if (full) return {
+		ok: false,
+		reason: "NO_FREE_HOLE",
+		detail: `${describe(full)}沒有空孔可以接線`
+	};
+	const clusterOf = /* @__PURE__ */ new Map();
+	net.clusters.forEach((cl, i) => cl.forEach((g) => clusterOf.set(g, i)));
+	const connected = new Set(net.clusters[net.startCluster]);
+	const remaining = new Set(net.clusters.map((_, i) => i).filter((i) => i !== net.startCluster));
+	let cost = 0;
+	let k = 0;
+	while (remaining.size > 0) {
+		const targets = new Set([...remaining].flatMap((i) => net.clusters[i]));
+		const rails = new Set([...connected].filter((g) => problem.railGroups.has(g)));
+		const found = (rails.size > 0 ? findRoute(problem, state, net, rails, targets, params) : null) ?? findRoute(problem, state, net, connected, targets, params);
+		if (!found) {
+			state.removeNet(net.netId);
+			const missing = [...remaining].map((i) => describe(net.clusters[i])).join("、");
+			return {
+				ok: false,
+				reason: "UNROUTABLE",
+				detail: `${net.netId} 無法連到 ${missing}`
+			};
+		}
+		for (const line of found.wires) {
+			state.addWire({
+				id: `${net.netId}#${k++}`,
+				netId: net.netId,
+				...line
+			});
+			for (const end of [line.a, line.b]) {
+				const g = problem.groupAt[end];
+				if (!clusterOf.has(g)) connected.add(g);
+			}
+		}
+		if (params.overlap.kind === "hard" && state.conflicts().some((x) => state.netsIn([x]).has(net.netId))) {
+			state.removeNet(net.netId);
+			return {
+				ok: false,
+				reason: "UNROUTABLE",
+				detail: `${net.netId} 的線彼此衝突，找不到合法的接法`
+			};
+		}
+		cost += found.cost;
+		const reached = clusterOf.get(problem.groupAt[found.wires[found.wires.length - 1].b]);
+		for (const g of net.clusters[reached]) connected.add(g);
+		remaining.delete(reached);
+	}
+	return {
+		ok: true,
+		cost
+	};
+}
+//#endregion
+//#region src/core/routing/straightState.ts
+/** 協商佈線時已放的直線導線、每個資源的使用者，以及歷史擁擠成本。 */
+var StraightState = class {
+	problem;
+	ends;
+	lines;
+	histEnd;
+	histLine;
+	histVia = /* @__PURE__ */ new Map();
+	viaUse = /* @__PURE__ */ new Map();
+	wires = /* @__PURE__ */ new Map();
+	byNet = /* @__PURE__ */ new Map();
+	terminals;
+	constructor(problem) {
+		this.problem = problem;
+		this.ends = Array.from({ length: problem.size }, () => []);
+		this.lines = Array.from({ length: problem.size * 2 }, () => []);
+		this.histEnd = new Float64Array(problem.size);
+		this.histLine = new Float64Array(problem.size * 2);
+		this.terminals = new Map(problem.nets.map((n) => [n.netId, new Set(n.terminalGroups)]));
+	}
+	/** 這一排是不是這個 Net 的終端排，或它的線已經插在這一排（轉接排）。 */
+	owns(netId, group) {
+		return this.terminals.get(netId)?.has(group) === true || (this.viaUse.get(group)?.get(netId) ?? 0) > 0;
+	}
+	/** 把這一排當轉接排的其他 Net 數。 */
+	viaOthers(netId, group) {
+		let n = 0;
+		for (const [id, count] of this.viaUse.get(group) ?? []) if (id !== netId && count > 0) n++;
+		return n;
+	}
+	bumpVia(netId, cell, delta) {
+		const g = this.problem.groupAt[cell];
+		if (!g || this.terminals.get(netId)?.has(g)) return;
+		const m = this.viaUse.get(g) ?? /* @__PURE__ */ new Map();
+		const next = (m.get(netId) ?? 0) + delta;
+		if (next > 0) m.set(netId, next);
+		else m.delete(netId);
+		if (m.size > 0) this.viaUse.set(g, m);
+		else this.viaUse.delete(g);
+	}
+	addWire(w) {
+		if (this.wires.has(w.id)) throw new Error(`Wire ${w.id} is already placed`);
+		this.wires.set(w.id, w);
+		const list = this.byNet.get(w.netId);
+		if (list) list.push(w.id);
+		else this.byNet.set(w.netId, [w.id]);
+		for (const end of [w.a, w.b]) {
+			this.ends[end].push(w.id);
+			this.bumpVia(w.netId, end, 1);
+		}
+		for (const c of w.cells) this.lines[c * 2 + w.o].push(w.id);
+	}
+	removeWire(id) {
+		const w = this.wires.get(id);
+		if (!w) return;
+		for (const end of [w.a, w.b]) {
+			this.ends[end] = this.ends[end].filter((x) => x !== id);
+			this.bumpVia(w.netId, end, -1);
+		}
+		for (const c of w.cells) this.lines[c * 2 + w.o] = this.lines[c * 2 + w.o].filter((x) => x !== id);
+		this.wires.delete(id);
+		const rest = (this.byNet.get(w.netId) ?? []).filter((x) => x !== id);
+		if (rest.length > 0) this.byNet.set(w.netId, rest);
+		else this.byNet.delete(w.netId);
+	}
+	removeNet(netId) {
+		for (const id of [...this.byNet.get(netId) ?? []]) this.removeWire(id);
+	}
+	wiresOf(netId) {
+		return (this.byNet.get(netId) ?? []).map((id) => this.wires.get(id));
+	}
+	conflicts() {
+		const out = [];
+		for (let c = 0; c < this.ends.length; c++) {
+			if (this.ends[c].length > 1) out.push({
+				kind: "end",
+				cell: c
+			});
+			if (this.ends[c].length > 0 && this.lines[c * 2].length + this.lines[c * 2 + 1].length > 0) out.push({
+				kind: "pass",
+				cell: c
+			});
+			for (const o of [0, 1]) if (this.lines[c * 2 + o].length > 1) out.push({
+				kind: "line",
+				cell: c,
+				o
+			});
+			if (this.lines[c * 2].length > 0 && this.lines[c * 2 + 1].length > 0) out.push({
+				kind: "cross",
+				cell: c
+			});
+		}
+		for (const [group, m] of [...this.viaUse].sort((x, y) => x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0)) if (m.size > 1) out.push({
+			kind: "via",
+			group
+		});
+		return out;
+	}
+	netsIn(conflicts) {
+		const nets = /* @__PURE__ */ new Set();
+		const add = (ids) => ids.forEach((id) => nets.add(this.wires.get(id).netId));
+		for (const x of conflicts) if (x.kind === "end") add(this.ends[x.cell]);
+		else if (x.kind === "pass") add([
+			...this.ends[x.cell],
+			...this.lines[x.cell * 2],
+			...this.lines[x.cell * 2 + 1]
+		]);
+		else if (x.kind === "line") add(this.lines[x.cell * 2 + x.o]);
+		else if (x.kind === "cross") add([...this.lines[x.cell * 2], ...this.lines[x.cell * 2 + 1]]);
+		else for (const id of this.viaUse.get(x.group)?.keys() ?? []) nets.add(id);
+		return nets;
+	}
+	bumpHistory(conflicts, increment) {
+		for (const x of conflicts) if (x.kind === "end" || x.kind === "pass") this.histEnd[x.cell] += increment;
+		else if (x.kind === "line") this.histLine[x.cell * 2 + x.o] += increment;
+		else if (x.kind === "cross") {
+			this.histLine[x.cell * 2] += increment;
+			this.histLine[x.cell * 2 + 1] += increment;
+		} else this.histVia.set(x.group, (this.histVia.get(x.group) ?? 0) + increment);
+	}
+};
+//#endregion
+//#region src/core/routing/metrics.ts
+function computeMetrics(wires, lattice) {
+	const { overlaps, crossings } = analyzeWireInteractions(wires, lattice);
+	return {
+		wireCount: wires.length,
+		totalLength: Math.round(wires.reduce((sum, w) => sum + wireLength(w, lattice), 0) * 10) / 10,
+		bends: wires.reduce((sum, w) => sum + countBends(w.path, lattice), 0),
+		crossings: crossings.length,
+		overlaps: overlaps.length,
+		shortJogs: wires.reduce((sum, w) => sum + countShortJogs(w.path, lattice), 0)
+	};
+}
+//#endregion
+//#region src/core/routing/score.ts
+function holePoints(index, groupId) {
+	const all = (groupInfo(index, groupId)?.nodeIds ?? []).map(parseNodeId);
+	const free = all.filter((p) => {
+		const id = nodeIdOf(p);
+		return !index.pinsAt.has(id) && !index.bodiesAt.has(id);
+	});
+	return free.length > 0 ? free : all;
+}
+/** 兩組格點間的最小曼哈頓距離（以全域格子座標計算，跨板也正確）。 */
+function groupDistance(a, b) {
+	let best = Infinity;
+	for (const p of a) for (const q of b) best = Math.min(best, Math.abs(p.x - q.x) + Math.abs(p.y - q.y));
+	return best;
+}
+/** 不考慮障礙物時，把各簇連成一棵樹的最短總長（Prim 最小生成樹）。 */
+function netLowerBound(index, clusters, lattice) {
+	if (clusters.length < 2) return 0;
+	const toLattice = (p) => lattice ? latticeOf(lattice, p) ?? p : p;
+	const points = clusters.map((cl) => cl.flatMap((g) => holePoints(index, g)).map(toLattice));
+	const inTree = new Array(clusters.length).fill(false);
+	const best = new Array(clusters.length).fill(Infinity);
+	best[0] = 0;
+	let total = 0;
+	for (let step = 0; step < clusters.length; step++) {
+		let pick = -1;
+		for (let i = 0; i < clusters.length; i++) if (!inTree[i] && (pick < 0 || best[i] < best[pick])) pick = i;
+		inTree[pick] = true;
+		total += best[pick];
+		for (let j = 0; j < clusters.length; j++) if (!inTree[j]) best[j] = Math.min(best[j], groupDistance(points[pick], points[j]));
+	}
+	return total;
+}
+/** 以 circuit.wires 分析出的 Net 為基準，替任何一組導線評分（0–100）。 */
+function scoreRouting(circuit, wires = circuit.wires, overrides) {
+	const weights = mergeConfig(overrides).scoring;
+	const index = indexCircuit(circuit);
+	const lattice = buildLattice(circuit.boards);
+	const metrics = computeMetrics(wires, lattice);
+	const isOnBoard = (p) => isRoutablePoint(lattice, p);
+	const broken = wires.some((w) => pathIssues(w, isOnBoard, lattice).length > 0 || [w.start, w.end].some((p) => nodeAt(index, p)?.kind !== "hole"));
+	const reference = extractNetsWith(index, circuit.wires);
+	if (broken || mismatchedNets(index, reference, wires).length > 0) return {
+		metrics,
+		score: 0
+	};
+	const obstacleHits = wires.filter((w) => cellsUnder(w, lattice).some((p) => {
+		const id = nodeIdOf(p);
+		return index.pinsAt.has(id) || index.bodiesAt.has(id);
+	})).length;
+	const lowerBound = reference.reduce((sum, net) => sum + netLowerBound(index, terminalClusters(net, index), lattice), 0);
+	const efficiency = metrics.totalLength === 0 ? 1 : Math.min(1, lowerBound / metrics.totalLength);
+	const penalty = (metrics.overlaps + obstacleHits) * weights.overlap + metrics.crossings * weights.crossing + weights.lengthMax * (1 - efficiency) + Math.min(weights.extraBendMax, Math.max(0, metrics.bends - metrics.wireCount) * weights.extraBend) + Math.min(weights.shortJogMax, metrics.shortJogs * weights.shortJog);
+	return {
+		metrics,
+		score: Math.round(Math.max(0, Math.min(100, 100 - penalty)) * 10) / 10
+	};
+}
+//#endregion
+//#region src/core/routing/autoRoute.ts
+function autoRoute$1(circuit, overrides) {
+	const started = performance.now();
+	const config = mergeConfig(overrides);
+	const { problems, spanning } = buildRoutingProblems(circuit, config);
+	const failed = /* @__PURE__ */ new Map();
+	const outOfTime = () => performance.now() - started > config.timeBudgetMs;
+	for (const { net, boardIds } of spanning) failed.set(net.id, {
+		netId: net.id,
+		reason: "UNROUTABLE",
+		detail: `${net.id} 連到沒有貼在一起的麵包板（${boardIds.join("、")}），請先把麵包板貼合成同一個群組`
+	});
+	let iterations = 0;
+	let routableCount = spanning.length;
+	let wires = [];
+	for (const problem of problems) {
+		const routed = routeCanvas(problem, config, failed, outOfTime);
+		iterations = Math.max(iterations, routed.iterations);
+		routableCount += routed.routable;
+		wires.push(...routed.wires);
+	}
+	const violations = checkRoutingLegality(circuit, wires);
+	for (const netId of [...new Set(violations.flatMap((v) => v.netIds))].sort(compareIds)) {
+		if (failed.has(netId)) continue;
+		const codes = [...new Set(violations.filter((v) => v.netIds.includes(netId)).map((v) => v.code))].join(", ");
+		failed.set(netId, {
+			netId,
+			reason: "LEGALITY_CHECK",
+			detail: `${netId} 沒有通過合法性檢查（${codes}）`
+		});
+	}
+	wires = wires.filter((w) => w.netId !== void 0 && !failed.has(w.netId));
+	const failedNets = [...failed.values()].sort((a, b) => compareIds(a.netId, b.netId));
+	const status = failedNets.length === 0 ? "success" : failedNets.length < routableCount ? "partial" : "failed";
+	const { metrics, score } = scoreRouting(circuit, wires, overrides);
+	return {
+		status,
+		message: status === "success" ? "Standard Routing Complete" : "No valid routing solution.",
+		wires,
+		failedNets,
+		metrics,
+		score,
+		stats: {
+			iterations,
+			elapsedMs: Math.round(performance.now() - started)
+		}
+	};
+}
+/** 在一張格子（一個 Board Group）上協商佈線：先允許重疊、逐輪提高成本，再在不准碰的條件下逐一改善。 */
+function routeCanvas(problem, config, failed, outOfTime) {
+	const state = new StraightState(problem);
+	const markFailed = (net, reason, detail) => {
+		state.removeNet(net.netId);
+		failed.set(net.netId, {
+			netId: net.netId,
+			reason,
+			detail
+		});
+	};
+	const routable = problem.nets.filter((n) => n.clusters.length >= 2);
+	const hard = {
+		weights: config.weights,
+		overlap: { kind: "hard" }
+	};
+	const negotiate = (presentFactor) => ({
+		weights: config.weights,
+		overlap: {
+			kind: "negotiate",
+			overlapBase: config.negotiation.overlapBase,
+			presentFactor
+		}
+	});
+	let active = routable;
+	let toRoute = routable;
+	let presentFactor = config.negotiation.presentFactor;
+	let iterations = 0;
+	while (toRoute.length > 0) {
+		iterations++;
+		for (const net of toRoute) {
+			state.removeNet(net.netId);
+			const result = routeNet(problem, state, net, negotiate(presentFactor));
+			if (!result.ok) markFailed(net, result.reason, result.detail);
+		}
+		active = active.filter((n) => !failed.has(n.netId));
+		const conflicts = state.conflicts();
+		if (conflicts.length === 0) break;
+		if (iterations >= config.negotiation.maxIterations || outOfTime()) {
+			const reason = outOfTime() ? "TIME_LIMIT" : "ITERATION_LIMIT";
+			active = dropConflicts(problem, state, active, hard, (net) => markFailed(net, reason, `${net.netId} 在 ${iterations} 輪協商後仍無法避開其他導線`));
+			break;
+		}
+		state.bumpHistory(conflicts, config.negotiation.historyIncrement);
+		presentFactor *= config.negotiation.presentFactorGrowth;
+		const touched = state.netsIn(conflicts);
+		toRoute = active.filter((n) => touched.has(n.netId));
+	}
+	const repairUntil = performance.now() + config.timeBudgetMs * REPAIR_SHARE;
+	for (let round = 0; round < REPAIR_ROUNDS; round++) {
+		let fixed = false;
+		for (const net of routable) {
+			if (performance.now() > repairUntil) break;
+			const why = failed.get(net.netId)?.reason;
+			if (why !== "TIME_LIMIT" && why !== "ITERATION_LIMIT" && why !== "UNROUTABLE") continue;
+			if (!ripUpAndReroute(problem, state, net, active, hard, negotiate(presentFactor))) continue;
+			failed.delete(net.netId);
+			active = routable.filter((n) => active.includes(n) || n === net);
+			fixed = true;
+		}
+		if (!fixed) break;
+	}
+	for (let pass = 0; pass < config.negotiation.maxImprovementPasses && !outOfTime(); pass++) {
+		let improved = false;
+		for (const net of active) {
+			if (outOfTime()) break;
+			if (rerouteIfCheaper(problem, state, net, hard)) improved = true;
+		}
+		if (!improved) break;
+	}
+	return {
+		wires: active.flatMap((net) => state.wiresOf(net.netId).map((stored, k) => toWire(problem, stored, net, k))),
+		iterations,
+		routable: routable.length
+	};
+}
+/** 把優先序最低、仍有衝突的 Net 逐一拿掉直到沒有衝突，再用嚴格模式試著放回去（優先序高的先放）。 */
+function dropConflicts(problem, state, active, hard, onFail) {
+	const dropped = [];
+	for (let conflicts = state.conflicts(); conflicts.length > 0; conflicts = state.conflicts()) {
+		const touched = state.netsIn(conflicts);
+		const victim = [...active].reverse().find((n) => touched.has(n.netId) && !dropped.includes(n));
+		if (!victim) break;
+		state.removeNet(victim.netId);
+		dropped.push(victim);
+	}
+	const failedIds = /* @__PURE__ */ new Set();
+	for (const net of [...dropped].reverse()) if (!routeNet(problem, state, net, hard).ok) {
+		onFail(net);
+		failedIds.add(net.netId);
+	}
+	return active.filter((n) => !failedIds.has(n.netId));
+}
+/** 子專案 48：拆線重接最多拆幾個 Net、最多幾輪、最多多用時間限制的幾成。 */
+var MAX_VICTIMS = 3;
+var REPAIR_ROUNDS = 3;
+var REPAIR_SHARE = .1;
+/**
+* 子專案 48：允許重疊把 net 接上，拆掉和它衝突的 Net（最多 MAX_VICTIMS 個），在不准碰的條件下依原本的順序重接。
+* 全部接得上才回傳 true；否則還原成原本的線。
+*/
+function ripUpAndReroute(problem, state, net, active, hard, soft) {
+	state.removeNet(net.netId);
+	if (!routeNet(problem, state, net, soft).ok) return false;
+	const victims = active.filter((n) => n !== net && state.netsIn(state.conflicts()).has(n.netId));
+	if (victims.length > MAX_VICTIMS) {
+		state.removeNet(net.netId);
+		return false;
+	}
+	const saved = victims.map((n) => ({
+		net: n,
+		wires: state.wiresOf(n.netId).map((w) => ({
+			...w,
+			cells: [...w.cells]
+		}))
+	}));
+	for (const v of victims) state.removeNet(v.netId);
+	const undo = () => {
+		state.removeNet(net.netId);
+		for (const v of saved) {
+			state.removeNet(v.net.netId);
+			for (const w of v.wires) state.addWire(w);
+		}
+		return false;
+	};
+	if (state.conflicts().length > 0) return undo();
+	for (const v of victims) if (!routeNet(problem, state, v, hard).ok) return undo();
+	return true;
+}
+/** 在其他線都不准碰的條件下重排 net；總成本下降才保留，否則還原。 */
+function rerouteIfCheaper(problem, state, net, hard) {
+	const old = state.wiresOf(net.netId).map((w) => ({
+		...w,
+		cells: [...w.cells]
+	}));
+	state.removeNet(net.netId);
+	let oldCost = 0;
+	for (const w of old) {
+		oldCost += wireCost(problem, state, net, w, hard);
+		state.addWire(w);
+	}
+	state.removeNet(net.netId);
+	const result = routeNet(problem, state, net, hard);
+	if (result.ok && result.cost < oldCost - 1e-9) return true;
+	state.removeNet(net.netId);
+	for (const w of old) state.addWire(w);
+	return false;
+}
+/** 規格 2026-10-10 routing-standard：輸出的每條線都是水平或垂直的直線導線。 */
+function toWire(problem, placed, net, k) {
+	const start = toPoint$1(problem, placed.a);
+	const end = toPoint$1(problem, placed.b);
+	return {
+		id: `w_${net.netId}_${k + 1}`,
+		color: net.color,
+		source: "auto",
+		netId: net.netId,
+		straight: true,
+		start,
+		end,
+		path: [{ ...start }, { ...end }]
+	};
+}
+//#endregion
+//#region src/core/icPlacement/relocate.ts
+/** 元件目前的位置。 */
+function placementOf(c) {
+	return {
+		boardId: c.boardId,
+		anchor: {
+			x: c.anchor.x,
+			y: c.anchor.y
+		},
+		rotation: c.rotation
+	};
+}
+function samePlacement(a, b) {
+	return a.boardId === b.boardId && a.anchor.x === b.anchor.x && a.anchor.y === b.anchor.y && a.rotation === b.rotation;
+}
+/** 把元件放到 p（回傳新物件）。 */
+function placeAt(c, p) {
+	return {
+		...c,
+		boardId: p.boardId,
+		anchor: {
+			x: p.anchor.x,
+			y: p.anchor.y
+		},
+		rotation: p.rotation
+	};
+}
+/** 套用搬移：搬過的元件換成新物件，其他沿用原本的參照；沒有搬移時回傳同一個陣列。 */
+function applyMoves(components, moves) {
+	if (moves.length === 0) return components;
+	const to = new Map(moves.map((m) => [m.componentId, m.to]));
+	return components.map((c) => {
+		const p = to.get(c.id);
+		return p ? placeAt(c, p) : c;
+	});
+}
+/** 群組的第一個格點（描述連接關係的導線端點）。 */
+function groupPoint(index, groupId) {
+	const nodeId = index.boards.get(groupId.slice(0, groupId.indexOf(":")))?.groups[groupId]?.nodeIds[0];
+	if (!nodeId) throw new Error(`Unknown group ${groupId}`);
+	return parseNodeId(nodeId);
+}
+/**
+* 規格 2026-10-10 ic-placement 2.2：IC 搬到新位置後的電路。導線換成「描述連接關係的導線」：每個原本的 Net
+* 把它在新位置的終端排（腳所在的排＋它的電源軌）依序串起來。這些線只告訴佈線器哪些排要接在一起，不會出現在結果裡。
+*/
+function relocatedCircuit(circuit, nets, moves) {
+	const moved = {
+		...circuit,
+		components: applyMoves(circuit.components, moves),
+		wires: []
+	};
+	const index = indexCircuit(moved);
+	const wires = [];
+	for (const net of nets) {
+		const groups = terminalGroupIds(net, index);
+		for (let i = 1; i < groups.length; i++) {
+			const start = groupPoint(index, groups[i - 1]);
+			const end = groupPoint(index, groups[i]);
+			wires.push({
+				id: `link_${net.id}_${i}`,
+				color: "#888888",
+				source: "manual",
+				straight: true,
+				start,
+				end,
+				path: [{ ...start }, { ...end }]
+			});
+		}
+	}
+	return {
+		...moved,
+		wires
+	};
+}
+/** 規格 2.3：兩組 Net 是否把腳分成完全相同的組（以腳為準，不管 Net 的名稱與群組）。 */
+function samePinPartition(a, b) {
+	const key = (nets) => nets.map((n) => n.pins.map(pinKey).join(",")).sort().join("|");
+	return key(a) === key(b);
+}
+//#endregion
+//#region src/core/icPlacement/candidates.ts
+var ROTATIONS$2 = [0, 180];
+/**
+* 規格 2026-10-10 ic-placement 3.1：一顆 IC 的所有合法位置。其他元件固定在 circuit 裡的位置；導線不管（佈線時會換掉）。
+* 同一個 Board Group 的每塊板、每個孔當錨點、旋轉 0 / 180 度：每支腳插在沒被佔用的五孔排、各在不同的排，本體不碰其他元件，
+* 同一排裡其他元件的腳必須和這支腳屬於原本的同一個 Net（nets）。順序：板子 ID、y、x、旋轉。
+*/
+function icCandidates(circuit, nets, componentId) {
+	const index = indexCircuit(circuit);
+	const self = index.placedById.get(componentId);
+	if (!self) throw new Error(`Unknown component ${componentId}`);
+	const lattice = buildLattice(circuit.boards);
+	const group = lattice.groupOf.get(self.instance.boardId);
+	const boardIds = circuit.boards.map((b) => b.id).filter((id) => lattice.groupOf.get(id) === group).sort(compareIds);
+	const netOf = netByPin(nets);
+	const taken = /* @__PURE__ */ new Set();
+	const netsInGroup = /* @__PURE__ */ new Map();
+	for (const pc of index.placed) {
+		if (pc.instance.id === componentId) continue;
+		for (const cell of pc.footprint.blocked) taken.add(nodeIdOf(cell));
+		for (const pin of pc.footprint.pins) {
+			taken.add(nodeIdOf(pin.point));
+			const g = groupOfPoint(index, pin.point);
+			const net = netOf.get(pinKey({
+				componentId: pc.instance.id,
+				pinNumber: pin.pinNumber
+			}));
+			if (!g || !net) continue;
+			const set = netsInGroup.get(g) ?? /* @__PURE__ */ new Set();
+			set.add(net.id);
+			netsInGroup.set(g, set);
+		}
+	}
+	const fits = (p) => {
+		const board = index.boards.get(p.boardId);
+		const fp = resolveFootprint(placeAt(self.instance, p), self.def);
+		const used = /* @__PURE__ */ new Set();
+		for (const pin of fp.pins) {
+			const node = getNode(board, pin.point.x, pin.point.y);
+			if (!node || node.kind !== "hole" || !node.groupId || taken.has(node.id) || used.has(node.groupId)) return false;
+			if (groupInfo(index, node.groupId)?.kind !== "terminal") return false;
+			used.add(node.groupId);
+			const mine = netOf.get(pinKey({
+				componentId,
+				pinNumber: pin.pinNumber
+			}))?.id;
+			for (const other of netsInGroup.get(node.groupId) ?? []) if (other !== mine) return false;
+		}
+		for (const cell of fp.blocked) {
+			const node = getNode(board, cell.x, cell.y);
+			if (!node || taken.has(node.id)) return false;
+		}
+		return true;
+	};
+	const out = [];
+	for (const boardId of boardIds) for (const node of index.boards.get(boardId).nodes) {
+		if (node.kind !== "hole") continue;
+		for (const rotation of ROTATIONS$2) {
+			const p = {
+				boardId,
+				anchor: {
+					x: node.x,
+					y: node.y
+				},
+				rotation
+			};
+			if (fits(p)) out.push(p);
+		}
+	}
+	return out;
+}
+//#endregion
+//#region src/core/icPlacement/estimate.ts
+/** 兩孔之間：同一列或同一行算 1 條線，否則 2 條線、1 個轉接；不管障礙與交叉。 */
+function pairCost(a, b, w) {
+	const length = Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+	return a.x === b.x || a.y === b.y ? w.wire + length * w.distance : 2 * w.wire + w.via + length * w.distance;
+}
+/** Prim：從第 0 簇開始，每次接上最便宜的一簇；兩簇之間取兩邊的孔兩兩比較的最小值。 */
+function spanningCost(clusters, w) {
+	if (clusters.length < 2) return 0;
+	const between = (a, b) => {
+		let best = Infinity;
+		for (const p of a) for (const q of b) best = Math.min(best, pairCost(p, q, w));
+		return best;
+	};
+	const inTree = clusters.map((_, i) => i === 0);
+	const dist = clusters.map((c, i) => i === 0 ? 0 : between(clusters[0], c));
+	let total = 0;
+	for (let added = 1; added < clusters.length; added++) {
+		let next = -1;
+		for (let i = 0; i < clusters.length; i++) if (!inTree[i] && (next < 0 || dist[i] < dist[next])) next = i;
+		inTree[next] = true;
+		total += dist[next];
+		for (let i = 0; i < clusters.length; i++) if (!inTree[i]) dist[i] = Math.min(dist[i], between(clusters[next], clusters[i]));
+	}
+	return total;
+}
+/**
+* 規格 2026-10-10 ic-placement 3.2：很快的估計。每個 Net 的終端排依元件內部導通分簇，簇與簇之間用最小生成樹相連。
+* index 是要估計的那個擺法（元件已經在新位置）；座標用全域格子，同組的兩塊板可以直接比較。
+*/
+function estimateNets(index, lattice, nets, weights) {
+	let total = 0;
+	for (const net of nets) {
+		const clusters = terminalClusters(net, index).map((cluster) => cluster.flatMap((g) => (index.boards.get(g.slice(0, g.indexOf(":")))?.groups[g]?.nodeIds ?? []).map((id) => latticeOf(lattice, parseNodeId(id))).filter((c) => c !== null)));
+		total += spanningCost(clusters, weights);
+	}
+	return total;
+}
+//#endregion
+//#region src/core/icPlacement/autoPlace.ts
+/** 子專案 48：重排目前的擺法最多用掉這次「可移動 IC」時間的幾成。 */
+var RETRY_SHARE = .4;
+/** 規格 1 節的好壞順序：接不完的 Net 少 → 交叉少 → 線少 → 總長短。a 比 b 好才回傳 true（同分是 false）。 */
+function isBetterRouting(a, b) {
+	const key = (r) => [
+		r.failedNets.length,
+		r.metrics.crossings,
+		r.metrics.wireCount,
+		r.metrics.totalLength
+	];
+	const ka = key(a);
+	const kb = key(b);
+	for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] < kb[i];
+	return false;
+}
+/**
+* 規格 2026-10-10 ic-placement：「AI 佈線（可移動 IC）」。起點是「IC 都不動」的佈線；每顆 IC 輪流試粗估最好的幾個位置、
+* 實際佈線，比目前最好的結果好才採用。回傳的結果一定有 moves（沒有搬動時是空陣列）。
+* 子專案 41：from 是同一個電路之前的結果（例如轉成麵包板的快速試），從它接著搬，不重做已經做過的。
+*/
+function autoPlaceAndRoute(circuit, overrides, from) {
+	const started = performance.now();
+	const config = mergeConfig(overrides);
+	const { candidatesPerIc, maxPasses, timeBudgetMs } = config.placement;
+	const outOfTime = () => performance.now() - started > timeBudgetMs;
+	const nets = extractNets(circuit);
+	const lattice = buildLattice(circuit.boards);
+	const original = new Map(circuit.components.map((c) => [c.id, placementOf(c)]));
+	const route = (moves, options) => {
+		const relocated = relocatedCircuit(circuit, nets, moves);
+		if (moves.length > 0 && !samePinPartition(nets, extractNets(relocated))) return null;
+		if (!config.placement.nearestPowerRail) return autoRoute$1(relocated, options);
+		const power = connectPowerToNearestRails(relocated);
+		return {
+			...autoRoute$1(power.circuit, options),
+			powerSymbols: {
+				added: power.added,
+				removed: power.removed
+			}
+		};
+	};
+	let moves = from?.moves ?? [];
+	let best = from ?? route(moves, overrides);
+	const unfinished = (r) => r.failedNets.some((f) => f.reason === "TIME_LIMIT");
+	if (from && unfinished(best) && !outOfTime()) {
+		const longer = route(moves, {
+			...overrides,
+			timeBudgetMs: Math.max(config.timeBudgetMs, timeBudgetMs * RETRY_SHARE)
+		});
+		if (longer && isBetterRouting(longer, best)) best = longer;
+	}
+	const optionsFor = (r) => ({
+		...overrides,
+		negotiation: {
+			...overrides?.negotiation,
+			maxIterations: Math.min(config.negotiation.maxIterations, Math.max(config.placement.candidateIterations, 2 * r.stats.iterations))
+		}
+	});
+	let candidateOptions = optionsFor(best);
+	for (let pass = 0; pass < maxPasses && !outOfTime(); pass++) {
+		let improved = false;
+		for (const id of movableIcs(circuit, nets)) {
+			if (outOfTime()) break;
+			const layout = {
+				...circuit,
+				components: applyMoves(circuit.components, moves),
+				wires: []
+			};
+			for (const to of rankCandidates(layout, nets, id, lattice, config).slice(0, candidatesPerIc)) {
+				if (outOfTime()) break;
+				const next = withMove(moves, id, original.get(id), to);
+				const result = route(next, candidateOptions);
+				if (result && isBetterRouting(result, best)) {
+					best = result;
+					moves = next;
+					candidateOptions = optionsFor(best);
+					improved = true;
+				}
+			}
+		}
+		if (!improved) break;
+	}
+	return {
+		...best,
+		moves,
+		stats: {
+			...best.stats,
+			elapsedMs: Math.round(performance.now() - started)
+		}
+	};
+}
+/** 會動的 IC：接到其他元件的腳多的先，同分依元件 ID。 */
+function movableIcs(circuit, nets) {
+	const linked = /* @__PURE__ */ new Map();
+	for (const net of nets) {
+		if (new Set(net.pins.map((p) => p.componentId)).size < 2) continue;
+		for (const p of net.pins) linked.set(p.componentId, (linked.get(p.componentId) ?? 0) + 1);
+	}
+	return circuit.components.filter((c) => getComponentDefinition(c.defId)?.category === "ic").map((c) => c.id).sort((a, b) => (linked.get(b) ?? 0) - (linked.get(a) ?? 0) || compareIds(a, b));
+}
+/** 這顆 IC 的合法位置（不含目前的位置）依粗估由小到大；同分維持 icCandidates 的順序。 */
+function rankCandidates(layout, nets, id, lattice, config) {
+	const here = placementOf(layout.components.find((c) => c.id === id));
+	const mine = nets.filter((n) => n.pins.some((p) => p.componentId === id));
+	return icCandidates(layout, nets, id).filter((p) => !samePlacement(p, here)).map((p, order) => {
+		const components = layout.components.map((c) => c.id === id ? placeAt(c, p) : c);
+		return {
+			p,
+			order,
+			cost: estimateNets(indexCircuit({
+				...layout,
+				components
+			}), lattice, mine, config.weights)
+		};
+	}).sort((a, b) => a.cost - b.cost || a.order - b.order).map((x) => x.p);
+}
+/** 把 id 搬到 to（搬回原位就刪掉這筆）；依元件 ID 排序，結果固定。 */
+function withMove(moves, id, from, to) {
+	const rest = moves.filter((m) => m.componentId !== id);
+	return (samePlacement(from, to) ? rest : [...rest, {
+		componentId: id,
+		from,
+		to
+	}]).sort((a, b) => compareIds(a.componentId, b.componentId));
+}
+//#endregion
+//#region src/editor/notes.ts
+var NOTE_COLORS = [
+	"yellow",
+	"blue",
+	"green",
+	"pink"
+];
+/** 元件刪除後，指向它的便條拿掉指向（沒有受影響時回傳原本的陣列）；子專案 29：板子刪除後，指向那塊板上的孔也拿掉。 */
+function dropNoteTargets(notes, removed, removedBoard) {
+	const hit = (n) => n.target !== void 0 && removed.has(n.target) || removedBoard !== void 0 && n.targetHole?.boardId === removedBoard;
+	if (!notes || !notes.some(hit)) return notes;
+	return notes.map((n) => {
+		if (!hit(n)) return n;
+		const { target: _old, targetHole: _hole, ...rest } = n;
+		return rest;
+	});
+}
+//#endregion
+//#region src/editor/ids.ts
+/** 元件編號前綴（參考電路圖的慣例）。 */
+var ID_PREFIX = {
+	ic: "U",
+	resistor: "R",
+	led: "D",
+	vcc: "V",
+	gnd: "G",
+	"dc-power": "P",
+	"dip-switch": "SW",
+	pushbutton: "BTN",
+	clock: "CLK",
+	"seven-seg": "DS",
+	capacitor: "C"
+};
+function nextNumbered(ids, prefix) {
+	const pattern = new RegExp(`^${prefix}(\\d+)$`);
+	let max = 0;
+	for (const id of ids) {
+		const match = pattern.exec(id);
+		if (match) max = Math.max(max, Number(match[1]));
+	}
+	return `${prefix}${max + 1}`;
+}
+/** 取「目前最大號 + 1」，刪掉的編號不會被重複使用，避免和舊的存檔或截圖混淆。 */
+function nextComponentId(circuit, category) {
+	return nextNumbered(circuit.components.map((c) => c.id), ID_PREFIX[category]);
+}
+function nextWireId(circuit) {
+	return nextNumbered(circuit.wires.map((w) => w.id), "w");
+}
+//#endregion
+//#region src/editor/boards.ts
+function mmFromUnits(units) {
+	return Math.round(units * 2.54 * 1e3) / 1e3 || 0;
+}
+function boardRect(instance) {
+	const board = getBoard(instance.layoutId, instance.id);
+	return {
+		id: instance.id,
+		x: unitsFromMm(instance.x),
+		y: unitsFromMm(instance.y),
+		width: board.width + 2,
+		height: board.height + 2
+	};
+}
+function boardRects(circuit) {
+	return circuit.boards.map(boardRect);
+}
+/** 內部重疊（邊貼邊不算）。 */
+function rectsOverlap(a, b) {
+	return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+}
+/** 由板子的位置推導出的 Board Group（至少兩塊板），依 ID 排序。ID 為 `g-` + 組內最小的板子 ID。 */
+function boardGroups(circuit) {
+	const lattice = buildLattice(circuit.boards);
+	const members = /* @__PURE__ */ new Map();
+	for (const b of lattice.boards) {
+		const root = lattice.groupOf.get(b.id);
+		const list = members.get(root);
+		if (list) list.push(b.id);
+		else members.set(root, [b.id]);
+	}
+	const groups = [];
+	for (const [root, ids] of members) {
+		if (ids.length < 2) continue;
+		const boards = ids.map((id) => lattice.byId.get(id));
+		const x = Math.min(...boards.map((b) => b.ox));
+		const y = Math.min(...boards.map((b) => b.oy));
+		const right = Math.max(...boards.map((b) => b.ox + b.width));
+		const bottom = Math.max(...boards.map((b) => b.oy + b.height));
+		groups.push({
+			id: `g-${root}`,
+			boardIds: [...ids].sort(compareIds),
+			x,
+			y,
+			width: right - x,
+			height: bottom - y,
+			rotation: 0
+		});
+	}
+	return groups.sort((a, b) => compareIds(a.id, b.id));
+}
+/** 位置對齊格點，並依幾何重新寫入每塊板的 groupId。沒有變化時回傳原本的 circuit。 */
+function normalizeBoardGroups(circuit) {
+	const aligned = circuit.boards.map((b) => {
+		const x = mmFromUnits(unitsFromMm(b.x));
+		const y = mmFromUnits(unitsFromMm(b.y));
+		return x === b.x && y === b.y ? b : {
+			...b,
+			x,
+			y
+		};
+	});
+	const groupOf = /* @__PURE__ */ new Map();
+	for (const g of boardGroups({ boards: aligned })) for (const id of g.boardIds) groupOf.set(id, g.id);
+	const boards = aligned.map((b) => {
+		const groupId = groupOf.get(b.id) ?? null;
+		return b.groupId === groupId ? b : {
+			...b,
+			groupId
+		};
+	});
+	return boards.every((b, i) => b === circuit.boards[i]) ? circuit : {
+		...circuit,
+		boards
+	};
 }
 //#endregion
 //#region src/editor/placement.ts
@@ -30193,7 +31742,7 @@ function num(value, path) {
 	if (typeof value !== "number" || !Number.isFinite(value)) fail$1(path, "必須是數字");
 	return value;
 }
-var ROTATIONS$2 = /* @__PURE__ */ new Set([
+var ROTATIONS$1 = /* @__PURE__ */ new Set([
 	0,
 	90,
 	180,
@@ -30270,7 +31819,7 @@ function parseComponent(raw, path, boardIds) {
 	if (!boardIds.has(boardId)) fail$1(`${path}.boardId`, `找不到麵包板 ${boardId}`);
 	const anchor = obj(c.anchor, `${path}.anchor`);
 	const rotation = c.rotation ?? 0;
-	if (typeof rotation !== "number" || !ROTATIONS$2.has(rotation)) fail$1(`${path}.rotation`, "必須是 0、90、180 或 270");
+	if (typeof rotation !== "number" || !ROTATIONS$1.has(rotation)) fail$1(`${path}.rotation`, "必須是 0、90、180 或 270");
 	const instance = {
 		id,
 		defId,
@@ -30932,250 +32481,6 @@ function checkElectrical(index, nets, report) {
 			});
 		}
 	}
-}
-//#endregion
-//#region src/core/routing/config.ts
-/** 起始值；Task 14 會用固定測試電路校準。 */
-var DEFAULT_ROUTING_CONFIG = {
-	weights: {
-		distance: 1,
-		wire: 6,
-		via: 3,
-		crossing: 1e3,
-		congestion: 2,
-		rail: 200
-	},
-	negotiation: {
-		overlapBase: 50,
-		presentFactor: .5,
-		presentFactorGrowth: 1.6,
-		historyIncrement: 1,
-		maxIterations: 150,
-		maxImprovementPasses: 3
-	},
-	timeBudgetMs: 5e3,
-	priority: {
-		power: 1e3,
-		spread: 10,
-		scarcity: 100
-	},
-	scoring: {
-		overlap: 30,
-		crossing: 8,
-		lengthMax: 20,
-		extraBend: 1.5,
-		extraBendMax: 15,
-		shortJog: 2,
-		shortJogMax: 10
-	},
-	placement: {
-		candidatesPerIc: 3,
-		maxPasses: 2,
-		timeBudgetMs: 2e4,
-		candidateIterations: 30,
-		nearestPowerRail: false
-	}
-};
-function mergeConfig(overrides) {
-	const d = DEFAULT_ROUTING_CONFIG;
-	return {
-		weights: {
-			...d.weights,
-			...overrides?.weights
-		},
-		negotiation: {
-			...d.negotiation,
-			...overrides?.negotiation
-		},
-		timeBudgetMs: overrides?.timeBudgetMs ?? d.timeBudgetMs,
-		priority: {
-			...d.priority,
-			...overrides?.priority
-		},
-		scoring: {
-			...d.scoring,
-			...overrides?.scoring
-		},
-		placement: {
-			...d.placement,
-			...overrides?.placement
-		}
-	};
-}
-//#endregion
-//#region src/core/routing/legality.ts
-/**
-* 獨立於佈線器的檢查（規格 2026-10-10 routing-standard 第 3 節）：任何一項不通過，autoRoute 就不能輸出那個 Net 的線。
-* 每條線是水平或垂直的直線；兩端插在這個 Net 的終端排或空的五孔排（轉接排）；一孔一線；不經過元件腳、本體、線端；不重疊；
-* 子專案 39：不交叉；連接關係不變。
-*/
-function checkRoutingLegality(circuit, wires) {
-	const index = indexCircuit(circuit);
-	const reference = extractNetsWith(index, circuit.wires);
-	const terminals = new Map(reference.map((net) => [net.id, new Set(terminalGroupIds(net, index))]));
-	const lattice = buildLattice(circuit.boards);
-	const isOnBoard = (p) => isRoutablePoint(lattice, p);
-	const pinGroups = /* @__PURE__ */ new Set();
-	for (const pc of index.placed) for (const pin of pc.footprint.pins) {
-		const g = groupOfPoint(index, pin.point);
-		if (g) pinGroups.add(g);
-	}
-	const endsAt = /* @__PURE__ */ new Map();
-	for (const w of wires) for (const p of [w.start, w.end]) pushTo(endsAt, nodeIdOf(p), w.id);
-	const out = [];
-	for (const w of wires) {
-		const netIds = w.netId ? [w.netId] : [];
-		const issues = pathIssues(w, isOnBoard, lattice);
-		const a = latticeOf(lattice, w.start);
-		const b = latticeOf(lattice, w.end);
-		if (!isStraight(w)) issues.push("NOT_STRAIGHT");
-		else if (a && b && a.x !== b.x && a.y !== b.y) issues.push("DIAGONAL");
-		const groups = [w.start, w.end].map((p) => nodeAt(index, p)?.groupId ?? null);
-		if (groups[0] !== null && groups[0] === groups[1]) issues.push("SAME_GROUP");
-		if (issues.length > 0) out.push({
-			code: "PATH_INVALID",
-			wireIds: [w.id],
-			netIds,
-			detail: issues.join(", ")
-		});
-		const allowed = w.netId ? terminals.get(w.netId) : void 0;
-		for (const end of [w.start, w.end]) {
-			const node = nodeAt(index, end);
-			const id = nodeIdOf(end);
-			const g = node?.groupId ?? null;
-			const groupOk = g !== null && allowed !== void 0 && (allowed.has(g) || !pinGroups.has(g));
-			if (!(node !== void 0 && node.kind === "hole" && groupOk && !index.pinsAt.has(id) && !index.bodiesAt.has(id) && (endsAt.get(id)?.length ?? 0) === 1)) out.push({
-				code: "ENDPOINT_INVALID",
-				wireIds: [w.id],
-				netIds,
-				detail: node?.name ?? id
-			});
-		}
-		const obstacle = cellsUnder(w, lattice).find((p) => {
-			const id = nodeIdOf(p);
-			return index.pinsAt.has(id) || index.bodiesAt.has(id) || endsAt.has(id);
-		});
-		if (obstacle) out.push({
-			code: "THROUGH_OBSTACLE",
-			wireIds: [w.id],
-			netIds,
-			detail: nodeIdOf(obstacle)
-		});
-	}
-	const netOfWire = new Map(wires.map((w) => [w.id, w.netId]));
-	const netsOf = (ids) => [...new Set(ids.map((id) => netOfWire.get(id)).filter((n) => n !== void 0))].sort(compareIds);
-	const interactions = analyzeWireInteractions(wires, lattice);
-	for (const o of interactions.overlaps) out.push({
-		code: "OVERLAP",
-		wireIds: [...o.wireIds],
-		netIds: netsOf(o.wireIds),
-		detail: o.nodeId
-	});
-	for (const x of interactions.crossings) out.push({
-		code: "CROSSING",
-		wireIds: [...x.wireIds],
-		netIds: netsOf(x.wireIds),
-		detail: x.nodeId
-	});
-	for (const netId of mismatchedNets(index, reference, wires)) out.push({
-		code: "NET_MISMATCH",
-		wireIds: wires.filter((w) => w.netId === netId).map((w) => w.id),
-		netIds: [netId],
-		detail: `${netId} 的連接關係與原電路不同`
-	});
-	return out;
-}
-/** 用「元件 + wires」重新分析 Net，回傳終端群組沒連在一起、或和別的 Net 併在一起的基準 Net。 */
-function mismatchedNets(index, reference, wires) {
-	const produced = extractNetsWith(index, wires);
-	const producedOf = /* @__PURE__ */ new Map();
-	for (const net of produced) for (const g of net.groupIds) producedOf.set(g, net.id);
-	const bad = /* @__PURE__ */ new Set();
-	const owner = /* @__PURE__ */ new Map();
-	for (const net of reference) {
-		const ids = new Set(terminalGroupIds(net, index).map((g) => producedOf.get(g) ?? `missing:${g}`));
-		if (ids.size > 1) bad.add(net.id);
-		for (const pid of ids) {
-			const previous = owner.get(pid);
-			if (previous !== void 0 && previous !== net.id) {
-				bad.add(previous);
-				bad.add(net.id);
-			} else owner.set(pid, net.id);
-		}
-	}
-	return [...bad].sort(compareIds);
-}
-//#endregion
-//#region src/core/routing/metrics.ts
-function computeMetrics(wires, lattice) {
-	const { overlaps, crossings } = analyzeWireInteractions(wires, lattice);
-	return {
-		wireCount: wires.length,
-		totalLength: Math.round(wires.reduce((sum, w) => sum + wireLength(w, lattice), 0) * 10) / 10,
-		bends: wires.reduce((sum, w) => sum + countBends(w.path, lattice), 0),
-		crossings: crossings.length,
-		overlaps: overlaps.length,
-		shortJogs: wires.reduce((sum, w) => sum + countShortJogs(w.path, lattice), 0)
-	};
-}
-//#endregion
-//#region src/core/routing/score.ts
-function holePoints(index, groupId) {
-	const all = (groupInfo(index, groupId)?.nodeIds ?? []).map(parseNodeId);
-	const free = all.filter((p) => {
-		const id = nodeIdOf(p);
-		return !index.pinsAt.has(id) && !index.bodiesAt.has(id);
-	});
-	return free.length > 0 ? free : all;
-}
-/** 兩組格點間的最小曼哈頓距離（以全域格子座標計算，跨板也正確）。 */
-function groupDistance(a, b) {
-	let best = Infinity;
-	for (const p of a) for (const q of b) best = Math.min(best, Math.abs(p.x - q.x) + Math.abs(p.y - q.y));
-	return best;
-}
-/** 不考慮障礙物時，把各簇連成一棵樹的最短總長（Prim 最小生成樹）。 */
-function netLowerBound(index, clusters, lattice) {
-	if (clusters.length < 2) return 0;
-	const toLattice = (p) => lattice ? latticeOf(lattice, p) ?? p : p;
-	const points = clusters.map((cl) => cl.flatMap((g) => holePoints(index, g)).map(toLattice));
-	const inTree = new Array(clusters.length).fill(false);
-	const best = new Array(clusters.length).fill(Infinity);
-	best[0] = 0;
-	let total = 0;
-	for (let step = 0; step < clusters.length; step++) {
-		let pick = -1;
-		for (let i = 0; i < clusters.length; i++) if (!inTree[i] && (pick < 0 || best[i] < best[pick])) pick = i;
-		inTree[pick] = true;
-		total += best[pick];
-		for (let j = 0; j < clusters.length; j++) if (!inTree[j]) best[j] = Math.min(best[j], groupDistance(points[pick], points[j]));
-	}
-	return total;
-}
-/** 以 circuit.wires 分析出的 Net 為基準，替任何一組導線評分（0–100）。 */
-function scoreRouting(circuit, wires = circuit.wires, overrides) {
-	const weights = mergeConfig(overrides).scoring;
-	const index = indexCircuit(circuit);
-	const lattice = buildLattice(circuit.boards);
-	const metrics = computeMetrics(wires, lattice);
-	const isOnBoard = (p) => isRoutablePoint(lattice, p);
-	const broken = wires.some((w) => pathIssues(w, isOnBoard, lattice).length > 0 || [w.start, w.end].some((p) => nodeAt(index, p)?.kind !== "hole"));
-	const reference = extractNetsWith(index, circuit.wires);
-	if (broken || mismatchedNets(index, reference, wires).length > 0) return {
-		metrics,
-		score: 0
-	};
-	const obstacleHits = wires.filter((w) => cellsUnder(w, lattice).some((p) => {
-		const id = nodeIdOf(p);
-		return index.pinsAt.has(id) || index.bodiesAt.has(id);
-	})).length;
-	const lowerBound = reference.reduce((sum, net) => sum + netLowerBound(index, terminalClusters(net, index), lattice), 0);
-	const efficiency = metrics.totalLength === 0 ? 1 : Math.min(1, lowerBound / metrics.totalLength);
-	const penalty = (metrics.overlaps + obstacleHits) * weights.overlap + metrics.crossings * weights.crossing + weights.lengthMax * (1 - efficiency) + Math.min(weights.extraBendMax, Math.max(0, metrics.bends - metrics.wireCount) * weights.extraBend) + Math.min(weights.shortJogMax, metrics.shortJogs * weights.shortJog);
-	return {
-		metrics,
-		score: Math.round(Math.max(0, Math.min(100, 100 - penalty)) * 10) / 10
-	};
 }
 //#endregion
 //#region src/editor/analysis.ts
@@ -32293,1311 +33598,6 @@ async function makeShareLink(base, fileText) {
 /** 字數說明（太長時加上提醒）。 */
 function linkLengthNote(link) {
 	return link.length > 8e3 ? `連結有 ${link.length} 個字，有些通訊軟體會截斷很長的網址；大電路建議改用「匯出 JSON」。` : `連結有 ${link.length} 個字。`;
-}
-//#endregion
-//#region src/core/circuit/powerRails.ts
-var POWER_COLORS = {
-	"+": "#d32f2f",
-	"-": "#212121"
-};
-var SYMBOL_OF = {
-	"+": "vcc",
-	"-": "gnd"
-};
-/** 新補的符號從第幾欄開始找空孔（和轉換原本放的位置一樣靠左）。 */
-var SYMBOL_FROM_X = 3;
-/** 電源軌的極性看群組 ID 最後一個字（例如 b1:rail-T+）。 */
-var railPolarity = (board, groupId) => board.groups[groupId]?.kind !== "rail" ? null : groupId.endsWith("+") ? "+" : groupId.endsWith("-") ? "-" : null;
-/** 每個群組裡的孔。 */
-function holesByGroup(board) {
-	const out = /* @__PURE__ */ new Map();
-	for (const n of board.nodes) {
-		if (!n.groupId) continue;
-		const list = out.get(n.groupId);
-		if (list) list.push(n);
-		else out.set(n.groupId, [n]);
-	}
-	return out;
-}
-function nearestIn(board, holes, groupId, polarity) {
-	const ys = (holes.get(groupId) ?? []).map((n) => n.y);
-	if (ys.length === 0) return null;
-	let best = null;
-	for (const id of Object.keys(board.groups).sort(compareIds)) {
-		if (railPolarity(board, id) !== polarity) continue;
-		const railYs = (holes.get(id) ?? []).map((n) => n.y);
-		if (railYs.length === 0) continue;
-		const distance = Math.min(...ys.flatMap((y) => railYs.map((ry) => Math.abs(y - ry))));
-		const y = Math.min(...railYs);
-		if (!best || distance < best.distance || distance === best.distance && y < best.y) best = {
-			id,
-			distance,
-			y
-		};
-	}
-	return best ? {
-		id: best.id,
-		distance: best.distance
-	} : null;
-}
-var nextId = (used, prefix) => {
-	let n = 1;
-	for (const id of used) {
-		const m = new RegExp(`^${prefix}(\\d+)$`).exec(id);
-		if (m) n = Math.max(n, Number(m[1]) + 1);
-	}
-	used.add(`${prefix}${n}`);
-	return `${prefix}${n}`;
-};
-/**
-* 把電源（power / ground）Net 重新接成「每個腳的群組 → 最近的同極性軌」：拿掉這些 Net 原本的導線，
-* 每個群組拉一條直線到最近的軌（群組裡離軌最近的空孔 → 軌上 x 最接近的空孔）；用到的軌沒有符號就補一個，
-* 沒有用到的軌上的 vcc / gnd 符號拿掉。訊號 Net 的導線與其他元件不動。
-*/
-function connectPowerToNearestRails(circuit) {
-	const index = indexCircuit(circuit);
-	const nets = extractNets(circuit).filter((n) => n.kind === "power" || n.kind === "ground");
-	if (nets.length === 0) return {
-		circuit,
-		added: [],
-		removed: []
-	};
-	const holes = /* @__PURE__ */ new Map();
-	const holesOf = (boardId) => {
-		if (!holes.has(boardId)) holes.set(boardId, holesByGroup(index.boards.get(boardId)));
-		return holes.get(boardId);
-	};
-	const boardOfGroup = (groupId) => groupId.slice(0, groupId.indexOf(":"));
-	const links = [];
-	for (const net of nets) {
-		const polarity = net.kind === "power" ? "+" : "-";
-		for (const cluster of terminalClusters(net, index)) {
-			let best = null;
-			for (const group of cluster) {
-				const boardId = boardOfGroup(group);
-				const board = index.boards.get(boardId);
-				if (board.groups[group]?.kind === "rail") {
-					best = null;
-					break;
-				}
-				const rail = nearestIn(board, holesOf(boardId), group, polarity);
-				if (rail && (!best || rail.distance < best.distance)) best = {
-					group,
-					rail: rail.id,
-					distance: rail.distance
-				};
-			}
-			if (best) links.push({
-				group: best.group,
-				rail: best.rail,
-				polarity
-			});
-		}
-	}
-	const powerGroups = new Set(nets.flatMap((n) => n.groupIds));
-	const touchesPower = (w) => [w.start, w.end].some((p) => {
-		const g = groupOfPoint(index, p);
-		return g !== null && powerGroups.has(g);
-	});
-	const kept = circuit.wires.filter((w) => !touchesPower(w));
-	const usedRails = new Map(links.map((l) => [l.rail, l.polarity]));
-	for (const net of nets) {
-		const polarity = net.kind === "power" ? "+" : "-";
-		for (const ref of net.pins) {
-			const owner = circuit.components.find((c) => c.id === ref.componentId);
-			if (!owner || owner.defId === "vcc" || owner.defId === "gnd") continue;
-			const p = pinPoint(index, ref);
-			const g = p ? groupOfPoint(index, p) : null;
-			if (g && index.boards.get(boardOfGroup(g))?.groups[g]?.kind === "rail") usedRails.set(g, polarity);
-		}
-	}
-	const symbolRail = (c) => {
-		const p = pinPoint(index, {
-			componentId: c.id,
-			pinNumber: 1
-		});
-		return p ? groupOfPoint(index, p) : null;
-	};
-	const symbols = circuit.components.filter((c) => c.defId === "vcc" || c.defId === "gnd");
-	const removed = symbols.filter((c) => {
-		const rail = symbolRail(c);
-		return rail !== null && rail.includes(":rail-") && usedRails.get(rail) !== (c.defId === "vcc" ? "+" : "-");
-	}).map((c) => c.id);
-	const occupied = /* @__PURE__ */ new Set([...index.pinsAt.keys(), ...index.bodiesAt.keys()]);
-	for (const id of removed) {
-		const p = pinPoint(index, {
-			componentId: symbols.find((s) => s.id === id).id,
-			pinNumber: 1
-		});
-		if (p) occupied.delete(nodeIdOf(p));
-	}
-	for (const w of kept) for (const p of [w.start, w.end]) occupied.add(nodeIdOf(p));
-	const take = (n, boardId) => {
-		const p = {
-			boardId,
-			x: n.x,
-			y: n.y
-		};
-		occupied.add(nodeIdOf(p));
-		return p;
-	};
-	const free = (boardId, n) => !occupied.has(nodeIdOf({
-		boardId,
-		x: n.x,
-		y: n.y
-	}));
-	const ids = new Set(circuit.components.map((c) => c.id));
-	const added = [];
-	for (const [rail, polarity] of [...usedRails].sort((a, b) => compareIds(a[0], b[0]))) {
-		const defId = SYMBOL_OF[polarity];
-		if (symbols.some((c) => c.defId === defId && symbolRail(c) === rail && !removed.includes(c.id))) continue;
-		const boardId = boardOfGroup(rail);
-		const spot = (holesOf(boardId).get(rail) ?? []).filter((n) => n.x >= SYMBOL_FROM_X && free(boardId, n)).sort((a, b) => a.x - b.x)[0];
-		if (!spot) continue;
-		const at = take(spot, boardId);
-		added.push({
-			id: nextId(ids, defId === "vcc" ? "V" : "G"),
-			defId,
-			boardId,
-			anchor: {
-				x: at.x,
-				y: at.y
-			},
-			rotation: 0,
-			props: {}
-		});
-	}
-	const wireIds = new Set(kept.map((w) => w.id));
-	let n = 0;
-	const wireId = () => {
-		let id;
-		do
-			id = `pw${++n}`;
-		while (wireIds.has(id));
-		wireIds.add(id);
-		return id;
-	};
-	const wires = [];
-	for (const { group, rail, polarity } of links) {
-		const boardId = boardOfGroup(group);
-		const railHoles = holesOf(boardId).get(rail) ?? [];
-		const railY = railHoles[0]?.y ?? 0;
-		const groupHoles = [...holesOf(boardId).get(group) ?? []].sort((a, b) => Math.abs(a.y - railY) - Math.abs(b.y - railY) || a.x - b.x);
-		const from = groupHoles.find((h) => free(boardId, h)) ?? groupHoles[0];
-		if (!from) continue;
-		const start = take(from, boardId);
-		const to = [...railHoles].filter((h) => free(boardId, h)).sort((a, b) => Math.abs(a.x - start.x) - Math.abs(b.x - start.x) || a.x - b.x)[0];
-		if (!to) continue;
-		const end = take(to, boardId);
-		wires.push({
-			id: wireId(),
-			color: POWER_COLORS[polarity],
-			source: "manual",
-			straight: true,
-			start,
-			end,
-			path: [{ ...start }, { ...end }]
-		});
-	}
-	return {
-		circuit: {
-			...circuit,
-			components: [...circuit.components.filter((c) => !removed.includes(c.id)), ...added],
-			wires: [...kept, ...wires]
-		},
-		added,
-		removed
-	};
-}
-//#endregion
-//#region src/core/routing/colors.ts
-var POWER_COLOR = "#d32f2f";
-var GROUND_COLOR = "#212121";
-/** 黃、綠、藍、橘、白、紫、棕、灰。 */
-var SIGNAL_PALETTE = [
-	"#f9a825",
-	"#2e7d32",
-	"#1565c0",
-	"#ef6c00",
-	"#f5f5f5",
-	"#6a1b9a",
-	"#6d4c41",
-	"#9e9e9e"
-];
-function netColor(kind, signalIndex) {
-	if (kind === "power") return POWER_COLOR;
-	if (kind === "ground") return GROUND_COLOR;
-	return SIGNAL_PALETTE[Math.max(0, signalIndex) % SIGNAL_PALETTE.length];
-}
-//#endregion
-//#region src/core/routing/problem.ts
-function toPoint$1(problem, i) {
-	const p = problem.points[i];
-	if (!p) throw new Error(`Cell ${i} is not on any breadboard`);
-	return p;
-}
-var POST_COLORS = {
-	red: "紅",
-	black: "黑",
-	yellow: "黃",
-	green: "綠"
-};
-/** 導通群組的中文說明；withBoard 為 true 時加上板子 ID（多塊板時使用）。 */
-function describeGroup(groupId, withBoard = false) {
-	const colon = groupId.indexOf(":");
-	const local = groupId.slice(colon + 1);
-	const prefix = withBoard ? `${groupId.slice(0, colon)} ` : "";
-	const column = /^(?:a(\d+)-)?c(\d+)-(top|bot)$/.exec(local);
-	if (column) return `${prefix}${column[1] ? `第 ${column[1]} 區` : ""}第 ${column[2]} 欄${column[3] === "top" ? "上半（A–E）" : "下半（F–J）"}`;
-	const post = /^post-(\w+)$/.exec(local);
-	if (post) return `${prefix}${POST_COLORS[post[1]] ?? post[1]}色接線柱`;
-	return `${prefix}${local.replace("rail-", "")} 電源軌`;
-}
-var boardOfGroup = (groupId) => groupId.slice(0, groupId.indexOf(":"));
-/** 每個 Board Group 一張佈線格子；單塊板的格子索引與以前相同（x 1–63、y 1–18）。 */
-function buildRoutingProblems(circuit, config) {
-	const index = indexCircuit(circuit);
-	const lattice = buildLattice(circuit.boards);
-	const referenceNets = extractNetsWith(index, circuit.wires);
-	const routableSignals = referenceNets.filter((n) => n.kind === "signal" && terminalClusters(n, index).length >= 2).map((n) => n.id);
-	const spanning = [];
-	const netsByCanvas = /* @__PURE__ */ new Map();
-	for (const net of referenceNets) {
-		const boards = [...new Set(terminalGroupIds(net, index).map(boardOfGroup))].sort(compareIds);
-		const canvases = new Set(boards.map((b) => lattice.groupOf.get(b) ?? b));
-		if (canvases.size > 1 && terminalClusters(net, index).length >= 2) {
-			spanning.push({
-				net,
-				boardIds: boards
-			});
-			continue;
-		}
-		const canvas = [...canvases][0];
-		if (!canvas) continue;
-		const list = netsByCanvas.get(canvas);
-		if (list) list.push(net);
-		else netsByCanvas.set(canvas, [net]);
-	}
-	return {
-		problems: latticeGroups(lattice).map((groupId) => buildCanvasProblem(index, lattice, buildCanvas(lattice, groupId), referenceNets, netsByCanvas.get(groupId) ?? [], routableSignals, config)),
-		spanning
-	};
-}
-function buildCanvasProblem(index, lattice, canvas, referenceNets, canvasNets, routableSignals, config) {
-	const { width, height, size } = canvas;
-	const at = (p) => canvasIndex(canvas, lattice, p);
-	const blocked = new Uint8Array(size);
-	for (let i = 0; i < size; i++) if (!canvas.routable[i]) blocked[i] = 1;
-	for (const pc of index.placed) {
-		for (const pin of pc.footprint.pins) {
-			const i = at(pin.point);
-			if (i >= 0) blocked[i] = 1;
-		}
-		for (const cell of pc.footprint.blocked) {
-			const i = at(cell);
-			if (i >= 0) blocked[i] = 1;
-		}
-	}
-	const groupAt = canvas.points.map((p) => p ? getNode(lattice.byId.get(p.boardId).board, p.x, p.y)?.groupId ?? null : null);
-	const groupIds = canvas.boardIds.flatMap((id) => Object.keys(lattice.byId.get(id).board.groups)).sort(compareIds);
-	const freeHoles = new Map(groupIds.map((g) => [g, []]));
-	groupAt.forEach((g, i) => {
-		if (g && !blocked[i]) freeHoles.get(g)?.push(i);
-	});
-	const isRail = (g) => lattice.byId.get(boardOfGroup(g))?.board.groups[g]?.kind === "rail";
-	const nets = canvasNets.map((net) => {
-		const terminalGroups = terminalGroupIds(net, index);
-		const clusters = terminalClusters(net, index);
-		const pinsIn = (cluster) => net.pins.filter((ref) => {
-			const p = pinPoint(index, ref);
-			const g = p ? groupOfPoint(index, p) : null;
-			return g !== null && cluster.includes(g);
-		}).length;
-		let startCluster = clusters.findIndex((cl) => cl.some(isRail));
-		if (startCluster < 0) {
-			startCluster = 0;
-			for (let i = 1; i < clusters.length; i++) if (pinsIn(clusters[i]) > pinsIn(clusters[startCluster])) startCluster = i;
-		}
-		const holes = terminalGroups.flatMap((g) => freeHoles.get(g) ?? []);
-		const xs = holes.map((i) => i % width);
-		const ys = holes.map((i) => Math.floor(i / width));
-		const spread = holes.length > 0 ? Math.max(...xs) - Math.min(...xs) + (Math.max(...ys) - Math.min(...ys)) : 0;
-		const freeIn = (cluster) => cluster.reduce((sum, g) => sum + (freeHoles.get(g)?.length ?? 0), 0);
-		const minFree = clusters.length > 0 ? Math.min(...clusters.map(freeIn)) : 0;
-		const priority = (net.kind === "signal" ? 0 : config.priority.power) + spread * config.priority.spread + config.priority.scarcity / (minFree + 1);
-		return {
-			netId: net.id,
-			kind: net.kind,
-			terminalGroups,
-			clusters,
-			startCluster,
-			priority,
-			color: netColor(net.kind, routableSignals.indexOf(net.id))
-		};
-	});
-	nets.sort((a, b) => b.priority - a.priority || compareIds(a.netId, b.netId));
-	const pinGroups = /* @__PURE__ */ new Set();
-	for (const pc of index.placed) for (const pin of pc.footprint.pins) {
-		const g = groupOfPoint(index, pin.point);
-		if (g) pinGroups.add(g);
-	}
-	const railGroups = new Set(groupIds.filter(isRail));
-	const groupOwner = /* @__PURE__ */ new Map();
-	for (const net of nets) for (const g of net.terminalGroups) groupOwner.set(g, net.netId);
-	const terminalHole = new Uint8Array(size);
-	for (const net of nets) {
-		if (net.clusters.length < 2) continue;
-		for (const g of net.terminalGroups) for (const i of freeHoles.get(g) ?? []) terminalHole[i] = 1;
-	}
-	return {
-		boardIds: canvas.boardIds,
-		originX: canvas.originX,
-		originY: canvas.originY,
-		width,
-		height,
-		size,
-		points: canvas.points,
-		blocked,
-		groupAt,
-		freeHoles,
-		terminalHole,
-		pinGroups,
-		railGroups,
-		groupOwner,
-		nets,
-		referenceNets,
-		index,
-		lattice
-	};
-}
-//#endregion
-//#region src/core/routing/minHeap.ts
-/** 以 key 排序的最小堆積；key 相同時先放入者先出，確保結果確定。 */
-var MinHeap = class {
-	keys = [];
-	seqs = [];
-	values = [];
-	counter = 0;
-	get size() {
-		return this.values.length;
-	}
-	push(key, value) {
-		this.keys.push(key);
-		this.seqs.push(this.counter++);
-		this.values.push(value);
-		this.siftUp(this.values.length - 1);
-	}
-	pop() {
-		if (this.values.length === 0) return void 0;
-		const top = {
-			key: this.keys[0],
-			value: this.values[0]
-		};
-		this.swap(0, this.values.length - 1);
-		this.keys.pop();
-		this.seqs.pop();
-		this.values.pop();
-		if (this.values.length > 0) this.siftDown(0);
-		return top;
-	}
-	less(i, j) {
-		return this.keys[i] < this.keys[j] || this.keys[i] === this.keys[j] && this.seqs[i] < this.seqs[j];
-	}
-	swap(i, j) {
-		const k = this.keys[i];
-		this.keys[i] = this.keys[j];
-		this.keys[j] = k;
-		const s = this.seqs[i];
-		this.seqs[i] = this.seqs[j];
-		this.seqs[j] = s;
-		const v = this.values[i];
-		this.values[i] = this.values[j];
-		this.values[j] = v;
-	}
-	siftUp(i) {
-		while (i > 0) {
-			const parent = i - 1 >> 1;
-			if (!this.less(i, parent)) return;
-			this.swap(i, parent);
-			i = parent;
-		}
-	}
-	siftDown(i) {
-		const n = this.values.length;
-		for (;;) {
-			const left = 2 * i + 1;
-			const right = left + 1;
-			let smallest = i;
-			if (left < n && this.less(left, smallest)) smallest = left;
-			if (right < n && this.less(right, smallest)) smallest = right;
-			if (smallest === i) return;
-			this.swap(i, smallest);
-			i = smallest;
-		}
-	}
-};
-//#endregion
-//#region src/core/routing/straightSearch.ts
-/** a、b 在同一列或同一欄時，兩點之間的直線。 */
-function lineBetween(problem, a, b) {
-	const w = problem.width;
-	const o = Math.floor(a / w) === Math.floor(b / w) ? 0 : 1;
-	const step = o === 0 ? Math.sign(b - a) : Math.sign(b - a) * w;
-	if (o === 1 && a % w !== b % w) throw new Error("Cells are not in one row or column");
-	const cells = [];
-	for (let c = a + step; c !== b; c += step) cells.push(c);
-	return {
-		a,
-		b,
-		o,
-		cells
-	};
-}
-/** 已經有 count 個使用者時再用一次的成本：協商時越擠、歷史越多越貴；嚴格模式不允許。 */
-function conflictCost(params, count, history) {
-	if (count === 0) return params.overlap.kind === "negotiate" ? history : 0;
-	if (params.overlap.kind === "hard") return Infinity;
-	return (params.overlap.overlapBase + history) * (1 + params.overlap.presentFactor * count);
-}
-/** 把線端插在 cell：孔上已有的線端、從上面經過的線都算衝突。 */
-function endCost(state, cell, params) {
-	return conflictCost(params, state.ends[cell].length + state.lines[cell * 2].length + state.lines[cell * 2 + 1].length, state.histEnd[cell]);
-}
-/**
-* 線從 cell 上方經過（方向 o）：別條線的端點、同方向的線是衝突；垂直的線是交叉；別的 Net 的終端空孔加擁擠成本。
-* 子專案 39（規格 2026-10-20 wiring-rules）：交叉不准：嚴格模式不能交叉；協商時先算很貴的成本，之後當成衝突排開。
-*/
-function passCost(problem, state, netId, cell, o, params) {
-	const crossing = state.lines[cell * 2 + (1 - o)].length;
-	if (crossing > 0 && params.overlap.kind === "hard") return Infinity;
-	let cost = conflictCost(params, state.ends[cell].length + state.lines[cell * 2 + o].length, state.histLine[cell * 2 + o]);
-	if (crossing > 0) cost += conflictCost(params, crossing, state.histLine[cell * 2 + (1 - o)]);
-	const g = problem.groupAt[cell];
-	if (problem.terminalHole[cell] && !(g && state.owns(netId, g))) cost += params.weights.congestion;
-	return cost;
-}
-/**
-* 線端可以插在 group 嗎：自己的排（終端排、用過的轉接排），或空的五孔排（新的轉接排）。
-* 子專案 47：沒有接電源、沒有元件腳的電源軌也可以當轉接排（整條相通，等於一條長的訊號通道）；有電源的軌是電源 Net 的終端排，別的 Net 不能用。
-*/
-function groupUse(problem, state, netId, group) {
-	if (state.owns(netId, group)) return "own";
-	if (problem.pinGroups.has(group)) return null;
-	const owner = problem.groupOwner.get(group);
-	return owner === void 0 || owner === netId ? "via" : null;
-}
-function viaCost(problem, state, netId, group, params) {
-	const rail = problem.railGroups.has(group) ? params.weights.rail : 0;
-	return params.weights.via + rail + conflictCost(params, state.viaOthers(netId, group), state.histVia.get(group) ?? 0);
-}
-var DX = [
-	1,
-	0,
-	-1,
-	0
-];
-var DY = [
-	0,
-	1,
-	0,
-	-1
-];
-/**
-* 規格 2.1：從 sources 那些排的空孔出發、到 targets 任一排為止，最便宜的一串直線（Dijkstra）。
-* 狀態 = 孔 × {IN, OUT}：IN(h) 是一條線停在 h；OUT(h) 是一條線從 h 出發。換孔（同一排）不花成本，所以不用估計函式。
-*/
-function findRoute(problem, state, net, sources, targets, params) {
-	const { width, height, size, blocked, groupAt } = problem;
-	const dist = new Float64Array(size * 2).fill(Infinity);
-	const parent = new Int32Array(size * 2).fill(-1);
-	const heap = new MinHeap();
-	const relax = (s, cost, from) => {
-		if (!Number.isFinite(cost) || cost >= dist[s]) return;
-		dist[s] = cost;
-		parent[s] = from;
-		heap.push(cost, s);
-	};
-	for (const g of [...sources].sort()) for (const c of problem.freeHoles.get(g) ?? []) relax(c * 2 + 1, endCost(state, c, params), -1);
-	while (heap.size > 0) {
-		const top = heap.pop();
-		const s = top.value;
-		if (top.key > dist[s]) continue;
-		const c = s >> 1;
-		const g = groupAt[c];
-		if ((s & 1) === 0) {
-			if (targets.has(g)) return {
-				wires: reconstruct(problem, parent, s),
-				cost: dist[s]
-			};
-			const passed = new Set(lineBetween(problem, parent[s] >> 1, c).cells);
-			for (const h of problem.freeHoles.get(g) ?? []) if (h !== c && !passed.has(h)) relax(h * 2 + 1, dist[s] + endCost(state, h, params), s);
-			continue;
-		}
-		const before = parent[s];
-		const arrived = before >= 0 && (before & 1) === 0 ? lineBetween(problem, parent[before] >> 1, before >> 1) : null;
-		const avoid = arrived ? /* @__PURE__ */ new Set([arrived.b, ...arrived.cells]) : null;
-		for (let d = 0; d < 4; d++) {
-			const o = d % 2 === 0 ? 0 : 1;
-			let x = c % width;
-			let y = Math.floor(c / width);
-			let acc = dist[s] + params.weights.wire;
-			for (let len = 1;; len++) {
-				x += DX[d];
-				y += DY[d];
-				if (x < 0 || y < 0 || x >= width || y >= height) break;
-				const q = y * width + x;
-				if (blocked[q] || avoid?.has(q)) break;
-				const gq = groupAt[q];
-				if (gq !== null && gq !== g) {
-					const use = groupUse(problem, state, net.netId, gq);
-					if (use) {
-						let cost = acc + params.weights.distance * len + endCost(state, q, params);
-						if (use === "via") cost += viaCost(problem, state, net.netId, gq, params);
-						relax(q * 2, cost, s);
-					}
-				}
-				acc += passCost(problem, state, net.netId, q, o, params);
-				if (!Number.isFinite(acc)) break;
-			}
-		}
-	}
-	return null;
-}
-/** 狀態鏈 OUT → IN → OUT → IN …：每一對 OUT → IN 是一條線。 */
-function reconstruct(problem, parent, goal) {
-	const chain = [];
-	for (let s = goal; s !== -1; s = parent[s]) chain.push(s);
-	chain.reverse();
-	const out = [];
-	for (let i = 0; i + 1 < chain.length; i++) if ((chain[i] & 1) === 1 && (chain[i + 1] & 1) === 0) out.push(lineBetween(problem, chain[i] >> 1, chain[i + 1] >> 1));
-	return out;
-}
-/** 用和 findRoute 相同的成本定義，計算在目前 state 下放一條線的成本（改善階段比較新舊用）。 */
-function wireCost(problem, state, net, line, params) {
-	let cost = endCost(state, line.a, params) + params.weights.wire + params.weights.distance * (line.cells.length + 1) + endCost(state, line.b, params);
-	for (const c of line.cells) cost += passCost(problem, state, net.netId, c, line.o, params);
-	const g = problem.groupAt[line.b];
-	if (g && groupUse(problem, state, net.netId, g) === "via") cost += viaCost(problem, state, net.netId, g, params);
-	return cost;
-}
-//#endregion
-//#region src/core/routing/straightNet.ts
-/**
-* 規格 2.2：Prim 式生成樹。每次從「已連上的排」（終端排與用過的轉接排）找一串直線到任一還沒連上的簇，
-* 有電源軌的 Net 先只從電源軌出發（星形），找不到才從整棵樹出發；
-* 把線加進 state。呼叫前 state 裡不能有這個 Net 的線。
-*/
-function routeNet(problem, state, net, params) {
-	const holesOf = (cluster) => cluster.flatMap((g) => problem.freeHoles.get(g) ?? []);
-	const multiBoard = problem.boardIds.length > 1;
-	const describe = (cluster) => cluster.map((g) => describeGroup(g, multiBoard)).join("＋");
-	const full = net.clusters.find((cl) => holesOf(cl).length === 0);
-	if (full) return {
-		ok: false,
-		reason: "NO_FREE_HOLE",
-		detail: `${describe(full)}沒有空孔可以接線`
-	};
-	const clusterOf = /* @__PURE__ */ new Map();
-	net.clusters.forEach((cl, i) => cl.forEach((g) => clusterOf.set(g, i)));
-	const connected = new Set(net.clusters[net.startCluster]);
-	const remaining = new Set(net.clusters.map((_, i) => i).filter((i) => i !== net.startCluster));
-	let cost = 0;
-	let k = 0;
-	while (remaining.size > 0) {
-		const targets = new Set([...remaining].flatMap((i) => net.clusters[i]));
-		const rails = new Set([...connected].filter((g) => problem.railGroups.has(g)));
-		const found = (rails.size > 0 ? findRoute(problem, state, net, rails, targets, params) : null) ?? findRoute(problem, state, net, connected, targets, params);
-		if (!found) {
-			state.removeNet(net.netId);
-			const missing = [...remaining].map((i) => describe(net.clusters[i])).join("、");
-			return {
-				ok: false,
-				reason: "UNROUTABLE",
-				detail: `${net.netId} 無法連到 ${missing}`
-			};
-		}
-		for (const line of found.wires) {
-			state.addWire({
-				id: `${net.netId}#${k++}`,
-				netId: net.netId,
-				...line
-			});
-			for (const end of [line.a, line.b]) {
-				const g = problem.groupAt[end];
-				if (!clusterOf.has(g)) connected.add(g);
-			}
-		}
-		if (params.overlap.kind === "hard" && state.conflicts().some((x) => state.netsIn([x]).has(net.netId))) {
-			state.removeNet(net.netId);
-			return {
-				ok: false,
-				reason: "UNROUTABLE",
-				detail: `${net.netId} 的線彼此衝突，找不到合法的接法`
-			};
-		}
-		cost += found.cost;
-		const reached = clusterOf.get(problem.groupAt[found.wires[found.wires.length - 1].b]);
-		for (const g of net.clusters[reached]) connected.add(g);
-		remaining.delete(reached);
-	}
-	return {
-		ok: true,
-		cost
-	};
-}
-//#endregion
-//#region src/core/routing/straightState.ts
-/** 協商佈線時已放的直線導線、每個資源的使用者，以及歷史擁擠成本。 */
-var StraightState = class {
-	problem;
-	ends;
-	lines;
-	histEnd;
-	histLine;
-	histVia = /* @__PURE__ */ new Map();
-	viaUse = /* @__PURE__ */ new Map();
-	wires = /* @__PURE__ */ new Map();
-	byNet = /* @__PURE__ */ new Map();
-	terminals;
-	constructor(problem) {
-		this.problem = problem;
-		this.ends = Array.from({ length: problem.size }, () => []);
-		this.lines = Array.from({ length: problem.size * 2 }, () => []);
-		this.histEnd = new Float64Array(problem.size);
-		this.histLine = new Float64Array(problem.size * 2);
-		this.terminals = new Map(problem.nets.map((n) => [n.netId, new Set(n.terminalGroups)]));
-	}
-	/** 這一排是不是這個 Net 的終端排，或它的線已經插在這一排（轉接排）。 */
-	owns(netId, group) {
-		return this.terminals.get(netId)?.has(group) === true || (this.viaUse.get(group)?.get(netId) ?? 0) > 0;
-	}
-	/** 把這一排當轉接排的其他 Net 數。 */
-	viaOthers(netId, group) {
-		let n = 0;
-		for (const [id, count] of this.viaUse.get(group) ?? []) if (id !== netId && count > 0) n++;
-		return n;
-	}
-	bumpVia(netId, cell, delta) {
-		const g = this.problem.groupAt[cell];
-		if (!g || this.terminals.get(netId)?.has(g)) return;
-		const m = this.viaUse.get(g) ?? /* @__PURE__ */ new Map();
-		const next = (m.get(netId) ?? 0) + delta;
-		if (next > 0) m.set(netId, next);
-		else m.delete(netId);
-		if (m.size > 0) this.viaUse.set(g, m);
-		else this.viaUse.delete(g);
-	}
-	addWire(w) {
-		if (this.wires.has(w.id)) throw new Error(`Wire ${w.id} is already placed`);
-		this.wires.set(w.id, w);
-		const list = this.byNet.get(w.netId);
-		if (list) list.push(w.id);
-		else this.byNet.set(w.netId, [w.id]);
-		for (const end of [w.a, w.b]) {
-			this.ends[end].push(w.id);
-			this.bumpVia(w.netId, end, 1);
-		}
-		for (const c of w.cells) this.lines[c * 2 + w.o].push(w.id);
-	}
-	removeWire(id) {
-		const w = this.wires.get(id);
-		if (!w) return;
-		for (const end of [w.a, w.b]) {
-			this.ends[end] = this.ends[end].filter((x) => x !== id);
-			this.bumpVia(w.netId, end, -1);
-		}
-		for (const c of w.cells) this.lines[c * 2 + w.o] = this.lines[c * 2 + w.o].filter((x) => x !== id);
-		this.wires.delete(id);
-		const rest = (this.byNet.get(w.netId) ?? []).filter((x) => x !== id);
-		if (rest.length > 0) this.byNet.set(w.netId, rest);
-		else this.byNet.delete(w.netId);
-	}
-	removeNet(netId) {
-		for (const id of [...this.byNet.get(netId) ?? []]) this.removeWire(id);
-	}
-	wiresOf(netId) {
-		return (this.byNet.get(netId) ?? []).map((id) => this.wires.get(id));
-	}
-	conflicts() {
-		const out = [];
-		for (let c = 0; c < this.ends.length; c++) {
-			if (this.ends[c].length > 1) out.push({
-				kind: "end",
-				cell: c
-			});
-			if (this.ends[c].length > 0 && this.lines[c * 2].length + this.lines[c * 2 + 1].length > 0) out.push({
-				kind: "pass",
-				cell: c
-			});
-			for (const o of [0, 1]) if (this.lines[c * 2 + o].length > 1) out.push({
-				kind: "line",
-				cell: c,
-				o
-			});
-			if (this.lines[c * 2].length > 0 && this.lines[c * 2 + 1].length > 0) out.push({
-				kind: "cross",
-				cell: c
-			});
-		}
-		for (const [group, m] of [...this.viaUse].sort((x, y) => x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0)) if (m.size > 1) out.push({
-			kind: "via",
-			group
-		});
-		return out;
-	}
-	netsIn(conflicts) {
-		const nets = /* @__PURE__ */ new Set();
-		const add = (ids) => ids.forEach((id) => nets.add(this.wires.get(id).netId));
-		for (const x of conflicts) if (x.kind === "end") add(this.ends[x.cell]);
-		else if (x.kind === "pass") add([
-			...this.ends[x.cell],
-			...this.lines[x.cell * 2],
-			...this.lines[x.cell * 2 + 1]
-		]);
-		else if (x.kind === "line") add(this.lines[x.cell * 2 + x.o]);
-		else if (x.kind === "cross") add([...this.lines[x.cell * 2], ...this.lines[x.cell * 2 + 1]]);
-		else for (const id of this.viaUse.get(x.group)?.keys() ?? []) nets.add(id);
-		return nets;
-	}
-	bumpHistory(conflicts, increment) {
-		for (const x of conflicts) if (x.kind === "end" || x.kind === "pass") this.histEnd[x.cell] += increment;
-		else if (x.kind === "line") this.histLine[x.cell * 2 + x.o] += increment;
-		else if (x.kind === "cross") {
-			this.histLine[x.cell * 2] += increment;
-			this.histLine[x.cell * 2 + 1] += increment;
-		} else this.histVia.set(x.group, (this.histVia.get(x.group) ?? 0) + increment);
-	}
-};
-//#endregion
-//#region src/core/routing/autoRoute.ts
-function autoRoute$1(circuit, overrides) {
-	const started = performance.now();
-	const config = mergeConfig(overrides);
-	const { problems, spanning } = buildRoutingProblems(circuit, config);
-	const failed = /* @__PURE__ */ new Map();
-	const outOfTime = () => performance.now() - started > config.timeBudgetMs;
-	for (const { net, boardIds } of spanning) failed.set(net.id, {
-		netId: net.id,
-		reason: "UNROUTABLE",
-		detail: `${net.id} 連到沒有貼在一起的麵包板（${boardIds.join("、")}），請先把麵包板貼合成同一個群組`
-	});
-	let iterations = 0;
-	let routableCount = spanning.length;
-	let wires = [];
-	for (const problem of problems) {
-		const routed = routeCanvas(problem, config, failed, outOfTime);
-		iterations = Math.max(iterations, routed.iterations);
-		routableCount += routed.routable;
-		wires.push(...routed.wires);
-	}
-	const violations = checkRoutingLegality(circuit, wires);
-	for (const netId of [...new Set(violations.flatMap((v) => v.netIds))].sort(compareIds)) {
-		if (failed.has(netId)) continue;
-		const codes = [...new Set(violations.filter((v) => v.netIds.includes(netId)).map((v) => v.code))].join(", ");
-		failed.set(netId, {
-			netId,
-			reason: "LEGALITY_CHECK",
-			detail: `${netId} 沒有通過合法性檢查（${codes}）`
-		});
-	}
-	wires = wires.filter((w) => w.netId !== void 0 && !failed.has(w.netId));
-	const failedNets = [...failed.values()].sort((a, b) => compareIds(a.netId, b.netId));
-	const status = failedNets.length === 0 ? "success" : failedNets.length < routableCount ? "partial" : "failed";
-	const { metrics, score } = scoreRouting(circuit, wires, overrides);
-	return {
-		status,
-		message: status === "success" ? "Standard Routing Complete" : "No valid routing solution.",
-		wires,
-		failedNets,
-		metrics,
-		score,
-		stats: {
-			iterations,
-			elapsedMs: Math.round(performance.now() - started)
-		}
-	};
-}
-/** 在一張格子（一個 Board Group）上協商佈線：先允許重疊、逐輪提高成本，再在不准碰的條件下逐一改善。 */
-function routeCanvas(problem, config, failed, outOfTime) {
-	const state = new StraightState(problem);
-	const markFailed = (net, reason, detail) => {
-		state.removeNet(net.netId);
-		failed.set(net.netId, {
-			netId: net.netId,
-			reason,
-			detail
-		});
-	};
-	const routable = problem.nets.filter((n) => n.clusters.length >= 2);
-	const hard = {
-		weights: config.weights,
-		overlap: { kind: "hard" }
-	};
-	const negotiate = (presentFactor) => ({
-		weights: config.weights,
-		overlap: {
-			kind: "negotiate",
-			overlapBase: config.negotiation.overlapBase,
-			presentFactor
-		}
-	});
-	let active = routable;
-	let toRoute = routable;
-	let presentFactor = config.negotiation.presentFactor;
-	let iterations = 0;
-	while (toRoute.length > 0) {
-		iterations++;
-		for (const net of toRoute) {
-			state.removeNet(net.netId);
-			const result = routeNet(problem, state, net, negotiate(presentFactor));
-			if (!result.ok) markFailed(net, result.reason, result.detail);
-		}
-		active = active.filter((n) => !failed.has(n.netId));
-		const conflicts = state.conflicts();
-		if (conflicts.length === 0) break;
-		if (iterations >= config.negotiation.maxIterations || outOfTime()) {
-			const reason = outOfTime() ? "TIME_LIMIT" : "ITERATION_LIMIT";
-			active = dropConflicts(problem, state, active, hard, (net) => markFailed(net, reason, `${net.netId} 在 ${iterations} 輪協商後仍無法避開其他導線`));
-			break;
-		}
-		state.bumpHistory(conflicts, config.negotiation.historyIncrement);
-		presentFactor *= config.negotiation.presentFactorGrowth;
-		const touched = state.netsIn(conflicts);
-		toRoute = active.filter((n) => touched.has(n.netId));
-	}
-	const repairUntil = performance.now() + config.timeBudgetMs * REPAIR_SHARE;
-	for (let round = 0; round < REPAIR_ROUNDS; round++) {
-		let fixed = false;
-		for (const net of routable) {
-			if (performance.now() > repairUntil) break;
-			const why = failed.get(net.netId)?.reason;
-			if (why !== "TIME_LIMIT" && why !== "ITERATION_LIMIT" && why !== "UNROUTABLE") continue;
-			if (!ripUpAndReroute(problem, state, net, active, hard, negotiate(presentFactor))) continue;
-			failed.delete(net.netId);
-			active = routable.filter((n) => active.includes(n) || n === net);
-			fixed = true;
-		}
-		if (!fixed) break;
-	}
-	for (let pass = 0; pass < config.negotiation.maxImprovementPasses && !outOfTime(); pass++) {
-		let improved = false;
-		for (const net of active) {
-			if (outOfTime()) break;
-			if (rerouteIfCheaper(problem, state, net, hard)) improved = true;
-		}
-		if (!improved) break;
-	}
-	return {
-		wires: active.flatMap((net) => state.wiresOf(net.netId).map((stored, k) => toWire(problem, stored, net, k))),
-		iterations,
-		routable: routable.length
-	};
-}
-/** 把優先序最低、仍有衝突的 Net 逐一拿掉直到沒有衝突，再用嚴格模式試著放回去（優先序高的先放）。 */
-function dropConflicts(problem, state, active, hard, onFail) {
-	const dropped = [];
-	for (let conflicts = state.conflicts(); conflicts.length > 0; conflicts = state.conflicts()) {
-		const touched = state.netsIn(conflicts);
-		const victim = [...active].reverse().find((n) => touched.has(n.netId) && !dropped.includes(n));
-		if (!victim) break;
-		state.removeNet(victim.netId);
-		dropped.push(victim);
-	}
-	const failedIds = /* @__PURE__ */ new Set();
-	for (const net of [...dropped].reverse()) if (!routeNet(problem, state, net, hard).ok) {
-		onFail(net);
-		failedIds.add(net.netId);
-	}
-	return active.filter((n) => !failedIds.has(n.netId));
-}
-/** 子專案 48：拆線重接最多拆幾個 Net、最多幾輪、最多多用時間限制的幾成。 */
-var MAX_VICTIMS = 3;
-var REPAIR_ROUNDS = 3;
-var REPAIR_SHARE = .1;
-/**
-* 子專案 48：允許重疊把 net 接上，拆掉和它衝突的 Net（最多 MAX_VICTIMS 個），在不准碰的條件下依原本的順序重接。
-* 全部接得上才回傳 true；否則還原成原本的線。
-*/
-function ripUpAndReroute(problem, state, net, active, hard, soft) {
-	state.removeNet(net.netId);
-	if (!routeNet(problem, state, net, soft).ok) return false;
-	const victims = active.filter((n) => n !== net && state.netsIn(state.conflicts()).has(n.netId));
-	if (victims.length > MAX_VICTIMS) {
-		state.removeNet(net.netId);
-		return false;
-	}
-	const saved = victims.map((n) => ({
-		net: n,
-		wires: state.wiresOf(n.netId).map((w) => ({
-			...w,
-			cells: [...w.cells]
-		}))
-	}));
-	for (const v of victims) state.removeNet(v.netId);
-	const undo = () => {
-		state.removeNet(net.netId);
-		for (const v of saved) {
-			state.removeNet(v.net.netId);
-			for (const w of v.wires) state.addWire(w);
-		}
-		return false;
-	};
-	if (state.conflicts().length > 0) return undo();
-	for (const v of victims) if (!routeNet(problem, state, v, hard).ok) return undo();
-	return true;
-}
-/** 在其他線都不准碰的條件下重排 net；總成本下降才保留，否則還原。 */
-function rerouteIfCheaper(problem, state, net, hard) {
-	const old = state.wiresOf(net.netId).map((w) => ({
-		...w,
-		cells: [...w.cells]
-	}));
-	state.removeNet(net.netId);
-	let oldCost = 0;
-	for (const w of old) {
-		oldCost += wireCost(problem, state, net, w, hard);
-		state.addWire(w);
-	}
-	state.removeNet(net.netId);
-	const result = routeNet(problem, state, net, hard);
-	if (result.ok && result.cost < oldCost - 1e-9) return true;
-	state.removeNet(net.netId);
-	for (const w of old) state.addWire(w);
-	return false;
-}
-/** 規格 2026-10-10 routing-standard：輸出的每條線都是水平或垂直的直線導線。 */
-function toWire(problem, placed, net, k) {
-	const start = toPoint$1(problem, placed.a);
-	const end = toPoint$1(problem, placed.b);
-	return {
-		id: `w_${net.netId}_${k + 1}`,
-		color: net.color,
-		source: "auto",
-		netId: net.netId,
-		straight: true,
-		start,
-		end,
-		path: [{ ...start }, { ...end }]
-	};
-}
-//#endregion
-//#region src/core/icPlacement/relocate.ts
-/** 元件目前的位置。 */
-function placementOf(c) {
-	return {
-		boardId: c.boardId,
-		anchor: {
-			x: c.anchor.x,
-			y: c.anchor.y
-		},
-		rotation: c.rotation
-	};
-}
-function samePlacement(a, b) {
-	return a.boardId === b.boardId && a.anchor.x === b.anchor.x && a.anchor.y === b.anchor.y && a.rotation === b.rotation;
-}
-/** 把元件放到 p（回傳新物件）。 */
-function placeAt(c, p) {
-	return {
-		...c,
-		boardId: p.boardId,
-		anchor: {
-			x: p.anchor.x,
-			y: p.anchor.y
-		},
-		rotation: p.rotation
-	};
-}
-/** 套用搬移：搬過的元件換成新物件，其他沿用原本的參照；沒有搬移時回傳同一個陣列。 */
-function applyMoves(components, moves) {
-	if (moves.length === 0) return components;
-	const to = new Map(moves.map((m) => [m.componentId, m.to]));
-	return components.map((c) => {
-		const p = to.get(c.id);
-		return p ? placeAt(c, p) : c;
-	});
-}
-/** 群組的第一個格點（描述連接關係的導線端點）。 */
-function groupPoint(index, groupId) {
-	const nodeId = index.boards.get(groupId.slice(0, groupId.indexOf(":")))?.groups[groupId]?.nodeIds[0];
-	if (!nodeId) throw new Error(`Unknown group ${groupId}`);
-	return parseNodeId(nodeId);
-}
-/**
-* 規格 2026-10-10 ic-placement 2.2：IC 搬到新位置後的電路。導線換成「描述連接關係的導線」：每個原本的 Net
-* 把它在新位置的終端排（腳所在的排＋它的電源軌）依序串起來。這些線只告訴佈線器哪些排要接在一起，不會出現在結果裡。
-*/
-function relocatedCircuit(circuit, nets, moves) {
-	const moved = {
-		...circuit,
-		components: applyMoves(circuit.components, moves),
-		wires: []
-	};
-	const index = indexCircuit(moved);
-	const wires = [];
-	for (const net of nets) {
-		const groups = terminalGroupIds(net, index);
-		for (let i = 1; i < groups.length; i++) {
-			const start = groupPoint(index, groups[i - 1]);
-			const end = groupPoint(index, groups[i]);
-			wires.push({
-				id: `link_${net.id}_${i}`,
-				color: "#888888",
-				source: "manual",
-				straight: true,
-				start,
-				end,
-				path: [{ ...start }, { ...end }]
-			});
-		}
-	}
-	return {
-		...moved,
-		wires
-	};
-}
-/** 規格 2.3：兩組 Net 是否把腳分成完全相同的組（以腳為準，不管 Net 的名稱與群組）。 */
-function samePinPartition(a, b) {
-	const key = (nets) => nets.map((n) => n.pins.map(pinKey).join(",")).sort().join("|");
-	return key(a) === key(b);
-}
-//#endregion
-//#region src/core/icPlacement/candidates.ts
-var ROTATIONS$1 = [0, 180];
-/**
-* 規格 2026-10-10 ic-placement 3.1：一顆 IC 的所有合法位置。其他元件固定在 circuit 裡的位置；導線不管（佈線時會換掉）。
-* 同一個 Board Group 的每塊板、每個孔當錨點、旋轉 0 / 180 度：每支腳插在沒被佔用的五孔排、各在不同的排，本體不碰其他元件，
-* 同一排裡其他元件的腳必須和這支腳屬於原本的同一個 Net（nets）。順序：板子 ID、y、x、旋轉。
-*/
-function icCandidates(circuit, nets, componentId) {
-	const index = indexCircuit(circuit);
-	const self = index.placedById.get(componentId);
-	if (!self) throw new Error(`Unknown component ${componentId}`);
-	const lattice = buildLattice(circuit.boards);
-	const group = lattice.groupOf.get(self.instance.boardId);
-	const boardIds = circuit.boards.map((b) => b.id).filter((id) => lattice.groupOf.get(id) === group).sort(compareIds);
-	const netOf = netByPin(nets);
-	const taken = /* @__PURE__ */ new Set();
-	const netsInGroup = /* @__PURE__ */ new Map();
-	for (const pc of index.placed) {
-		if (pc.instance.id === componentId) continue;
-		for (const cell of pc.footprint.blocked) taken.add(nodeIdOf(cell));
-		for (const pin of pc.footprint.pins) {
-			taken.add(nodeIdOf(pin.point));
-			const g = groupOfPoint(index, pin.point);
-			const net = netOf.get(pinKey({
-				componentId: pc.instance.id,
-				pinNumber: pin.pinNumber
-			}));
-			if (!g || !net) continue;
-			const set = netsInGroup.get(g) ?? /* @__PURE__ */ new Set();
-			set.add(net.id);
-			netsInGroup.set(g, set);
-		}
-	}
-	const fits = (p) => {
-		const board = index.boards.get(p.boardId);
-		const fp = resolveFootprint(placeAt(self.instance, p), self.def);
-		const used = /* @__PURE__ */ new Set();
-		for (const pin of fp.pins) {
-			const node = getNode(board, pin.point.x, pin.point.y);
-			if (!node || node.kind !== "hole" || !node.groupId || taken.has(node.id) || used.has(node.groupId)) return false;
-			if (groupInfo(index, node.groupId)?.kind !== "terminal") return false;
-			used.add(node.groupId);
-			const mine = netOf.get(pinKey({
-				componentId,
-				pinNumber: pin.pinNumber
-			}))?.id;
-			for (const other of netsInGroup.get(node.groupId) ?? []) if (other !== mine) return false;
-		}
-		for (const cell of fp.blocked) {
-			const node = getNode(board, cell.x, cell.y);
-			if (!node || taken.has(node.id)) return false;
-		}
-		return true;
-	};
-	const out = [];
-	for (const boardId of boardIds) for (const node of index.boards.get(boardId).nodes) {
-		if (node.kind !== "hole") continue;
-		for (const rotation of ROTATIONS$1) {
-			const p = {
-				boardId,
-				anchor: {
-					x: node.x,
-					y: node.y
-				},
-				rotation
-			};
-			if (fits(p)) out.push(p);
-		}
-	}
-	return out;
-}
-//#endregion
-//#region src/core/icPlacement/estimate.ts
-/** 兩孔之間：同一列或同一行算 1 條線，否則 2 條線、1 個轉接；不管障礙與交叉。 */
-function pairCost(a, b, w) {
-	const length = Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
-	return a.x === b.x || a.y === b.y ? w.wire + length * w.distance : 2 * w.wire + w.via + length * w.distance;
-}
-/** Prim：從第 0 簇開始，每次接上最便宜的一簇；兩簇之間取兩邊的孔兩兩比較的最小值。 */
-function spanningCost(clusters, w) {
-	if (clusters.length < 2) return 0;
-	const between = (a, b) => {
-		let best = Infinity;
-		for (const p of a) for (const q of b) best = Math.min(best, pairCost(p, q, w));
-		return best;
-	};
-	const inTree = clusters.map((_, i) => i === 0);
-	const dist = clusters.map((c, i) => i === 0 ? 0 : between(clusters[0], c));
-	let total = 0;
-	for (let added = 1; added < clusters.length; added++) {
-		let next = -1;
-		for (let i = 0; i < clusters.length; i++) if (!inTree[i] && (next < 0 || dist[i] < dist[next])) next = i;
-		inTree[next] = true;
-		total += dist[next];
-		for (let i = 0; i < clusters.length; i++) if (!inTree[i]) dist[i] = Math.min(dist[i], between(clusters[next], clusters[i]));
-	}
-	return total;
-}
-/**
-* 規格 2026-10-10 ic-placement 3.2：很快的估計。每個 Net 的終端排依元件內部導通分簇，簇與簇之間用最小生成樹相連。
-* index 是要估計的那個擺法（元件已經在新位置）；座標用全域格子，同組的兩塊板可以直接比較。
-*/
-function estimateNets(index, lattice, nets, weights) {
-	let total = 0;
-	for (const net of nets) {
-		const clusters = terminalClusters(net, index).map((cluster) => cluster.flatMap((g) => (index.boards.get(g.slice(0, g.indexOf(":")))?.groups[g]?.nodeIds ?? []).map((id) => latticeOf(lattice, parseNodeId(id))).filter((c) => c !== null)));
-		total += spanningCost(clusters, weights);
-	}
-	return total;
-}
-//#endregion
-//#region src/core/icPlacement/autoPlace.ts
-/** 子專案 48：重排目前的擺法最多用掉這次「可移動 IC」時間的幾成。 */
-var RETRY_SHARE = .4;
-/** 規格 1 節的好壞順序：接不完的 Net 少 → 交叉少 → 線少 → 總長短。a 比 b 好才回傳 true（同分是 false）。 */
-function isBetterRouting(a, b) {
-	const key = (r) => [
-		r.failedNets.length,
-		r.metrics.crossings,
-		r.metrics.wireCount,
-		r.metrics.totalLength
-	];
-	const ka = key(a);
-	const kb = key(b);
-	for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] < kb[i];
-	return false;
-}
-/**
-* 規格 2026-10-10 ic-placement：「AI 佈線（可移動 IC）」。起點是「IC 都不動」的佈線；每顆 IC 輪流試粗估最好的幾個位置、
-* 實際佈線，比目前最好的結果好才採用。回傳的結果一定有 moves（沒有搬動時是空陣列）。
-* 子專案 41：from 是同一個電路之前的結果（例如轉成麵包板的快速試），從它接著搬，不重做已經做過的。
-*/
-function autoPlaceAndRoute(circuit, overrides, from) {
-	const started = performance.now();
-	const config = mergeConfig(overrides);
-	const { candidatesPerIc, maxPasses, timeBudgetMs } = config.placement;
-	const outOfTime = () => performance.now() - started > timeBudgetMs;
-	const nets = extractNets(circuit);
-	const lattice = buildLattice(circuit.boards);
-	const original = new Map(circuit.components.map((c) => [c.id, placementOf(c)]));
-	const route = (moves, options) => {
-		const relocated = relocatedCircuit(circuit, nets, moves);
-		if (moves.length > 0 && !samePinPartition(nets, extractNets(relocated))) return null;
-		if (!config.placement.nearestPowerRail) return autoRoute$1(relocated, options);
-		const power = connectPowerToNearestRails(relocated);
-		return {
-			...autoRoute$1(power.circuit, options),
-			powerSymbols: {
-				added: power.added,
-				removed: power.removed
-			}
-		};
-	};
-	let moves = from?.moves ?? [];
-	let best = from ?? route(moves, overrides);
-	const unfinished = (r) => r.failedNets.some((f) => f.reason === "TIME_LIMIT");
-	if (from && unfinished(best) && !outOfTime()) {
-		const longer = route(moves, {
-			...overrides,
-			timeBudgetMs: Math.max(config.timeBudgetMs, timeBudgetMs * RETRY_SHARE)
-		});
-		if (longer && isBetterRouting(longer, best)) best = longer;
-	}
-	const optionsFor = (r) => ({
-		...overrides,
-		negotiation: {
-			...overrides?.negotiation,
-			maxIterations: Math.min(config.negotiation.maxIterations, Math.max(config.placement.candidateIterations, 2 * r.stats.iterations))
-		}
-	});
-	let candidateOptions = optionsFor(best);
-	for (let pass = 0; pass < maxPasses && !outOfTime(); pass++) {
-		let improved = false;
-		for (const id of movableIcs(circuit, nets)) {
-			if (outOfTime()) break;
-			const layout = {
-				...circuit,
-				components: applyMoves(circuit.components, moves),
-				wires: []
-			};
-			for (const to of rankCandidates(layout, nets, id, lattice, config).slice(0, candidatesPerIc)) {
-				if (outOfTime()) break;
-				const next = withMove(moves, id, original.get(id), to);
-				const result = route(next, candidateOptions);
-				if (result && isBetterRouting(result, best)) {
-					best = result;
-					moves = next;
-					candidateOptions = optionsFor(best);
-					improved = true;
-				}
-			}
-		}
-		if (!improved) break;
-	}
-	return {
-		...best,
-		moves,
-		stats: {
-			...best.stats,
-			elapsedMs: Math.round(performance.now() - started)
-		}
-	};
-}
-/** 會動的 IC：接到其他元件的腳多的先，同分依元件 ID。 */
-function movableIcs(circuit, nets) {
-	const linked = /* @__PURE__ */ new Map();
-	for (const net of nets) {
-		if (new Set(net.pins.map((p) => p.componentId)).size < 2) continue;
-		for (const p of net.pins) linked.set(p.componentId, (linked.get(p.componentId) ?? 0) + 1);
-	}
-	return circuit.components.filter((c) => getComponentDefinition(c.defId)?.category === "ic").map((c) => c.id).sort((a, b) => (linked.get(b) ?? 0) - (linked.get(a) ?? 0) || compareIds(a, b));
-}
-/** 這顆 IC 的合法位置（不含目前的位置）依粗估由小到大；同分維持 icCandidates 的順序。 */
-function rankCandidates(layout, nets, id, lattice, config) {
-	const here = placementOf(layout.components.find((c) => c.id === id));
-	const mine = nets.filter((n) => n.pins.some((p) => p.componentId === id));
-	return icCandidates(layout, nets, id).filter((p) => !samePlacement(p, here)).map((p, order) => {
-		const components = layout.components.map((c) => c.id === id ? placeAt(c, p) : c);
-		return {
-			p,
-			order,
-			cost: estimateNets(indexCircuit({
-				...layout,
-				components
-			}), lattice, mine, config.weights)
-		};
-	}).sort((a, b) => a.cost - b.cost || a.order - b.order).map((x) => x.p);
-}
-/** 把 id 搬到 to（搬回原位就刪掉這筆）；依元件 ID 排序，結果固定。 */
-function withMove(moves, id, from, to) {
-	const rest = moves.filter((m) => m.componentId !== id);
-	return (samePlacement(from, to) ? rest : [...rest, {
-		componentId: id,
-		from,
-		to
-	}]).sort((a, b) => compareIds(a.componentId, b.componentId));
 }
 //#endregion
 //#region src/core/routing/apply.ts
@@ -35563,6 +35563,11 @@ var TWO_BOARD_VARIANTS = [
 ];
 /** 總時間預設 40 秒：每塊板先用短時間試每一種擺法（每種最多 4 秒），剩下的時間給最好的兩種。 */
 var TOTAL_MS = 4e4;
+/**
+* 子專案 54：用到兩塊 EIC-1106 的大電路多給的時間（沒有指定總時間時）。2026-11-02 量測：圖 8-8 的十進制加法器
+* （兩顆 74LS83、兩顆 74LS47、兩個顯示器）一次跑一件時 40 秒差 1 條、90 秒排完（257 條線）。
+*/
+var TWO_BOARD_EXTRA_MS = 5e4;
 var MIN_QUICK_MS = 300;
 var MAX_QUICK_MS = 4e3;
 var POLISHED = 2;
@@ -35581,7 +35586,7 @@ function* convertSteps(d, options, budget = {}, parallel = 1) {
 		ok: false,
 		reason: problem
 	};
-	const total = budget.totalMs ?? TOTAL_MS;
+	let total = budget.totalMs ?? TOTAL_MS;
 	const started = performance.now();
 	const hasDisplay = d.nodes.some((n) => n.kind === "DISPLAY");
 	const single = (layout) => ({
@@ -35602,6 +35607,7 @@ function* convertSteps(d, options, budget = {}, parallel = 1) {
 	let tried = 0;
 	let failure = "";
 	for (const [i, { layout: board, variants }] of boards.entries()) {
+		if (variants === TWO_BOARD_VARIANTS && budget.totalMs === void 0) total += TWO_BOARD_EXTRA_MS;
 		const candidates = [];
 		const seen = /* @__PURE__ */ new Set();
 		for (const variant of variants) {
@@ -35685,13 +35691,6 @@ function* convertSteps(d, options, budget = {}, parallel = 1) {
 		ok: false,
 		reason: failure || "轉換失敗：沒有放得下的擺法"
 	};
-}
-/** 一次跑一件（MCP、測試、沒有 Worker 的環境）。route：佈線用的函式（測試時換成假的，不用真的等時間）。 */
-function convertAndRoute(d, options, budget = {}, route = autoPlaceAndRoute) {
-	const steps = convertSteps(d, options, budget, 1);
-	let step = steps.next();
-	while (!step.done) step = steps.next(step.value.map((job) => route(job.circuit, job.config, job.from)));
-	return step.value;
 }
 /** 同時跑好幾件（網頁：每一批交給 routeMany，例如分給好幾個 Worker）。 */
 async function convertAndRouteParallel(d, options, routeMany, parallel, budget = {}) {
@@ -36786,10 +36785,37 @@ function diagramCheckText(d, circuit) {
 	const row = (inputs) => `${c.inputs.join(" ")} = ${[...inputs].join(" ")}`;
 	return [...c.result.mismatches.length === 0 ? [verifyText(c.result, c.outputs)] : [`有 ${c.result.mismatches.length} 列不一致：`, ...c.result.mismatches.map((m) => `- ${row(m.inputs)}：應該 ${pair(m.expected)}，麵包板 ${pair(m.actual)}`)], `對應：${c.mapping}`].join("\n");
 }
+/**
+* 子專案 55：接不完時建議下一步：先多給時間（最常見的原因是時間到），再換顯示器電阻、選板、閘的種類；已經用了的設定不再建議。
+*/
+function retryHints(retry) {
+	if (!retry) return ["可以多給時間（seconds，例如 120）、改用自動選板，或只用一種閘再轉一次。"];
+	const limit = retry.seconds ?? Math.round(retry.elapsedMs / 1e3);
+	const hints = [`seconds: ${Math.min(300, Math.max(120, limit * 2))}（多給佈線器時間，常常就補得上最後幾條）`];
+	if (retry.displays && retry.displayResistors === "each") hints.push("display_resistors: \"shared\"（顯示器共用一顆電阻，線比較少）");
+	if (retry.board !== "auto") hints.push("board: \"auto\"（排不完時可以用兩塊 EIC-1106 左右貼在一起）");
+	if (retry.gates === "direct") hints.push("gates: \"nand\"（只用 NAND，擺法不同，有時比較好排）");
+	hints.push("簡化邏輯圖（少一個閘、少幾條線都有幫助）");
+	return ["可以這樣再轉一次：", ...hints.map((h) => `- ${h}`)];
+}
 function checkAgainstDiagram(f) {
 	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
 	return { text: diagramCheckText(f.logic, f.circuit) };
 }
+var budgetOf = (args) => args.seconds ? { totalMs: args.seconds * 1e3 } : {};
+var retryOf = (f, args, elapsedMs) => {
+	const displays = f.logic.nodes.filter((n) => n.kind === "DISPLAY").length;
+	return {
+		board: args.board ?? "auto",
+		gates: args.gates ?? "direct",
+		...displays > 0 ? {
+			displays,
+			displayResistors: displayResistorsOf(f.logic, args.display_resistors)
+		} : {},
+		elapsedMs,
+		...args.seconds ? { seconds: args.seconds } : {}
+	};
+};
 var convertOptionsOf = (args) => ({
 	switchTo: args.switch_to ?? "vcc",
 	board: args.board ?? "auto",
@@ -36799,20 +36825,22 @@ var convertOptionsOf = (args) => ({
 	display: args.display ?? "ca",
 	...args.display_resistors ? { displayResistors: args.display_resistors } : {}
 });
-function logicToBreadboard(f, args) {
-	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
-	const options = convertOptionsOf(args);
-	const converted = convertAndRoute(f.logic, options);
-	if (!converted.ok) return fail(converted.reason);
-	return convertedReply(f, options, converted);
-}
 /** 子專案 42：同樣的轉換，佈線交給 routeMany（MCP 伺服器用好幾個執行緒同時跑）。 */
-async function logicToBreadboardParallel(f, args, routeMany, parallel) {
+async function logicToBreadboardParallel(f, args, routeMany, parallel, onProgress) {
 	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
 	const options = convertOptionsOf(args);
-	const converted = await convertAndRouteParallel(f.logic, options, routeMany, parallel);
+	const started = performance.now();
+	let batch = 0;
+	const reported = (jobs) => {
+		onProgress?.(`佈線中：第 ${++batch} 批，${jobs.length} 種擺法（已經 ${Math.round((performance.now() - started) / 1e3)} 秒）`);
+		return routeMany(jobs);
+	};
+	const converted = await convertAndRouteParallel(f.logic, options, reported, parallel, budgetOf(args));
 	if (!converted.ok) return fail(converted.reason);
-	return convertedReply(f, options, converted);
+	return convertedReply(f, {
+		...options,
+		retry: retryOf(f, args, performance.now() - started)
+	}, converted);
 }
 /**
 * logic_to_breadboard 的回覆與要寫入的檔案（測試時可以給假的佈線結果）。
@@ -36821,7 +36849,8 @@ async function logicToBreadboardParallel(f, args, routeMany, parallel) {
 */
 function convertedReply(f, options, converted) {
 	const { result: r, routed, tried } = converted;
-	const notes = [`試了 ${tried} 種擺法，用佈線最好的一種。`];
+	const { retry } = options;
+	const notes = [`試了 ${tried} 種擺法，用佈線最好的一種${retry ? `；用了 ${Math.round(retry.elapsedMs / 1e3)} 秒${retry.seconds ? `（上限 ${retry.seconds} 秒）` : ""}` : ""}。`];
 	const done = routed.status === "success";
 	const circuit = done ? applyRouting(r.circuit, routed) : r.circuit;
 	const bom = r.bom;
@@ -36844,7 +36873,7 @@ function convertedReply(f, options, converted) {
 		const nets = new Map(extractNets(r.circuit).map((n) => [n.id, n]));
 		const pins = (netId) => (nets.get(netId)?.pins ?? []).map((p) => `${p.componentId} 第 ${p.pinNumber} 腳`).join("、") || "找不到接在哪些腳";
 		const missing = routed.failedNets.map((n) => `${n.netId}（${pins(n.netId)}）`).join("；");
-		lines.push(`佈線沒有完成，沒有寫入檔案：還沒接好的連線不能用斜的或交叉的線代替（每條線只能水平或垂直、不能交叉、不能跨過 IC）。沒接好的是 ${missing}。`, "可以改用 board: \"EIC1106\"、加上 / 下拉電阻或只用一種閘再轉一次。");
+		lines.push(`佈線沒有完成，沒有寫入檔案：還沒接好的連線不能用斜的或交叉的線代替（每條線只能水平或垂直、不能交叉、不能跨過 IC）。沒接好的是 ${missing}。`, ...retryHints(retry));
 		return { text: lines.join("\n") };
 	}
 	lines.push(`比對：${diagramCheckText(f.logic, circuit)}`);
@@ -37625,7 +37654,7 @@ function folderFromArgs(argv, cwd) {
 * 工具的邏輯在 src/mcp/（純函式）；這裡只負責路徑檢查、讀檔、寫檔。
 */
 /** 版本號：打包時換成建置的日期（vite.mcp.config.ts），原始碼版是 1.0.0。 */
-var VERSION = "2026.10.28";
+var VERSION = "2026.11.2";
 if (process.argv.includes("--version")) {
 	console.log(VERSION);
 	process.exit(0);
@@ -37648,6 +37677,7 @@ var reply = (text, isError = false) => ({
 var load = (abs) => loadLabFile(abs, shown(abs));
 /** 子專案 33：邏輯圖沒有節點但有題目或便條時也要存（由 toCircuitFile 決定）。 */
 function save(abs, lab) {
+	mkdirSync(dirname(abs), { recursive: true });
 	writeFileSync(abs, `${JSON.stringify(toCircuitFile(lab.circuit, lab.name, /* @__PURE__ */ new Date(), void 0, lab.logic), null, 2)}\n`, "utf8");
 }
 /** 讀檔 → 執行工具 → 有新檔案時寫回。失敗時不寫檔。 */
@@ -37851,7 +37881,7 @@ server.registerTool("logic_truth_table", {
 }, async (args) => withFile(args.file, (lab) => logicTruthTable(lab, { pulses: args.pulses })));
 server.registerTool("logic_to_breadboard", {
 	title: "邏輯圖轉成麵包板",
-	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。",
+	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。一般最多 40 秒；用到兩塊 EIC-1106 的大電路最多 90 秒（可以用 seconds 調整）；有 progressToken 時每一批佈線回報一次進度。接不完時不寫入檔案，回覆照這次的設定建議下一步。",
 	inputSchema: {
 		file,
 		switch_to: _enum(["vcc", "gnd"]).optional().describe("開關另一端接 +5 V（ON = 1，預設）或 GND（ON = 0）"),
@@ -37868,9 +37898,23 @@ server.registerTool("logic_to_breadboard", {
 		inputs: _enum(["switch", "button"]).optional().describe("輸入用指撥開關（預設）或每個輸入一顆按鈕"),
 		display: _enum(["ca", "cc"]).optional().describe("7 段顯示器用共陽極 + 74LS47（預設）或共陰極 + 74LS48"),
 		display_resistors: _enum(["each", "shared"]).optional().describe("7 段顯示器的電阻：each 每段一顆 220 Ω（亮度一致，最多 2 個顯示器）或 shared 共同腳共用一顆 100 Ω（線比較少，最多 3 個；亮的段越多越暗）。each 2 個、shared 3 個時要兩塊 EIC-1106（board 要是 auto）。沒給時 1 個顯示器 each、2 個以上 shared"),
-		pulls: boolean().optional().describe("加上 / 下拉電阻（預設加上；電阻直立插在開關那一排、另一端插進電源軌）")
+		pulls: boolean().optional().describe("加上 / 下拉電阻（預設加上；電阻直立插在開關那一排、另一端插進電源軌）"),
+		seconds: number().int().min(10).max(300).optional().describe("總時間上限（秒，10–300）；沒給時一般 40 秒、用到兩塊 EIC-1106 時 90 秒。差一兩條線接不完時調大再轉一次")
 	}
-}, async ({ file: f, ...args }) => pool ? withFileAsync(f, (lab) => logicToBreadboardParallel(lab, args, pool.routeMany, pool.size)) : withFile(f, (lab) => logicToBreadboard(lab, args)));
+}, async ({ file: f, ...args }, extra) => {
+	const token = extra._meta?.progressToken;
+	let progress = 0;
+	const onProgress = token === void 0 ? void 0 : (message) => void extra.sendNotification({
+		method: "notifications/progress",
+		params: {
+			progressToken: token,
+			progress: ++progress,
+			message
+		}
+	});
+	const inline = async (jobs) => jobs.map((job) => autoPlaceAndRoute(job.circuit, job.config, job.from));
+	return withFileAsync(f, (lab) => logicToBreadboardParallel(lab, args, pool?.routeMany ?? inline, pool?.size ?? 1, onProgress));
+});
 server.registerTool("check_against_diagram", {
 	title: "和邏輯圖比對",
 	description: "依名稱把麵包板的開關、LED、7 段顯示器對應到邏輯圖，逐列模擬比對真值表；列出不一致的列或還不能比對的原因。",
