@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.2（commit bc2c034）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.2（commit 7456b0f）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -29094,6 +29094,103 @@ function checkPlacement$1(circuit, instance, ignoreId = instance.id) {
 	if (!def) throw new Error(`Unknown component definition: ${instance.defId}`);
 	return checkPlacementWith(buildOccupancy(circuit, instance.boardId, ignoreId), instance, def);
 }
+var offsetCache = /* @__PURE__ */ new Map();
+/** 半徑 radius 內的所有位移，依距離排序（同距離依 |dy|、|dx|、dy、dx），結果固定。 */
+function searchOffsets(radius) {
+	let offsets = offsetCache.get(radius);
+	if (!offsets) {
+		offsets = [];
+		for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) offsets.push([dx, dy]);
+		offsets.sort(([ax, ay], [bx, by]) => ax * ax + ay * ay - (bx * bx + by * by) || Math.abs(ay) - Math.abs(by) || Math.abs(ax) - Math.abs(bx) || ay - by || ax - bx);
+		offsetCache.set(radius, offsets);
+	}
+	return offsets;
+}
+/**
+* 自動吸附：在 anchor 附近找最近的位置。先找完全沒有問題的位置，
+* 找不到再退而求其次接受只有軟性問題的位置；都沒有就回傳 null。
+*/
+function findPlacement(circuit, instance, options = {}) {
+	const def = getComponentDefinition(instance.defId);
+	if (!def) return null;
+	const occ = buildOccupancy(circuit, instance.boardId, options.ignoreId ?? instance.id);
+	let fallback = null;
+	for (const [dx, dy] of searchOffsets(options.radius ?? 2)) {
+		const candidate = {
+			...instance,
+			anchor: {
+				x: instance.anchor.x + dx,
+				y: instance.anchor.y + dy
+			}
+		};
+		const check = checkPlacementWith(occ, candidate, def);
+		if (check.clean) return candidate;
+		if (check.ok && !fallback) fallback = candidate;
+	}
+	return fallback;
+}
+/** 元件所有腳與本體格點外框的中心（格點座標，可為 .5）。 */
+function footprintCenter(instance, def) {
+	const fp = resolveFootprint(instance, def);
+	const cells = [...fp.pins.map((p) => p.point), ...fp.blocked];
+	const xs = cells.map((p) => p.x);
+	const ys = cells.map((p) => p.y);
+	return {
+		x: (Math.min(...xs) + Math.max(...xs)) / 2,
+		y: (Math.min(...ys) + Math.max(...ys)) / 2
+	};
+}
+/** 同上，但不取整（中心在兩個孔中間時會是半格）。 */
+function exactCenteredAnchor(def, rotation, span, cx, cy) {
+	const probe = {
+		id: "?",
+		defId: def.id,
+		boardId: "?",
+		anchor: {
+			x: 0,
+			y: 0
+		},
+		rotation,
+		props: {}
+	};
+	if (span !== void 0) probe.span = span;
+	const center = footprintCenter(probe, def);
+	return {
+		x: cx - center.x,
+		y: cy - center.y
+	};
+}
+/** 子專案 56：轉到指定的角度（MCP set_part 用）；轉完放不下、附近也找不到位置時回傳 null。 */
+function turnedTo(circuit, instance, rotation) {
+	return rotation === instance.rotation ? instance : placeTurned(circuit, instance, [rotation]);
+}
+/** 依序試這些角度：先找不用挪就放得下的，都不行才挪到附近。 */
+function placeTurned(circuit, instance, rotations) {
+	const def = getComponentDefinition(instance.defId);
+	if (!def) return null;
+	const center = footprintCenter(instance, def);
+	const onPin1 = def.package.type !== "dip" && !(Number.isInteger(center.x) && Number.isInteger(center.y));
+	const turned = rotations.map((rotation) => {
+		const exact = exactCenteredAnchor(def, rotation, instance.span, center.x, center.y);
+		const anchor = !onPin1 && Number.isInteger(exact.x) && Number.isInteger(exact.y) ? {
+			x: exact.x + 0,
+			y: exact.y + 0
+		} : instance.anchor;
+		return {
+			...instance,
+			rotation,
+			anchor
+		};
+	});
+	const occ = buildOccupancy(circuit, instance.boardId, instance.id);
+	const inPlace = turned.find((t) => checkPlacementWith(occ, t, def).ok);
+	if (inPlace) return inPlace;
+	for (const t of turned) {
+		const placed = findPlacement(circuit, t, { ignoreId: instance.id });
+		if (placed) return placed;
+	}
+	return null;
+}
 //#endregion
 //#region src/editor/commands.ts
 function definitionOf(defId) {
@@ -36316,6 +36413,9 @@ var ROTATIONS = [
 	180,
 	270
 ];
+/** 子專案 56：IC（DIP）要跨過凹槽，只能 0° 或 180°。 */
+var DIP_TURN = "IC 要跨過中間的凹槽，只能轉 0° 或 180°";
+var dipCannotTurn = (def, rotation) => def.package.type === "dip" && (rotation === 90 || rotation === 270);
 /** 子專案 33：list_files 的一行說明（麵包板、元件數、有沒有邏輯圖與題目）。 */
 function describeLabFile(f) {
 	const boards = f.circuit.boards.map((b) => b.layoutId === "EIC1106" ? "EIC-1106" : "MB-102");
@@ -36481,6 +36581,7 @@ function placePart(f, args) {
 	const def = getComponentDefinition(item.defId);
 	const rotation = args.rotation ?? 0;
 	if (!ROTATIONS.includes(rotation)) return fail("rotation 只能是 0、90、180、270");
+	if (dipCannotTurn(def, rotation)) return fail(`${args.part} 不能轉 ${rotation}°：${DIP_TURN}`);
 	if (args.id !== void 0 && f.circuit.components.some((c) => c.id === args.id)) return fail(`ID ${args.id} 已經有元件了`);
 	const id = args.id ?? nextComponentId(f.circuit, def.category);
 	const spec = {
@@ -36543,6 +36644,18 @@ function setPart(f, args) {
 	const def = getComponentDefinition(instance.defId);
 	let circuit = f.circuit;
 	const done = [];
+	if (args.rotation !== void 0) {
+		const rotation = args.rotation;
+		if (!ROTATIONS.includes(rotation)) return fail("rotation 只能是 0、90、180、270");
+		if (dipCannotTurn(def, rotation)) return fail(`${args.id} 不能轉 ${rotation}°：${DIP_TURN}`);
+		const turned = turnedTo(circuit, instance, rotation);
+		if (!turned) return fail(`${args.id} 轉到 ${rotation}° 放不下（附近的孔被佔用或超出麵包板）；先把它移到空一點的地方（remove 後用 place_part 指定 rotation）`);
+		circuit = {
+			...circuit,
+			components: circuit.components.map((c) => c.id === args.id ? turned : c)
+		};
+		done.push(`轉到 ${rotation}°：${pinsText(circuit, turned)}`);
+	}
 	if (args.labels) {
 		const slots = labelSlots(instance);
 		if (slots === 0) return fail(`${args.id} 不能設名稱（只有指撥開關、LED、7 段顯示器可以）`);
@@ -36569,7 +36682,7 @@ function setPart(f, args) {
 		circuit = updateComponentProps(circuit, args.id, { switchStates: [...args.switches] });
 		done.push(`開關 ${args.switches.map((on) => on ? "ON" : "OFF").join(" ")}`);
 	}
-	if (done.length === 0) return fail("沒有要改的東西（labels、resistance、color、switches 至少給一個）");
+	if (done.length === 0) return fail("沒有要改的東西（labels、resistance、color、switches、rotation 至少給一個）");
 	return {
 		text: `${args.id}：${done.join("；")}`,
 		file: {
@@ -37798,7 +37911,7 @@ server.registerTool("place_part", {
 		file,
 		part: string().describe("元件名稱（list_parts 列出的名稱）"),
 		hole: hole("第 1 腳的位置").optional(),
-		rotation: number().int().optional().describe("旋轉角度：0、90、180、270"),
+		rotation: number().int().optional().describe("旋轉角度（順時針）：0、90、180、270；IC 只能 0 或 180（要跨過凹槽）"),
 		id: string().optional().describe("指定元件 ID（預設自動編號：U1、R1、D1、SW1…）")
 	}
 }, async ({ file: f, ...args }) => withFile(f, (lab) => placePart(lab, args)));
@@ -37814,7 +37927,7 @@ server.registerTool("add_wire", {
 }, async ({ file: f, ...args }) => withFile(f, (lab) => addWire(lab, args)));
 server.registerTool("set_part", {
 	title: "改元件設定",
-	description: "改名稱（指撥開關每個開關一個、LED 與 7 段顯示器一個）、電阻值、LED 顏色、指撥開關 ON / OFF。",
+	description: "改名稱（指撥開關每個開關一個、LED 與 7 段顯示器一個）、電阻值、LED 顏色、指撥開關 ON / OFF、旋轉角度（rotation）。",
 	inputSchema: {
 		file,
 		id: string().describe("元件 ID"),
@@ -37826,7 +37939,8 @@ server.registerTool("set_part", {
 			"yellow",
 			"blue"
 		]).optional().describe("LED 顏色"),
-		switches: array(boolean()).optional().describe("指撥開關每個開關的狀態，true = ON")
+		switches: array(boolean()).optional().describe("指撥開關每個開關的狀態，true = ON"),
+		rotation: number().int().optional().describe("轉到這個角度（0、90、180、270，順時針）；和網頁按 R 一樣以中心轉（2 腳元件以第 1 腳為軸），放不下時挪到附近。IC 只能 0 或 180")
 	}
 }, async ({ file: f, ...args }) => withFile(f, (lab) => setPart(lab, args)));
 server.registerTool("remove", {
