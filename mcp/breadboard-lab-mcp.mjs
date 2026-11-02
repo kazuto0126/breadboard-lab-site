@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.2（commit 7456b0f）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.2（commit f5e0cc2）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -21786,65 +21786,71 @@ var terminalArea = (area, top) => [...TOP_ROWS.map((label, i) => ({
 	half: "bot",
 	area
 }))];
+/** 子專案 57：每對電源軌 − 在上、+ 在下（以前是 + 在上；舊檔打開時由 fileFormat 換排）。 */
 var railPair = (n, y) => [{
 	y,
 	kind: "rail",
-	label: `P${n}+`,
+	label: `P${n}-`,
 	holeColumns: RAIL_COLUMNS
 }, {
 	y: y + 1,
 	kind: "rail",
-	label: `P${n}-`,
+	label: `P${n}+`,
 	holeColumns: RAIL_COLUMNS
 }];
+/**
+* EIC-1106（2390 孔）：由上到下 接線柱、P1、P2、插孔區 1、P3、插孔區 2、P4、插孔區 3、P5（規格 2026-10-11 eic-board 第 2 節）。
+* 每個插孔區和 MB-102 相同（63 欄 × A–J，中間凹槽）；每條電源軌 − + 兩列（− 在上）、各 50 孔、整條相通。
+*/
+var EIC1106_LAYOUT = {
+	id: "EIC1106",
+	name: "EIC-1106",
+	width: 63,
+	height: 56,
+	rows: [
+		...railPair(1, 4),
+		...railPair(2, 7),
+		...terminalArea(1, 10),
+		...railPair(3, 23),
+		...terminalArea(2, 26),
+		...railPair(4, 39),
+		...terminalArea(3, 42),
+		...railPair(5, 55)
+	],
+	posts: [
+		{
+			x: 20,
+			y: 2,
+			name: "紅",
+			color: "red",
+			source: "vcc"
+		},
+		{
+			x: 28,
+			y: 2,
+			name: "黑",
+			color: "black",
+			source: "gnd"
+		},
+		{
+			x: 36,
+			y: 2,
+			name: "黃",
+			color: "yellow"
+		},
+		{
+			x: 44,
+			y: 2,
+			name: "綠",
+			color: "green"
+		}
+	]
+};
 //#endregion
 //#region src/core/breadboard/registry.ts
 var LAYOUTS = {
 	MB102: MB102_LAYOUT,
-	EIC1106: {
-		id: "EIC1106",
-		name: "EIC-1106",
-		width: 63,
-		height: 56,
-		rows: [
-			...railPair(1, 4),
-			...railPair(2, 7),
-			...terminalArea(1, 10),
-			...railPair(3, 23),
-			...terminalArea(2, 26),
-			...railPair(4, 39),
-			...terminalArea(3, 42),
-			...railPair(5, 55)
-		],
-		posts: [
-			{
-				x: 20,
-				y: 2,
-				name: "紅",
-				color: "red",
-				source: "vcc"
-			},
-			{
-				x: 28,
-				y: 2,
-				name: "黑",
-				color: "black",
-				source: "gnd"
-			},
-			{
-				x: 36,
-				y: 2,
-				name: "黃",
-				color: "yellow"
-			},
-			{
-				x: 44,
-				y: 2,
-				name: "綠",
-				color: "green"
-			}
-		]
-	}
+	EIC1106: EIC1106_LAYOUT
 };
 function getLayout(layoutId) {
 	const layout = LAYOUTS[layoutId];
@@ -31798,12 +31804,128 @@ function parseLogicDiagram(raw) {
 	}
 }
 //#endregion
+//#region src/editor/legacyRails.ts
+/**
+* 子專案 57：EIC-1106 的電源軌以前每對都是 + 在上、− 在下，現在改成 − 在上、+ 在下。
+* 舊檔（檔案版本 1）打開時，把插在電源軌上的導線端點、元件腳、便條指的孔換到同極性的那一排，舊電路照樣能用。
+*/
+var SWAP = (() => {
+	const yOf = new Map(EIC1106_LAYOUT.rows.flatMap((r) => r.kind === "rail" ? [[r.label, r.y]] : []));
+	const swap = /* @__PURE__ */ new Map();
+	for (const [label, y] of yOf) {
+		const partner = yOf.get(label.endsWith("+") ? `${label.slice(0, -1)}-` : `${label.slice(0, -1)}+`);
+		if (partner !== void 0) swap.set(y, partner);
+	}
+	return swap;
+})();
+var moved = (p, eic) => eic.has(p.boardId) && SWAP.has(p.y) ? {
+	...p,
+	y: SWAP.get(p.y)
+} : p;
+var same = (a, b) => a.boardId === b.boardId && a.x === b.x && a.y === b.y;
+/** 去掉直線中間的點（只留端點與轉角），換排時線才不會在兩排軌之間來回；換完再用 steps 補回每一格。 */
+function corners(path) {
+	return path.filter((p, i) => {
+		if (i === 0 || i === path.length - 1) return true;
+		const a = path[i - 1];
+		const b = path[i + 1];
+		return !(a.boardId === p.boardId && b.boardId === p.boardId && (a.x === p.x && p.x === b.x || a.y === p.y && p.y === b.y));
+	});
+}
+/** 相鄰兩個轉角之間一格一格補齊（同一塊板、水平或垂直）。 */
+function steps(points) {
+	const out = [points[0]];
+	for (let i = 1; i < points.length; i++) {
+		const a = points[i - 1];
+		const b = points[i];
+		if (a.boardId !== b.boardId || a.x !== b.x && a.y !== b.y) {
+			out.push(b);
+			continue;
+		}
+		let { x, y } = a;
+		while (x !== b.x || y !== b.y) {
+			x += Math.sign(b.x - x);
+			y += Math.sign(b.y - y);
+			out.push({
+				boardId: a.boardId,
+				x,
+				y
+			});
+		}
+	}
+	return out;
+}
+function migrateWire(w, eic) {
+	if (![
+		w.start,
+		w.end,
+		...w.path
+	].some((p) => !same(p, moved(p, eic)))) return w;
+	const turned = corners(w.path).map((p) => moved(p, eic));
+	return {
+		...w,
+		start: moved(w.start, eic),
+		end: moved(w.end, eic),
+		path: w.straight ? turned : steps(turned)
+	};
+}
+/** 元件：找一個腳剛好落在換排後位置的擺法（同方向，anchor 挪一格以內、2 腳元件長度差一格以內）；找不到就不動。 */
+function migrateComponent(c, eic) {
+	const def = getComponentDefinition(c.defId);
+	if (!def || !eic.has(c.boardId)) return c;
+	const pinsOf = (x) => resolveFootprint(x, def).pins.map((p) => p.point);
+	const before = pinsOf(c);
+	const want = before.map((p) => moved(p, eic));
+	if (want.every((p, i) => same(p, before[i]))) return c;
+	const span = effectiveSpan(c, def);
+	const pkg = def.package;
+	const spans = pkg.type === "two-lead" ? [
+		span,
+		span - 1,
+		span + 1
+	].filter((s) => s >= pkg.minSpan) : [span];
+	for (const s of spans) for (const dy of [
+		0,
+		-1,
+		1
+	]) for (const dx of [
+		0,
+		-1,
+		1
+	]) {
+		const t = {
+			...c,
+			anchor: {
+				x: c.anchor.x + dx,
+				y: c.anchor.y + dy
+			}
+		};
+		if (s !== span) t.span = s;
+		if (pinsOf(t).every((p, i) => same(p, want[i]))) return t;
+	}
+	return c;
+}
+function migrateEicRails(circuit) {
+	const eic = new Set(circuit.boards.filter((b) => b.layoutId === "EIC1106").map((b) => b.id));
+	if (eic.size === 0) return circuit;
+	const notes = circuit.notes?.map((n) => n.targetHole ? {
+		...n,
+		targetHole: moved(n.targetHole, eic)
+	} : n);
+	return {
+		...circuit,
+		components: circuit.components.map((c) => migrateComponent(c, eic)),
+		wires: circuit.wires.map((w) => migrateWire(w, eic)),
+		...notes ? { notes } : {}
+	};
+}
+//#endregion
 //#region src/editor/fileFormat.ts
 var FILE_FORMAT = "breadboard-lab/circuit";
 function toCircuitFile(circuit, name, now = /* @__PURE__ */ new Date(), checklist, logic) {
 	const file = {
 		format: FILE_FORMAT,
-		version: 1,
+		version: 2,
 		name,
 		savedAt: now.toISOString(),
 		circuit
@@ -32028,7 +32150,7 @@ function parseCircuitData(raw) {
 		const top = raw;
 		if (top.format !== void 0) {
 			if (top.format !== "breadboard-lab/circuit") fail$1("format", `不是 Breadboard Lab 的電路檔（${String(top.format)}）`);
-			if (top.version !== 1) fail$1("version", `不支援的檔案版本 ${String(top.version)}`);
+			if (top.version !== 2 && top.version !== 1) fail$1("version", `不支援的檔案版本 ${String(top.version)}`);
 			const name = typeof top.name === "string" && top.name.trim() ? top.name.trim() : null;
 			const checklist = parseChecklist(top.checklist);
 			let logic;
@@ -32039,7 +32161,7 @@ function parseCircuitData(raw) {
 			}
 			return {
 				ok: true,
-				circuit: parseCircuit(top.circuit),
+				circuit: top.version === 1 ? migrateEicRails(parseCircuit(top.circuit)) : parseCircuit(top.circuit),
 				name,
 				...checklist ? { checklist } : {},
 				...logic ? { logic } : {}
@@ -33600,7 +33722,7 @@ function routingSummaryText(s) {
 	"- 和這個電路或數位邏輯無關的問題，簡短說明你只能回答這個電路的問題。"
 ].join("\n");
 var MB102_RULE = "孔位規則：編號相同的 A–E 五個孔相通（例如 A10–E10）、F–J 五個孔相通（例如 F10–J10），中間凹槽隔開；T+、T-、B+、B- 四條電源軌各自整條相通。";
-var EIC1106_RULE = "EIC-1106 孔位規則：有三個插孔區，孔名前面是區號（例如 1-A15、2-F30）；每區同一欄的 A–E 五個孔相通、F–J 五個孔相通。電源軌 P1–P5 各有 + 與 − 兩列，每列整條相通（例如 P2+12）。上方的接線柱：紅柱 = +5 V、黑柱 = GND，黃柱、綠柱不是電源。";
+var EIC1106_RULE = "EIC-1106 孔位規則：有三個插孔區，孔名前面是區號（例如 1-A15、2-F30）；每區同一欄的 A–E 五個孔相通、F–J 五個孔相通。電源軌 P1–P5 各有 − 與 + 兩列（− 在上、+ 在下），每列整條相通（例如 P2+12）。上方的接線柱：紅柱 = +5 V、黑柱 = GND，黃柱、綠柱不是電源。";
 /** 規格 5.4：依電路裡有的板子型號產生孔位規則。 */
 function holeRule(circuit) {
 	const layouts = new Set(circuit.boards.map((b) => b.layoutId));
@@ -37825,7 +37947,7 @@ function saved(path, r) {
 /** 子專案 42：轉成麵包板的佈線執行緒（核心數 − 1，最多 4 個；只有 1 個時不用執行緒）。 */
 var pool = isMainThread && poolSize() > 1 ? createRoutingPool(poolSize()) : null;
 var file = string().describe("電路檔的路徑（工作資料夾裡的 .json 檔，例如 circuits/xor.json）");
-var hole = (what) => string().describe(`${what}：孔位名稱，寫法和網頁一樣，例如 F10、A3、T+10（上方 + 軌）、B-3（下方 − 軌）；EIC-1106 寫 1-F10、P2+12；有好幾塊板時加板子 ID，例如 b2:F10`);
+var hole = (what) => string().describe(`${what}：孔位名稱，寫法和網頁一樣，例如 F10、A3、T+10（上方 + 軌）、B-3（下方 − 軌）；EIC-1106 寫 1-F10、P2+12（每對電源軌 − 在上、+ 在下）；有好幾塊板時加板子 ID，例如 b2:F10`);
 var server = new McpServer({
 	name: "breadboard-lab",
 	version: VERSION
