@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.2（commit f5e0cc2）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.3（commit 2dd0bdf）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -27431,6 +27431,10 @@ function wireSegments(wire, lattice) {
 	}
 	return out;
 }
+/** 子專案 58：斜的直線導線（網頁上手動拉的；AI 標準佈線會改成水平 / 垂直的線）。 */
+function isDiagonal(wire, lattice) {
+	return wireSegments(wire, lattice).some((s) => s.a.x !== s.b.x && s.a.y !== s.b.y);
+}
 /** 長度（格）：直線導線是兩端的直線距離，路徑導線是步數。 */
 function wireLength(wire, lattice) {
 	if (!isStraight(wire)) return Math.max(0, wire.path.length - 1);
@@ -32383,19 +32387,19 @@ function checkWires(circuit, index, report) {
 	const isOnBoard = (p) => isRoutablePoint(lattice, p);
 	const endsAt = /* @__PURE__ */ new Map();
 	for (const w of circuit.wires) for (const p of [w.start, w.end]) pushTo(endsAt, nodeIdOf(p), w.id);
+	const diagonal = new Set(circuit.wires.filter((w) => isDiagonal(w, lattice)).map((w) => w.id));
 	for (const w of circuit.wires) {
-		const segments = wireSegments(w, lattice);
-		if (segments.length > 1) report({
+		if (wireSegments(w, lattice).length > 1) report({
 			code: "WIRE_BENT",
 			severity: "error",
 			message: `導線 ${w.id} 在一條線裡轉彎：要轉彎請分成兩條直線`,
 			wireIds: [w.id],
 			points: [w.start, w.end]
 		});
-		else if (segments.some((s) => s.a.x !== s.b.x && s.a.y !== s.b.y)) report({
+		else if (diagonal.has(w.id)) report({
 			code: "WIRE_DIAGONAL",
-			severity: "error",
-			message: `導線 ${w.id} 是斜的：導線只能水平或垂直，要轉彎請分成兩條`,
+			severity: "warning",
+			message: `導線 ${w.id} 是斜的：按「AI 標準佈線」會改成直線`,
 			wireIds: [w.id],
 			points: [w.start, w.end]
 		});
@@ -32434,7 +32438,7 @@ function checkWires(circuit, index, report) {
 				componentIds: index.bodiesAt.get(id)
 			});
 		}
-		const blockedAt = cellsUnder(w, lattice).find((p) => {
+		const blockedAt = !diagonal.has(w.id) && cellsUnder(w, lattice).find((p) => {
 			const id = nodeIdOf(p);
 			return index.pinsAt.has(id) || index.bodiesAt.has(id) || (endsAt.get(id) ?? []).some((other) => other !== w.id);
 		});
@@ -32447,7 +32451,8 @@ function checkWires(circuit, index, report) {
 		});
 	}
 	const byPair = /* @__PURE__ */ new Map();
-	for (const o of analyzeWireInteractions(circuit.wires, lattice).overlaps) {
+	const interactions = analyzeWireInteractions(circuit.wires.filter((w) => !diagonal.has(w.id)), lattice);
+	for (const o of interactions.overlaps) {
 		const key = JSON.stringify(o.wireIds);
 		const entry = byPair.get(key) ?? {
 			wireIds: [...o.wireIds],
@@ -32463,7 +32468,7 @@ function checkWires(circuit, index, report) {
 		wireIds,
 		points
 	});
-	for (const x of analyzeWireInteractions(circuit.wires, lattice).crossings) {
+	for (const x of interactions.crossings) {
 		const at = parseNodeId(x.nodeId);
 		report({
 			code: "WIRE_CROSSING",
@@ -32860,13 +32865,17 @@ function isFreeHoleWith(occ, p) {
 	const id = node.id;
 	return !occ.pins.has(id) && !occ.bodies.has(id) && !occ.wireEnds.has(id) && !occ.wirePaths.has(id);
 }
+/** 子專案 58：網頁的手動接線（拉線、拖曳端點、預覽）與 MCP 的 add_wire 用這個選項，可以拉斜線。 */
+var FREE_WIRING = { allowDiagonal: true };
 /**
 * 規格（2026-10-10 straight-wires）第 1 節：手動直線（新拉的線、拖曳端點後的線）合不合法；不合法時回傳第一個原因。
 * 一孔多線可以；端點不能是元件腳或本體；線不能和別條線重疊，不能經過元件腳、本體（例如 IC）、別條線的端點；
 * 端點也不能落在別條線經過的孔上（那條線就會變成經過障礙）。ignoreWireId：拖曳端點時忽略被移動的那條線。
 * 子專案 39（規格 2026-10-20 wiring-rules）：只能水平或垂直（轉彎要分成兩條），也不能和別條線十字交叉。MCP 的 add_wire 也用這個檢查。
+* 子專案 58：options.allowDiagonal（網頁的手動接線）可以拉斜線，斜線只檢查兩端（AI 標準佈線會改成直線）；
+* 已經拉好的斜線也不擋之後的線，只有它的兩端照舊算障礙。MCP 的 add_wire 也用這個選項。
 */
-function straightWireProblem(circuit, start, end, ignoreWireId) {
+function straightWireProblem(circuit, start, end, ignoreWireId, options = {}) {
 	const index = indexCircuit(circuit);
 	for (const p of [start, end]) {
 		const node = nodeAt(index, p);
@@ -32884,7 +32893,8 @@ function straightWireProblem(circuit, start, end, ignoreWireId) {
 	if (lattice.groupOf.get(start.boardId) !== lattice.groupOf.get(end.boardId)) return { kind: "other-group" };
 	const a = latticeOf(lattice, start);
 	const b = latticeOf(lattice, end);
-	if (a && b && a.x !== b.x && a.y !== b.y) return { kind: "diagonal" };
+	const diagonal = !!a && !!b && a.x !== b.x && a.y !== b.y;
+	if (diagonal && !options.allowDiagonal) return { kind: "diagonal" };
 	const probe = {
 		id: "__new",
 		color: "",
@@ -32894,7 +32904,21 @@ function straightWireProblem(circuit, start, end, ignoreWireId) {
 		end,
 		path: [start, end]
 	};
-	const others = circuit.wires.filter((w) => w.id !== ignoreWireId);
+	const all = circuit.wires.filter((w) => w.id !== ignoreWireId);
+	const others = all.filter((w) => !isDiagonal(w, lattice));
+	const endIds = /* @__PURE__ */ new Set([nodeIdOf(start), nodeIdOf(end)]);
+	const coveredAt = () => {
+		for (const w of others) {
+			const under = cellsUnder(w, lattice).find((p) => endIds.has(nodeIdOf(p)));
+			if (under) return {
+				kind: "covered",
+				wireId: w.id,
+				point: under
+			};
+		}
+		return null;
+	};
+	if (diagonal) return coveredAt();
 	const [mine] = wireSegments(probe, lattice);
 	for (const w of others) if (wireSegments(w, lattice).some((s) => segmentOverlap(mine, s))) return {
 		kind: "overlap",
@@ -32909,7 +32933,7 @@ function straightWireProblem(circuit, start, end, ignoreWireId) {
 			point: at
 		};
 	}
-	const ends = new Set(others.flatMap((w) => [nodeIdOf(w.start), nodeIdOf(w.end)]));
+	const ends = new Set(all.flatMap((w) => [nodeIdOf(w.start), nodeIdOf(w.end)]));
 	for (const p of cellsUnder(probe, lattice)) {
 		const id = nodeIdOf(p);
 		if (index.pinsAt.has(id) || index.bodiesAt.has(id) || ends.has(id)) return {
@@ -32917,16 +32941,7 @@ function straightWireProblem(circuit, start, end, ignoreWireId) {
 			point: p
 		};
 	}
-	const endIds = /* @__PURE__ */ new Set([nodeIdOf(start), nodeIdOf(end)]);
-	for (const w of others) {
-		const under = cellsUnder(w, lattice).find((p) => endIds.has(nodeIdOf(p)));
-		if (under) return {
-			kind: "covered",
-			wireId: w.id,
-			point: under
-		};
-	}
-	return null;
+	return coveredAt();
 }
 function straightProblemText(circuit, problem) {
 	const label = (p) => holeLabel(circuit, p);
@@ -33367,8 +33382,8 @@ var ISSUE_TEXT = {
 		fix: "刪掉其中一條改走別的路，或按「AI 標準佈線」重新排。"
 	},
 	WIRE_DIAGONAL: {
-		why: "導線只能水平或垂直（子專案 39 的接線規則）：斜的線在實體麵包板上不好插，也不好對照。",
-		fix: "刪掉這條線，改成水平或垂直的線；要轉彎就分成兩條，轉角接在同一排相通的孔。或按「AI 標準佈線」。"
+		why: "標準接線只用水平或垂直的線（子專案 39 的接線規則）：斜的線在實體麵包板上不好插，也不好對照。自己接的時候可以先拉斜線（子專案 58）。",
+		fix: "按「AI 標準佈線」，斜線會全部改成水平或垂直的線；也可以自己改成水平或垂直，要轉彎就分成兩條，轉角接在同一排相通的孔。"
 	},
 	WIRE_BENT: {
 		why: "一條線不能轉彎（子專案 39 的接線規則）：實體跳線是一段直的，要轉彎就要用兩條線。",
@@ -36749,11 +36764,12 @@ function addWire(f, args) {
 	if (!a.ok) return fail(a.error);
 	const b = parseHole(f.circuit, args.to);
 	if (!b.ok) return fail(b.error);
-	const problem = straightWireProblem(f.circuit, a.point, b.point);
+	const problem = straightWireProblem(f.circuit, a.point, b.point, void 0, FREE_WIRING);
 	if (problem) return fail(`不能接 ${args.from} → ${args.to}：${straightProblemText(f.circuit, problem)}`);
 	const { circuit, id } = addWire$1(f.circuit, a.point, b.point, args.color ?? defaultWireColor(f.circuit, a.point, b.point));
+	const note = isDiagonal(circuit.wires.find((w) => w.id === id), buildLattice(circuit.boards)) ? "（斜線；auto_route 會改成水平或垂直的線）" : "";
 	return {
-		text: `接好 ${id}：${holeLabel(circuit, a.point)} → ${holeLabel(circuit, b.point)}`,
+		text: `接好 ${id}：${holeLabel(circuit, a.point)} → ${holeLabel(circuit, b.point)}${note}`,
 		file: {
 			...f,
 			circuit
@@ -37889,7 +37905,7 @@ function folderFromArgs(argv, cwd) {
 * 工具的邏輯在 src/mcp/（純函式）；這裡只負責路徑檢查、讀檔、寫檔。
 */
 /** 版本號：打包時換成建置的日期（vite.mcp.config.ts），原始碼版是 1.0.0。 */
-var VERSION = "2026.11.2";
+var VERSION = "2026.11.3";
 if (process.argv.includes("--version")) {
 	console.log(VERSION);
 	process.exit(0);
@@ -37955,7 +37971,7 @@ var server = new McpServer({
 	"Breadboard Lab：在 MB-102 / EIC-1106 麵包板上放 74LS IC、電阻、LED、指撥開關並接線，可以檢查、AI 佈線、模擬，也可以把邏輯圖轉成麵包板。",
 	`工作資料夾：${ROOT}；file 參數寫相對於它的路徑（例如 circuits/xor.json），list_files 列出裡面的電路檔。`,
 	"電路檔就是網頁「匯出 JSON」的格式；做完用 share_link 給使用者一個連結（點開就在網頁上看到），或請使用者在網頁用「檔案 → 匯入 JSON」打開。",
-	"接線規則（一定要遵守）：每條導線只能水平或垂直的直線，不能斜；要轉彎就分成兩條線（轉角接在同一排相通的五孔排）；兩條線不能重疊，也不能交叉；線不能跨過 IC（上下、左右都不行）或經過元件腳、別條線的端點。add_wire 會拒絕不合規則的線；auto_route 與 logic_to_breadboard 接出來的線都符合這些規則。",
+	"標準接線規則（auto_route 與 logic_to_breadboard 的結果一定遵守，check_circuit 照這個檢查）：每條導線只能水平或垂直的直線，不能斜；要轉彎就分成兩條線（轉角接在同一排相通的五孔排）；兩條線不能重疊，也不能交叉；線不能跨過 IC（上下、左右都不行）或經過元件腳、別條線的端點。auto_route 與 logic_to_breadboard 接出來的線都符合這些規則。add_wire 和使用者在網頁上自己接一樣可以接斜線（只檢查兩端），check_circuit 會提醒，auto_route 會全部改成直線；水平或垂直的線不合規則時 add_wire 會拒絕。",
 	"建議流程：new_circuit → list_parts（查元件名稱與腳位）→ place_part（IC 第 1 腳放在 F 列，跨過凹槽）→ add_wire → check_circuit → auto_route → simulate。",
 	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
 	"從真值表題目開始：task_set → task_show → task_to_diagram → logic_to_breadboard → task_check。",
@@ -38039,7 +38055,7 @@ server.registerTool("place_part", {
 }, async ({ file: f, ...args }) => withFile(f, (lab) => placePart(lab, args)));
 server.registerTool("add_wire", {
 	title: "接線",
-	description: "在兩個孔之間接一條直線導線。只能水平或垂直，不能斜；要轉彎就分成兩條（轉角接在同一排相通的孔）；不能和別條線重疊，也不能交叉；不能跨過 IC 或經過元件腳、別條線的端點。不合規則時說明原因。",
+	description: "在兩個孔之間接一條直線導線。可以斜著接（和使用者在網頁上自己接一樣：斜線只檢查兩端，可以壓過 IC、和別條線交叉；auto_route 會全部改成水平或垂直的線）。水平或垂直的線照標準規則：只能水平或垂直的一段，要轉彎就分成兩條（轉角接在同一排相通的孔）；不能和別條線重疊，也不能交叉；不能跨過 IC 或經過元件腳、別條線的端點。不合規則時說明原因。",
 	inputSchema: {
 		file,
 		from: hole("起點"),
