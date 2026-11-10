@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.3（commit 2dd0bdf）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.10（commit e82f1c1）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -30627,23 +30627,26 @@ function powerOn(chip) {
 /** 子專案 46：時序方塊最多重算幾次（漣波計數器一級一級傳下去）。 */
 var MAX_SETTLE = 32;
 /**
+* 子專案 59：閘接回前面的迴授（例如 NAND 交叉接成的 SR 閂鎖）。迴授上的值記在 SeqState 裡（key 是 LOOP_KEY + 訊號），
+* 下次求值時從記住的值開始算（閂鎖會「保持」）；沒記過的從 0 開始（上電狀態）。
+*/
+var LOOP_KEY = "loop:";
+/** 迴授最多來回算幾輪；還在變就判定不穩定（一直來回跳，例如 NOT 接回自己），那些訊號當成 X。 */
+var MAX_LOOP_PASSES = 64;
+/**
 * values：輸入端 id → 0 / 1；沒給的用節點自己的 value。displays：顯示器 id → 0–15（A + 2B + 4C + 8D）或 X。
 * 子專案 32：dps 是小數點（沒接是 0）；segs 是每段直接控制的顯示器亮的段（沒接的段是 0，有不確定的是 X）。
 */
 function evaluate$1(d, values = {}, state) {
-	const { order, loop } = topoOrder(d);
-	if (loop) return {
-		loop,
-		nodes: /* @__PURE__ */ new Map(),
-		displays: /* @__PURE__ */ new Map(),
-		dps: /* @__PURE__ */ new Map(),
-		segs: /* @__PURE__ */ new Map(),
-		seq: state ?? {}
-	};
+	const topo = topoOrder(d);
+	const order = topo.loop ? [...topo.order, ...d.nodes.filter((n) => !topo.order.includes(n))] : topo.order;
+	const feedback = topo.loop ? order.slice(topo.order.length).filter((n) => !isSequentialNode(n)) : [];
 	const driver = new Map(d.wires.map((w) => [`${w.to.node}#${w.to.pin}`, signalOf(w.from, w.fromPin)]));
 	const sequential = order.filter(isSequentialNode);
 	const seq = {};
 	for (const node of sequential) seq[node.id] = state?.[node.id] ?? powerOn(node.chip);
+	const memory = /* @__PURE__ */ new Map();
+	for (const [key, entry] of Object.entries(state ?? {})) if (key.startsWith(LOOP_KEY)) memory.set(key.slice(5), entry.out[0]);
 	/** 時序方塊的輸入：沒接時用 BLOCK_DEFAULTS 的值。 */
 	const readOf = (node, current) => {
 		const chip = node.chip;
@@ -30655,7 +30658,7 @@ function evaluate$1(d, values = {}, state) {
 			return from === void 0 ? defaultOf(chip, pin) : current.get(from) ?? "X";
 		};
 	};
-	let result = combinational(order, driver, values, seq);
+	let result = combinational(order, driver, values, seq, feedback.length > 0 ? memory : null);
 	for (let round = 0; sequential.length > 0 && round < MAX_SETTLE; round++) {
 		let changed = false;
 		for (const node of sequential) {
@@ -30668,56 +30671,84 @@ function evaluate$1(d, values = {}, state) {
 			};
 		}
 		if (!changed) break;
-		result = combinational(order, driver, values, seq);
+		result = combinational(order, driver, values, seq, feedback.length > 0 ? memory : null);
+	}
+	for (const node of feedback) {
+		const signals = node.kind === "BLOCK" ? BLOCK_PINS[node.chip].outputs.map((_, k) => signalOf(node.id, k)) : isGate(node.kind) ? [node.id] : [];
+		for (const s of signals) seq[LOOP_KEY + s] = {
+			state: {
+				prev: {},
+				bits: []
+			},
+			out: [result.nodes.get(s) ?? "X"]
+		};
 	}
 	return {
-		loop: null,
 		...result,
 		seq
 	};
 }
-/** 照拓撲順序算一次（時序方塊的輸出用 seq 裡目前的值）。 */
-function combinational(order, driver, values, seq) {
-	const nodes = /* @__PURE__ */ new Map();
+/**
+* 照順序算一次（時序方塊的輸出用 seq 裡目前的值）。子專案 59：memory 不是 null 時圖裡有迴授：
+* 從記住的值（沒有時是 0）開始，一輪一輪照順序重算到不再變（每輪用到的是最新的值）；算了 MAX_LOOP_PASSES 輪還在變的訊號當成 X（不穩定）。
+*/
+function combinational(order, driver, values, seq, memory) {
+	const nodes = new Map(memory ?? []);
+	const unstable = /* @__PURE__ */ new Set();
 	const displays = /* @__PURE__ */ new Map();
 	const dps = /* @__PURE__ */ new Map();
 	const segs = /* @__PURE__ */ new Map();
 	const inputOf = (node, pin) => {
 		const from = driver.get(`${node.id}#${pin}`);
-		return from === void 0 ? "X" : nodes.get(from) ?? "X";
+		return from === void 0 ? "X" : nodes.get(from) ?? (memory ? 0 : "X");
 	};
-	for (const node of order) if (node.kind === "INPUT" || node.kind === "CLOCK") nodes.set(node.id, values[node.id] ?? node.value ?? 0);
-	else if (node.kind === "HIGH") nodes.set(node.id, 1);
-	else if (node.kind === "LOW") nodes.set(node.id, 0);
-	else if (isSequentialNode(node)) seq[node.id].out.forEach((v, k) => nodes.set(signalOf(node.id, k), v));
-	else if (node.kind === "BLOCK" && node.chip) {
-		const ins = Array.from({ length: inputCountOf(node) }, (_, i) => inputOf(node, i));
-		blockOutputs(node.chip, ins).forEach((v, k) => nodes.set(signalOf(node.id, k), v));
-	} else if (node.kind === "OUTPUT") nodes.set(node.id, inputOf(node, 0));
-	else if (node.kind === "DISPLAY") {
-		const optional = (pin) => driver.has(`${node.id}#${pin}`) ? inputOf(node, pin) : 0;
-		if (node.segments) {
-			const bits = SEGMENT_NAMES.map((_, i) => optional(i));
-			segs.set(node.id, bits.includes("X") ? "X" : SEGMENT_NAMES.filter((_, i) => bits[i] === 1));
-		} else {
-			const bits = [
-				0,
-				1,
-				2,
-				3
-			].map((i) => inputOf(node, i));
-			displays.set(node.id, bits.includes("X") ? "X" : bits.reduce((sum, b, i) => sum + b * (1 << i), 0));
-			dps.set(node.id, optional(4));
+	const set = (signal, v) => nodes.set(signal, unstable.has(signal) ? "X" : v);
+	const pass = () => {
+		for (const node of order) if (node.kind === "INPUT" || node.kind === "CLOCK") nodes.set(node.id, values[node.id] ?? node.value ?? 0);
+		else if (node.kind === "HIGH") nodes.set(node.id, 1);
+		else if (node.kind === "LOW") nodes.set(node.id, 0);
+		else if (isSequentialNode(node)) seq[node.id].out.forEach((v, k) => nodes.set(signalOf(node.id, k), v));
+		else if (node.kind === "BLOCK" && node.chip) {
+			const ins = Array.from({ length: inputCountOf(node) }, (_, i) => inputOf(node, i));
+			blockOutputs(node.chip, ins).forEach((v, k) => set(signalOf(node.id, k), v));
+		} else if (node.kind === "OUTPUT") nodes.set(node.id, inputOf(node, 0));
+		else if (node.kind === "DISPLAY") {
+			const optional = (pin) => driver.has(`${node.id}#${pin}`) ? inputOf(node, pin) : 0;
+			if (node.segments) {
+				const bits = SEGMENT_NAMES.map((_, i) => optional(i));
+				segs.set(node.id, bits.includes("X") ? "X" : SEGMENT_NAMES.filter((_, i) => bits[i] === 1));
+			} else {
+				const bits = [
+					0,
+					1,
+					2,
+					3
+				].map((i) => inputOf(node, i));
+				displays.set(node.id, bits.includes("X") ? "X" : bits.reduce((sum, b, i) => sum + b * (1 << i), 0));
+				dps.set(node.id, optional(4));
+			}
+		} else if (isGate(node.kind)) {
+			const ins = Array.from({ length: inputCountOf(node) }, (_, i) => inputOf(node, i));
+			set(node.id, gateValue(node.kind, ins));
 		}
-	} else if (isGate(node.kind)) {
-		const ins = Array.from({ length: inputCountOf(node) }, (_, i) => inputOf(node, i));
-		nodes.set(node.id, gateValue(node.kind, ins));
+	};
+	pass();
+	if (memory) for (let round = 0; round < 2; round++) {
+		for (let k = 0; k < MAX_LOOP_PASSES; k++) {
+			const before = new Map(nodes);
+			pass();
+			const changed = [...nodes].filter(([s, v]) => before.get(s) !== v).map(([s]) => s);
+			if (changed.length === 0) break;
+			if (k === 63) for (const s of changed) unstable.add(s);
+		}
+		if (unstable.size === 0) break;
 	}
 	return {
 		nodes,
 		displays,
 		dps,
-		segs
+		segs,
+		unstable
 	};
 }
 var byName = (a, b) => (a.name ?? "") < (b.name ?? "") ? -1 : (a.name ?? "") > (b.name ?? "") ? 1 : 0;
@@ -30727,6 +30758,12 @@ function sortedIo(d) {
 		outputs: d.nodes.filter((n) => isSink(n.kind)).sort(byName)
 	};
 }
+/** 子專案 59：有迴授的電路，輸出跟之前的狀態有關的格子（例如閂鎖 S = R = 0 時）。 */
+var HOLD = "保持";
+/** 子專案 59：一直來回跳、停不下來的格子（例如 NOT 接回自己）。 */
+var UNSTABLE = "不穩定";
+/** 子專案 59：算真值表時最多記幾種迴授狀態。 */
+var MAX_MEMORY_STATES = 16;
 /** 7 段的名稱（每段直接控制的顯示器的輸入順序）。 */
 var SEGMENT_NAMES = [
 	"a",
@@ -30751,15 +30788,13 @@ function displayValue(node, v) {
 function segmentToken(lit) {
 	return SEGMENT_NAMES.slice(0, 7).filter((s) => lit.includes(s)).join("") + (lit.includes("dp") ? "." : "") || "-";
 }
-/** 規格第 3 節：輸入端依名稱排序，第一個是最高位元，從全 0 數到全 1。 */
+/**
+* 規格第 3 節：輸入端依名稱排序，第一個是最高位元，從全 0 數到全 1。
+* 子專案 59：有迴授時，每一列從每一種可能的狀態（上電狀態，以及任何一列留下的狀態）各算一次：
+* 都一樣就寫那個值，不一樣寫「保持」（跟之前的狀態有關），有一次停不下來就寫「不穩定」。
+*/
 function truthTable(d) {
 	const { inputs, outputs } = sortedIo(d);
-	const loop = topoOrder(d).loop;
-	if (loop) return {
-		ok: false,
-		reason: "loop",
-		loop
-	};
 	if (isSequential(d)) return {
 		ok: false,
 		reason: "sequential"
@@ -30768,25 +30803,57 @@ function truthTable(d) {
 		ok: false,
 		reason: "empty"
 	};
-	if (inputs.length > 8) return {
+	if (inputs.length > 12) return {
 		ok: false,
 		reason: "too-many"
 	};
-	const rows = [];
-	for (let r = 0; r < 1 << inputs.length; r++) {
-		const bits = inputs.map((_, i) => r >> inputs.length - 1 - i & 1);
-		const v = evaluate$1(d, Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]])));
-		rows.push({
-			in: bits,
-			out: outputs.map((o) => o.kind === "DISPLAY" ? displayValue(o, v) : v.nodes.get(o.id) ?? "X")
-		});
-	}
-	return {
+	const rowBits = Array.from({ length: 1 << inputs.length }, (_, r) => inputs.map((_, i) => r >> inputs.length - 1 - i & 1));
+	const valuesOf = (bits) => Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]]));
+	const read = (v) => outputs.map((o) => o.kind === "DISPLAY" ? displayValue(o, v) : v.nodes.get(o.id) ?? "X");
+	const head = {
 		ok: true,
 		inputs: inputs.map((n) => n.name ?? n.id),
-		outputs: outputs.map((n) => n.name ?? n.id),
-		rows
+		outputs: outputs.map((n) => n.name ?? n.id)
 	};
+	if (!topoOrder(d).loop) return {
+		...head,
+		rows: rowBits.map((bits) => ({
+			in: bits,
+			out: read(evaluate$1(d, valuesOf(bits)))
+		}))
+	};
+	const starts = [{}];
+	const seen = /* @__PURE__ */ new Set([memoryKey({})]);
+	const results = rowBits.map(() => []);
+	for (let s = 0; s < starts.length; s++) rowBits.forEach((bits, r) => {
+		const v = evaluate$1(d, valuesOf(bits), starts[s]);
+		results[r].push({
+			out: read(v),
+			unstable: v.unstable.size > 0
+		});
+		const key = memoryKey(v.seq);
+		if (!seen.has(key) && starts.length < MAX_MEMORY_STATES) {
+			seen.add(key);
+			starts.push(v.seq);
+		}
+	});
+	const rows = rowBits.map((bits, r) => ({
+		in: bits,
+		out: outputs.map((_, k) => {
+			const cells = results[r];
+			if (cells.some((c) => c.unstable && c.out[k] === "X")) return UNSTABLE;
+			return cells.every((c) => c.out[k] === cells[0].out[k]) ? cells[0].out[k] : HOLD;
+		})
+	}));
+	return {
+		...head,
+		rows,
+		feedback: true
+	};
+}
+/** 迴授記住的值寫成一個字串（比較是不是同一種狀態）。 */
+function memoryKey(seq) {
+	return Object.keys(seq).filter((k) => k.startsWith(LOOP_KEY)).sort().map((k) => `${k}=${seq[k].out[0]}`).join(",");
 }
 /**
 * 子專案 46（規格 2026-10-24 sequential-logic 第 4 節）：從重設（全部 0）開始，其他輸入用 values（沒給時用開關目前的值），
@@ -30794,12 +30861,6 @@ function truthTable(d) {
 */
 function sequenceTable(d, pulses = 16, values = {}) {
 	const clock = d.nodes.find((n) => n.kind === "CLOCK");
-	const loop = topoOrder(d).loop;
-	if (loop) return {
-		ok: false,
-		reason: "loop",
-		loop
-	};
 	if (!clock) return {
 		ok: false,
 		reason: "no-clock"
@@ -31064,7 +31125,7 @@ function compareDiagramToTask(d, task) {
 	const loop = topoOrder(d).loop;
 	if (loop) return {
 		kind: "issues",
-		issues: [`邏輯圖有迴圈（${loop.join("、")}），不能和題目比對`]
+		issues: [`邏輯圖有迴授（${loop.join("、")}），輸出跟之前的狀態有關，不能和真值表題目比對`]
 	};
 	if (isSequential(d)) return {
 		kind: "issues",
@@ -31118,7 +31179,7 @@ function taskFromDiagram(d) {
 	const table = truthTable(d);
 	if (!table.ok) return {
 		ok: false,
-		reason: table.reason === "sequential" ? "時序電路（有正反器、計數器或時脈）沒有真值表，不能建立題目" : table.reason === "loop" ? `邏輯圖有迴圈（${(table.loop ?? []).join("、")}），不能算真值表` : table.reason === "too-many" ? `輸入最多 6 個（64 列）` : "先在邏輯圖放輸入端和輸出端"
+		reason: table.reason === "sequential" ? "時序電路（有正反器、計數器或時脈）沒有真值表，不能建立題目" : table.reason === "too-many" ? `輸入最多 6 個（64 列）` : "先在邏輯圖放輸入端和輸出端"
 	};
 	const sinks = sortedIo(d).outputs;
 	const segments = sinks.find((o) => o.kind === "DISPLAY" && o.segments);
@@ -32193,11 +32254,6 @@ var text = (b) => b === 0 || b === 1 ? String(b) : "?";
 */
 function compareDiagramToStateTask(d, task) {
 	if (d.nodes.length === 0) return { kind: "none" };
-	const loop = topoOrder(d).loop;
-	if (loop) return {
-		kind: "issues",
-		issues: [`邏輯圖有迴圈（${loop.join("、")}），不能和狀態表比對`]
-	};
 	const bits = stateBitNames(task.states);
 	const inputs = new Map(d.nodes.filter((n) => n.kind === "INPUT").map((n) => [n.name ?? n.id, n.id]));
 	const outputs = new Map(d.nodes.filter((n) => n.kind === "OUTPUT").map((n) => [n.name ?? n.id, n.id]));
@@ -34334,16 +34390,9 @@ function nodeLabel(node) {
 	if (node.kind === "CLOCK") return `時脈 ${node.name}`;
 	return `${node.id}（${node.kind}）`;
 }
-/** 規格第 4 節。順序：迴圈、缺輸入 / 輸出端、每個節點（依圖上的順序）的開路與沒用到。 */
+/** 規格第 4 節。順序：缺輸入 / 輸出端、每個節點（依圖上的順序）的開路與沒用到。子專案 59 起閘接回前面的迴授（閂鎖）不算錯。 */
 function checkDiagram(d) {
 	const issues = [];
-	const loop = topoOrder(d).loop;
-	if (loop) issues.push({
-		code: "LOGIC_LOOP",
-		severity: "error",
-		message: `${loop.join("、")} 形成迴圈：閘的輸出不能再接回前面（要經過正反器或計數器才可以）`,
-		nodeIds: loop
-	});
 	if (d.nodes.some((n) => isGate(n.kind))) {
 		if (!d.nodes.some((n) => n.kind === "INPUT")) issues.push({
 			code: "LOGIC_NO_IO",
@@ -34455,7 +34504,6 @@ function displayResistorsOf(d, chosen) {
 /** 規格第 6 節：不能轉的原因；可以轉時回傳 null。 */
 function convertProblem(d, options = {}) {
 	const issues = checkDiagram(d);
-	if (issues.some((i) => i.code === "LOGIC_LOOP")) return "邏輯圖有迴圈，不能轉成麵包板";
 	const { inputs, outputs } = sortedIo(d);
 	if (inputs.length === 0 && !d.nodes.some((n) => n.kind === "CLOCK") || outputs.length === 0) return "邏輯圖要有輸入端和輸出端才能轉";
 	const displayCount = d.nodes.filter((n) => n.kind === "DISPLAY").length;
@@ -34463,7 +34511,7 @@ function convertProblem(d, options = {}) {
 	const resistors = displayResistorsOf(d, options.displayResistors);
 	if (displayCount > 2 && resistors === "each") return `每段一顆電阻時 7 段顯示器最多 2 個；3 個請選「共用一顆電阻」`;
 	if (options.board !== void 0 && options.board !== "auto" && displaysNeedTwoBoards(displayCount, resistors)) return `${displayCount} 個 7 段顯示器${resistors === "each" ? "（每段一顆電阻）" : ""}要用兩塊 EIC-1106，請把麵包板選「自動」`;
-	if (inputs.length > 8) return `輸入端最多 8 個（指撥開關最多 8 位元）`;
+	if (inputs.length > 12) return `輸入端最多 12 個（真值表 4096 列）`;
 	if (issues.some((i) => i.code === "LOGIC_INPUT_OPEN" || i.code === "LOGIC_OUTPUT_OPEN")) return "還有沒接好的腳（到「檢查」分頁看是哪些），請先接好";
 	return null;
 }
@@ -34895,6 +34943,10 @@ function simplify(input, keep) {
 //#region src/logic/toBreadboard.ts
 /** 子專案 38：零件清單裡開關那一項（「8 位元指撥開關 × 1」「4 位元指撥開關 × 2」「按鈕 × 3」）。 */
 function switchText(bom) {
+	if (bom.switchList) {
+		const count = (def) => bom.switchList.filter((s) => s === def).length;
+		return ["dipsw-8", "dipsw-4"].filter((def) => count(def) > 0).map((def) => `${def === "dipsw-4" ? "4" : "8"} 位元指撥開關 × ${count(def)}`).join("、");
+	}
 	return bom.switch ? `${bom.switch === "dipsw-4" ? "4" : "8"} 位元指撥開關 × ${bom.switches}` : `按鈕 × ${bom.buttons}`;
 }
 /** 子專案 48：零件清單裡板子那一項（「MB-102」「EIC-1106」「EIC-1106 × 2（左右貼在一起）」）。 */
@@ -35134,12 +35186,14 @@ function build(d, options, layout, variant) {
 	};
 	const pullDown = options.switchTo === "vcc";
 	const uprightPulls = options.pulls === true && options.inputs !== "button";
-	const splitSwitches = inputs.length > 4 && (variant.splitSwitches === true || two && variant.displayBoards === true || uprightPulls && inputs.length >= 6);
-	const flatPull = uprightPulls && inputs.length >= 6 && !splitSwitches ? 5 : -1;
+	const many = inputs.length > 8;
+	const splitSwitches = !many && inputs.length > 4 && (variant.splitSwitches === true || two && variant.displayBoards === true || uprightPulls && inputs.length >= 6);
 	/** 每個開關接的輸入（依名稱排序）；拆開時依「哪顆 IC 先用到」分組（子專案 45），開關比較靠近用到它的 IC。 */
-	const switches = splitSwitches ? splitByIc(inputs, icOrderOf(d, plans, chips)) : [inputs];
-	const swDef = splitSwitches || inputs.length <= 4 ? "dipsw-4" : "dipsw-8";
-	const swPins = swDef === "dipsw-4" ? 8 : 16;
+	const switches = many ? Array.from({ length: Math.ceil(inputs.length / 8) }, (_, s) => inputs.slice(s * 8, s * 8 + 8)) : splitSwitches ? splitByIc(inputs, icOrderOf(d, plans, chips)) : [inputs];
+	/** 用平放電阻的輸入（第幾個）：6 個以上接在同一個開關時，第 6 個那一欄電源軌沒有孔。 */
+	const flatPulls = new Set(uprightPulls ? switches.filter((group) => group.length >= 6 && !splitSwitches).map((group) => inputs.indexOf(group[5])) : []);
+	const defOf = (group) => many ? group.length <= 4 ? "dipsw-4" : "dipsw-8" : splitSwitches || inputs.length <= 4 ? "dipsw-4" : "dipsw-8";
+	const swDef = defOf(switches[0]);
 	const switchBlocks = [];
 	const pullRail = pullDown ? !eic ? "B-" : inOneRow ? "P4-" : "P3-" : !eic ? "T+" : inOneRow ? "P3+" : "P2+";
 	const pullRow = pullDown ? "J" : "A";
@@ -35167,11 +35221,13 @@ function build(d, options, layout, variant) {
 	});
 	else switches.forEach((group, s) => {
 		const id = `SW${s + 1}`;
+		const def = defOf(group);
+		const swPins = def === "dipsw-4" ? 8 : 16;
 		switchBlocks.push({
 			width: swPins / 2,
-			align: uprightPulls ? (x) => group.every((node, j) => inputs.indexOf(node) === flatPull !== railHole(pullRail, x + j)) : void 0,
+			align: uprightPulls ? (x) => group.every((node, j) => flatPulls.has(inputs.indexOf(node)) !== railHole(pullRail, x + j)) : void 0,
 			place: (x) => {
-				components.push(comp(id, swDef, hole(`F${x}`, 1), {
+				components.push(comp(id, def, hole(`F${x}`, 1), {
 					board: boardNow,
 					props: {
 						switchStates: Array(swPins / 2).fill(false),
@@ -35181,7 +35237,7 @@ function build(d, options, layout, variant) {
 				if (!uprightPulls) return;
 				group.forEach((node, j) => {
 					const k = inputs.indexOf(node);
-					if (k === flatPull || !railHole(pullRail, x + j)) return;
+					if (flatPulls.has(k) || !railHole(pullRail, x + j)) return;
 					const rid = `R${k + 1}`;
 					const at = hole(`${pullRow}${x + j}`, 1);
 					const span = Math.abs(holeOn(boardNow, `${pullRail}${x + j}`, layout).y - at.y);
@@ -35287,7 +35343,7 @@ function build(d, options, layout, variant) {
 	const twoLeads = [];
 	let r = 0;
 	if (options.pulls) inputs.forEach((node, k) => {
-		if (uprightPulls && k !== flatPull) return;
+		if (uprightPulls && !flatPulls.has(k)) return;
 		twoLeads.push({
 			id: `R${k + 1}`,
 			defId: "resistor",
@@ -35632,6 +35688,7 @@ function build(d, options, layout, variant) {
 			boards: two ? 2 : 1,
 			switch: useButtons ? null : swDef,
 			switches: useButtons ? 0 : switches.length,
+			...many && !useButtons ? { switchList: switches.map(defOf) } : {},
 			buttons: useButtons ? inputs.length : 0,
 			resistors: components.filter((c) => c.defId === "resistor").length,
 			leds: outputs.length,
@@ -35988,13 +36045,15 @@ function verifyRows(d, circuit, bindings) {
 		rows: 0,
 		mismatches: []
 	};
-	return verifyExpected(circuit, bindings, sortedIo(d).outputs.map((o) => ({
+	const outputs = sortedIo(d).outputs.map((o) => ({
 		id: o.id,
 		display: o.kind === "DISPLAY",
 		segments: !!o.segments
-	})), table.rows.map((row) => ({
+	}));
+	const cell = (b) => b === "X" ? "?" : b === "保持" || b === "不穩定" ? "X" : String(b);
+	return verifyExpected(circuit, bindings, outputs, table.rows.map((row) => ({
 		in: row.in,
-		out: row.out.map((b) => b === "X" ? "?" : String(b))
+		out: row.out.map(cell)
 	})));
 }
 /** 子專案 37：陽極直接接在 +5 V 的 LED 是低態致動（陰極經過電阻接到輸出，訊號 0 時亮）。 */
@@ -36490,7 +36549,7 @@ function diagramFormulas(d) {
 		name: n.name ?? n.id
 	});
 	if (topoOrder(d).loop) {
-		const problem = "邏輯圖有迴圈，寫不出布林式";
+		const problem = "有迴授（閘接回前面），輸出跟之前的狀態有關，寫不出布林式（看真值表）";
 		return {
 			outputs: outputs.map((n) => ({
 				...base(n),
@@ -36523,7 +36582,7 @@ function diagramFormulas(d) {
 				f.readProblem = `經過 IC 方塊 ${err.message}，照圖寫不出布林式`;
 			}
 			if (!table.ok) {
-				f.simplifiedProblem = table.reason === "too-many" ? "輸入超過 8 個，真值表太長，不化簡" : table.reason === "sequential" ? "時序電路不化簡（看時序表）" : "算不出真值表";
+				f.simplifiedProblem = table.reason === "too-many" ? `輸入超過 12 個，真值表太長，不化簡` : table.reason === "sequential" ? "時序電路不化簡（看時序表）" : "算不出真值表";
 				return f;
 			}
 			const k = sinks.indexOf(n);
@@ -36988,12 +37047,12 @@ function logicTruthTable(f, args = {}) {
 	if (isSequential(f.logic)) return sequenceReply(f.logic, args.pulses ?? 16);
 	const t = truthTable(f.logic);
 	if (!t.ok) {
-		if (t.reason === "loop") return { text: `邏輯圖有迴圈（${(t.loop ?? []).join("、")}），算不出真值表。` };
-		if (t.reason === "too-many") return { text: "輸入超過 8 個，真值表太長，不列出。" };
+		if (t.reason === "too-many") return { text: `輸入超過 12 個，真值表太長，不列出。` };
 		return { text: "邏輯圖沒有輸入端和輸出端。" };
 	}
 	const cell = (v) => v === "X" ? "?" : String(v);
 	const lines = [`${t.inputs.join(" ")} | ${t.outputs.join(" ")}`, ...t.rows.map((r) => `${r.in.join(" ")} | ${r.out.map(cell).join(" ")}`)];
+	if (t.feedback) lines.push("", "有迴授（閘接回前面）：「保持」是輸出跟之前的狀態有關（維持原來的值），「不穩定」是一直來回跳、停不下來。");
 	const formulas = diagramFormulas(f.logic).outputs;
 	if (formulas.length > 0) {
 		lines.push("", "布林式：");
@@ -37010,7 +37069,6 @@ function logicTruthTable(f, args = {}) {
 function sequenceReply(d, pulses) {
 	const t = sequenceTable(d, Math.max(1, Math.min(64, Math.floor(pulses))));
 	if (!t.ok) {
-		if (t.reason === "loop") return { text: `邏輯圖有迴圈（${(t.loop ?? []).join("、")}）：閘的輸出不能再接回前面（要經過正反器或計數器）。` };
 		if (t.reason === "no-clock") return { text: "這是時序電路（有正反器或計數器），但沒有時脈：加一個 kind 為 CLOCK 的節點，接到 CLK 腳。" };
 		return { text: "邏輯圖沒有輸出端或 7 段顯示器。" };
 	}
@@ -37905,7 +37963,7 @@ function folderFromArgs(argv, cwd) {
 * 工具的邏輯在 src/mcp/（純函式）；這裡只負責路徑檢查、讀檔、寫檔。
 */
 /** 版本號：打包時換成建置的日期（vite.mcp.config.ts），原始碼版是 1.0.0。 */
-var VERSION = "2026.11.3";
+var VERSION = "2026.11.10";
 if (process.argv.includes("--version")) {
 	console.log(VERSION);
 	process.exit(0);
@@ -38113,7 +38171,8 @@ server.registerTool("logic_set", {
 		"寫入（取代）電路檔裡的邏輯圖。節點種類：AND、OR、NAND、NOR（inputs 2–4）、NOT、XOR、INPUT、OUTPUT（要有 name；activeLow: true 是低態致動，0 時亮，轉成麵包板時 LED 正極接 +5 V、負極經過電阻接到輸出）、DISPLAY（7 段顯示器，name）、",
 		"HIGH（5V）、LOW（GND）、BLOCK（chip：74LS83、74LS151、74LS153、74LS138、74LS85；時序 IC：74LS74 雙 D 正反器、74LS76 雙 JK 正反器、74LS90、74LS93、74LS161、74LS193 計數器；單顆正反器 DFF（D、CLK、/PRE、/CLR → Q、/Q）、JKFF（J、CLK、K、/PRE、/CLR → Q、/Q），轉成麵包板時兩顆合用一片 74LS74 / 74LS76；輸入可以不接：清除 / 預設 / 載入不用、資料 0、時脈 1）、",
 		"CLOCK（時脈，name，一張圖最多一個；接到正反器、計數器的 CLK）。腳的順序用 BLOCK 的腳名（和 74LS 資料表一樣），fromPin 是第幾個輸出。",
-		"線：{ id, from, fromPin?（方塊的第幾個輸出）, to: { node, pin } }。節點沒有 x、y 時自動排版。"
+		"線：{ id, from, fromPin?（方塊的第幾個輸出）, to: { node, pin } }。節點沒有 x、y 時自動排版。",
+		"閘的輸出可以接回前面（迴授，例如 NAND 交叉接成的 SR 閂鎖）。輸入端最多 12 個；名稱英文字母開頭、最多 8 個英數字（Q̄ 寫成 QBAR、清除寫成 CLR）。"
 	].join(""),
 	inputSchema: {
 		file,
@@ -38125,7 +38184,7 @@ server.registerTool("logic_set", {
 }, async ({ file: f, diagram }) => withFile(f, (lab) => logicSet(lab, { diagram })));
 server.registerTool("logic_truth_table", {
 	title: "真值表",
-	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元）、每個輸出的布林式（照圖寫出來與化簡後）與檢查結果。時序電路（有正反器、計數器或時脈）回傳時序表：從重設開始每次脈衝之後的輸出，再加一段文字波形（每格一個字元，‾ 是 1、_ 是 0）。",
+	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元，最多 12 個輸入）、每個輸出的布林式（照圖寫出來與化簡後）與檢查結果。有迴授（閂鎖）時，輸出跟之前的狀態有關的格子寫「保持」，一直來回跳的寫「不穩定」。時序電路（有正反器、計數器或時脈）回傳時序表：從重設開始每次脈衝之後的輸出，再加一段文字波形（每格一個字元，‾ 是 1、_ 是 0）。",
 	inputSchema: {
 		file,
 		pulses: number().int().min(1).max(64).optional().describe("時序表列到第幾次脈衝（預設 16）")
@@ -38133,7 +38192,7 @@ server.registerTool("logic_truth_table", {
 }, async (args) => withFile(args.file, (lab) => logicTruthTable(lab, { pulses: args.pulses })));
 server.registerTool("logic_to_breadboard", {
 	title: "邏輯圖轉成麵包板",
-	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。一般最多 40 秒；用到兩塊 EIC-1106 的大電路最多 90 秒（可以用 seconds 調整）；有 progressToken 時每一批佈線回報一次進度。接不完時不寫入檔案，回覆照這次的設定建議下一步。",
+	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表（「保持」「不穩定」的格子不比）；輸入最多 12 個，超過 8 個時照名稱順序每 8 個一個指撥開關；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。一般最多 40 秒；用到兩塊 EIC-1106 的大電路最多 90 秒（可以用 seconds 調整）；有 progressToken 時每一批佈線回報一次進度。接不完時不寫入檔案，回覆照這次的設定建議下一步。",
 	inputSchema: {
 		file,
 		switch_to: _enum(["vcc", "gnd"]).optional().describe("開關另一端接 +5 V（ON = 1，預設）或 GND（ON = 0）"),
