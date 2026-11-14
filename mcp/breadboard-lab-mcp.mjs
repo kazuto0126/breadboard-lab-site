@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.10（commit e82f1c1）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.14（commit 515501b）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -22428,7 +22428,7 @@ var RAW_DEFINITIONS = [
 			"type": "two-lead",
 			"defaultSpan": 1,
 			"minSpan": 1,
-			"blocksBetween": false
+			"blocksBetween": true
 		},
 		pins: [{
 			"number": 1,
@@ -30631,6 +30631,16 @@ var MAX_SETTLE = 32;
 * 下次求值時從記住的值開始算（閂鎖會「保持」）；沒記過的從 0 開始（上電狀態）。
 */
 var LOOP_KEY = "loop:";
+/** 子專案 60：迴授上還沒記過的值從幾開始（上電狀態，記在 LOOP_KEY + POWER_ON；沒有時是 0）。 */
+var POWER_ON = "*";
+/** 子專案 60：上電時迴授上的值都是 seed（比對時用 0 與 1 各算一次，找出跟上電狀態有關的格子）。 */
+var powerOnState = (seed) => ({ ["loop:*"]: {
+	state: {
+		prev: {},
+		bits: []
+	},
+	out: [seed]
+} });
 /** 迴授最多來回算幾輪；還在變就判定不穩定（一直來回跳，例如 NOT 接回自己），那些訊號當成 X。 */
 var MAX_LOOP_PASSES = 64;
 /**
@@ -30700,7 +30710,7 @@ function combinational(order, driver, values, seq, memory) {
 	const segs = /* @__PURE__ */ new Map();
 	const inputOf = (node, pin) => {
 		const from = driver.get(`${node.id}#${pin}`);
-		return from === void 0 ? "X" : nodes.get(from) ?? (memory ? 0 : "X");
+		return from === void 0 ? "X" : nodes.get(from) ?? (memory ? memory.get(POWER_ON) ?? 0 : "X");
 	};
 	const set = (signal, v) => nodes.set(signal, unstable.has(signal) ? "X" : v);
 	const pass = () => {
@@ -30859,7 +30869,8 @@ function memoryKey(seq) {
 * 子專案 46（規格 2026-10-24 sequential-logic 第 4 節）：從重設（全部 0）開始，其他輸入用 values（沒給時用開關目前的值），
 * 送 pulses 個脈衝（0 → 1 → 0），列出每次之後每個輸出端、顯示器的值。
 */
-function sequenceTable(d, pulses = 16, values = {}) {
+/** 子專案 60：seed 是迴授（閂鎖）上電時的值（預設 0）。 */
+function sequenceTable(d, pulses = 16, values = {}, seed = 0) {
 	const clock = d.nodes.find((n) => n.kind === "CLOCK");
 	if (!clock) return {
 		ok: false,
@@ -30874,7 +30885,7 @@ function sequenceTable(d, pulses = 16, values = {}) {
 	let v = evaluate$1(d, {
 		...values,
 		[clock.id]: 0
-	});
+	}, seed === 0 ? void 0 : powerOnState(seed));
 	const rows = [{
 		pulse: 0,
 		out: read(v)
@@ -35120,9 +35131,75 @@ function splitByIc(inputs, order) {
 	const byName = (list) => [...list].sort((a, b) => inputs.indexOf(a) - inputs.indexOf(b));
 	return [byName(sorted.slice(0, 4)), byName(sorted.slice(4))];
 }
+/**
+* 子專案 60（指南 3.2）：互相沒有訊號相連的子電路。共用的時脈、5V、GND 不算相連；閘放在同一顆 IC 裡算相連。
+* 回傳每個輸入端、輸出端、IC（id）屬於第幾個子電路：依第一個輸入的名稱順序，沒有輸入的排在後面；
+* 沒有接到任何 IC 或輸出端的輸入算在第 1 個。
+*/
+function independentParts(inputs, outputs, plans, chips, driver) {
+	const parent = /* @__PURE__ */ new Map();
+	const find = (x) => {
+		if (!parent.has(x)) parent.set(x, x);
+		const p = parent.get(x);
+		if (p === x) return x;
+		const root = find(p);
+		parent.set(x, root);
+		return root;
+	};
+	const union = (a, b) => parent.set(find(a), find(b));
+	/** 訊號 → 產生它的東西（輸入端或 IC）；時脈、5V、GND 沒有。 */
+	const owner = /* @__PURE__ */ new Map();
+	for (const n of inputs) owner.set(n.id, n.id);
+	for (const plan of plans) for (const unit of plan.slots) if (unit) owner.set(unit.output, plan.id);
+	for (const { node, ic } of chips) BLOCK_PINS[node.chip].outputs.forEach((_, k) => owner.set(signalOf(node.id, k), ic));
+	const link = (item, signal) => {
+		find(item);
+		const from = signal === void 0 ? void 0 : owner.get(signal);
+		if (from !== void 0) union(item, from);
+	};
+	for (const plan of plans) for (const unit of plan.slots) for (const s of unit?.inputs ?? []) link(plan.id, s);
+	for (const { node, ic } of chips) BLOCK_PINS[node.chip].inputs.forEach((_, i) => link(ic, driver.get(`${node.id}#${i}`)));
+	for (const n of outputs) link(n.id, driver.get(`${n.id}#0`));
+	for (const n of inputs) find(n.id);
+	const real = new Set([
+		...plans.map((p) => p.id),
+		...chips.map((c) => c.ic),
+		...outputs.map((n) => n.id)
+	].map(find));
+	const index = /* @__PURE__ */ new Map();
+	const of = /* @__PURE__ */ new Map();
+	for (const id of [
+		...inputs.map((n) => n.id),
+		...plans.map((p) => p.id),
+		...chips.map((c) => c.ic),
+		...outputs.map((n) => n.id)
+	]) {
+		const root = find(id);
+		if (real.has(root) && !index.has(root)) index.set(root, index.size);
+	}
+	for (const id of parent.keys()) of.set(id, index.get(find(id)) ?? 0);
+	return {
+		of,
+		count: Math.max(1, index.size)
+	};
+}
+/** 子專案 60：這張圖有兩個以上互相獨立的子電路、可以用分組的擺法（沒有 7 段顯示器、有輸入端）。 */
+function hasParts(d, options) {
+	const { inputs, outputs: sinks } = sortedIo(d);
+	if (inputs.length === 0 || sinks.some((n) => n.kind === "DISPLAY")) return false;
+	const plans = assignIcs(unitsFor(d, options));
+	return independentParts(inputs, sinks, plans, d.nodes.filter((n) => n.kind === "BLOCK" && n.chip).map((node, k) => ({
+		node,
+		ic: `U${plans.length + k + 1}`
+	})), drivers(d)).count >= 2;
+}
 /** 規格（2026-10-13 logic-to-breadboard）第 4、5 節。 */
 function toBreadboard(diagram, options, variant = DEFAULT_LAYOUT) {
 	const d = packFlipFlops(diagram);
+	if (variant.parts && !hasParts(d, options)) return {
+		ok: false,
+		reason: ""
+	};
 	const problem = convertProblem(d, variant.boards === 2 ? {
 		...options,
 		board: "auto"
@@ -35160,13 +35237,19 @@ function build(d, options, layout, variant) {
 	const two = eic && !inOneRow && variant.boards === 2;
 	/** 子專案 48：正在放哪一塊板（兩塊板時由下面的排列決定）。 */
 	let boardNow = BOARD_ID;
-	const hole = (name, area) => holeOn(boardNow, eic ? `${inOneRow ? 2 : area}-${name}` : name, layout);
+	const hole = (name, area) => holeOn(boardNow, eic ? `${grouped ? area : inOneRow ? 2 : area}-${name}` : name, layout);
 	const { inputs, outputs: sinks } = sortedIo(d);
 	const outputs = sinks.filter((n) => n.kind === "OUTPUT");
 	const displays = sinks.filter((n) => n.kind === "DISPLAY");
 	const driver = drivers(d);
 	const plans = assignIcs(unitsFor(d, options));
 	const chips = d.nodes.filter((n) => n.kind === "BLOCK" && n.chip);
+	const parts = independentParts(inputs, outputs, plans, chips.map((node, k) => ({
+		node,
+		ic: `U${plans.length + k + 1}`
+	})), driver);
+	const grouped = variant.parts === true && parts.count >= 2 && inputs.length > 0 && displays.length === 0 && !two;
+	const partOf = (id) => grouped ? parts.of.get(id) ?? 0 : 0;
 	const components = [];
 	const netOf = {};
 	const tie = (pin, net) => netOf[pin] = net;
@@ -35187,21 +35270,39 @@ function build(d, options, layout, variant) {
 	const pullDown = options.switchTo === "vcc";
 	const uprightPulls = options.pulls === true && options.inputs !== "button";
 	const many = inputs.length > 8;
-	const splitSwitches = !many && inputs.length > 4 && (variant.splitSwitches === true || two && variant.displayBoards === true || uprightPulls && inputs.length >= 6);
+	const splitSwitches = !grouped && !many && inputs.length > 4 && (variant.splitSwitches === true || two && variant.displayBoards === true || uprightPulls && inputs.length >= 6);
 	/** 每個開關接的輸入（依名稱排序）；拆開時依「哪顆 IC 先用到」分組（子專案 45），開關比較靠近用到它的 IC。 */
-	const switches = many ? Array.from({ length: Math.ceil(inputs.length / 8) }, (_, s) => inputs.slice(s * 8, s * 8 + 8)) : splitSwitches ? splitByIc(inputs, icOrderOf(d, plans, chips)) : [inputs];
+	const chunks8 = (list) => Array.from({ length: Math.ceil(list.length / 8) }, (_, s) => list.slice(s * 8, s * 8 + 8));
+	const switches = grouped ? Array.from({ length: parts.count }, (_, p) => chunks8(inputs.filter((n) => partOf(n.id) === p))).flat() : many ? chunks8(inputs) : splitSwitches ? splitByIc(inputs, icOrderOf(d, plans, chips)) : [inputs];
+	/** 開關不只一種（8 位元與 4 位元混用）：超過 8 個輸入或分組。 */
+	const listed = many || grouped;
 	/** 用平放電阻的輸入（第幾個）：6 個以上接在同一個開關時，第 6 個那一欄電源軌沒有孔。 */
 	const flatPulls = new Set(uprightPulls ? switches.filter((group) => group.length >= 6 && !splitSwitches).map((group) => inputs.indexOf(group[5])) : []);
-	const defOf = (group) => many ? group.length <= 4 ? "dipsw-4" : "dipsw-8" : splitSwitches || inputs.length <= 4 ? "dipsw-4" : "dipsw-8";
+	const defOf = (group) => listed ? group.length <= 4 ? "dipsw-4" : "dipsw-8" : splitSwitches || inputs.length <= 4 ? "dipsw-4" : "dipsw-8";
 	const swDef = defOf(switches[0]);
 	const switchBlocks = [];
 	const pullRail = pullDown ? !eic ? "B-" : inOneRow ? "P4-" : "P3-" : !eic ? "T+" : inOneRow ? "P3+" : "P2+";
 	const pullRow = pullDown ? "J" : "A";
+	/** 這一區上方的 + 軌與下方的兩條軌（子專案 60：分組時每一組在自己的那一區；欄位每條軌都一樣）。 */
+	const railsOf = (area) => {
+		if (!eic) return {
+			plusTop: "T+",
+			minusBottom: "B-",
+			plusBottom: "B+"
+		};
+		const a = grouped ? area ?? 1 : inOneRow ? 2 : area ?? 1;
+		return {
+			plusTop: `P${a + 1}+`,
+			minusBottom: `P${a + 2}-`,
+			plusBottom: `P${a + 2}+`
+		};
+	};
 	const clockNode = d.nodes.find((n) => n.kind === "CLOCK");
 	if (clockNode) {
 		blocks[1].push({
 			width: 2,
-			place: (x) => components.push(comp("CLK1", "clock", hole(`C${x}`, 1), { board: boardNow }))
+			rank: 0,
+			place: (x, area) => components.push(comp("CLK1", "clock", hole(`C${x}`, area), { board: boardNow }))
 		});
 		tie("CLK1#1", clockNode.id);
 	}
@@ -35211,7 +35312,9 @@ function build(d, options, layout, variant) {
 		const id = buttonIds[k];
 		blocks[1].push({
 			width: 3,
-			place: (x) => components.push(comp(id, "pushbutton", hole(`F${x}`, 1), {
+			part: partOf(node.id),
+			rank: 1,
+			place: (x, area) => components.push(comp(id, "pushbutton", hole(`F${x}`, area), {
 				board: boardNow,
 				props: { labels: [node.name ?? ""] }
 			}))
@@ -35225,9 +35328,11 @@ function build(d, options, layout, variant) {
 		const swPins = def === "dipsw-4" ? 8 : 16;
 		switchBlocks.push({
 			width: swPins / 2,
+			part: partOf(group[0]?.id ?? ""),
+			rank: 1,
 			align: uprightPulls ? (x) => group.every((node, j) => flatPulls.has(inputs.indexOf(node)) !== railHole(pullRail, x + j)) : void 0,
-			place: (x) => {
-				components.push(comp(id, def, hole(`F${x}`, 1), {
+			place: (x, area) => {
+				components.push(comp(id, def, hole(`F${x}`, area), {
 					board: boardNow,
 					props: {
 						switchStates: Array(swPins / 2).fill(false),
@@ -35239,8 +35344,8 @@ function build(d, options, layout, variant) {
 					const k = inputs.indexOf(node);
 					if (flatPulls.has(k) || !railHole(pullRail, x + j)) return;
 					const rid = `R${k + 1}`;
-					const at = hole(`${pullRow}${x + j}`, 1);
-					const span = Math.abs(holeOn(boardNow, `${pullRail}${x + j}`, layout).y - at.y);
+					const at = hole(`${pullRow}${x + j}`, area);
+					const span = Math.abs(holeOn(boardNow, `${pullDown ? railsOf(area).minusBottom : railsOf(area).plusTop}${x + j}`, layout).y - at.y);
 					components.push(comp(rid, "resistor", at, {
 						board: boardNow,
 						rotation: pullDown ? 90 : 270,
@@ -35270,6 +35375,8 @@ function build(d, options, layout, variant) {
 		icBlocks.push({
 			ic: plan.id,
 			width: 7,
+			part: partOf(plan.id),
+			rank: 3,
 			place: (x, area) => components.push(comp(plan.id, plan.defId, hole(`F${x}`, area), { board: boardNow }))
 		});
 		const def = getComponentDefinition(plan.defId);
@@ -35291,6 +35398,8 @@ function build(d, options, layout, variant) {
 		icBlocks.push({
 			ic,
 			width: def.pins.length / 2,
+			part: partOf(ic),
+			rank: 3,
 			place: (x, area) => components.push(comp(ic, chip, hole(`F${x}`, area), { board: boardNow }))
 		});
 		const numberOf = (name) => def.pins.find((p) => p.name === name).number;
@@ -35351,7 +35460,8 @@ function build(d, options, layout, variant) {
 			span: RESISTOR_SPAN,
 			nets: [node.id, pullDown ? GND : VCC],
 			area: 1,
-			group: "in"
+			group: "in",
+			part: partOf(node.id)
 		});
 	});
 	if (options.pulls) r = inputs.length;
@@ -35367,7 +35477,8 @@ function build(d, options, layout, variant) {
 			span: RESISTOR_SPAN,
 			nets: [source, mid],
 			area: 3,
-			group: "led"
+			group: "led",
+			part: partOf(node.id)
 		});
 		twoLeads.push({
 			id: `D${k + 1}`,
@@ -35380,6 +35491,7 @@ function build(d, options, layout, variant) {
 			nets: low ? [VCC, mid] : [mid, GND],
 			area: 3,
 			group: "led",
+			part: partOf(node.id),
 			...low ? { reversed: true } : {}
 		});
 		leds[node.id] = `D${k + 1}`;
@@ -35443,72 +35555,121 @@ function build(d, options, layout, variant) {
 		tie(`${t.id}#2`, t.nets[1]);
 	}
 	for (const group of [...new Set(twoLeads.map((t) => t.group))]) {
-		const list = twoLeads.filter((t) => t.group === group);
-		const area = list[0].area;
-		if (group === "led") {
-			const at = (row, col) => hole(`${row}${col}`, eic ? area : void 0);
-			const putLed = (led, row, col) => components.push(comp(led.id, led.defId, at(row, led.reversed ? col + 1 : col), {
-				board: boardNow,
-				...led.reversed ? { rotation: 180 } : {},
-				props: led.props
-			}));
-			const units = [];
-			for (let i = 0; i < list.length; i += 2) units.push([list[i], list[i + 1]]);
-			const ledBlocks = [];
-			if (variant.leds === "straddle") {
-				const half = Math.floor(units.length / 2);
-				const chunks = variant.split && inOneRow && units.length >= 4 ? [units.slice(0, half), units.slice(half)] : [units];
-				for (const chunk of chunks) ledBlocks.push({
-					width: chunk.length * 2,
-					place: (x) => chunk.forEach(([res, led], j) => {
-						components.push(comp(res.id, res.defId, at("E", x + 2 * j), {
-							board: boardNow,
-							rotation: 90,
-							props: res.props,
-							span: 3
-						}));
-						putLed(led, "I", x + 2 * j);
-					})
-				});
-			} else for (let i = 0; i < units.length; i += 2) {
-				const pair = units.slice(i, i + 2);
-				ledBlocks.push({
-					width: 5,
-					place: (x) => pair.forEach(([res, led], j) => {
-						const [rRow, dRow] = j === 0 ? ["A", "B"] : ["J", "I"];
-						components.push(comp(res.id, res.defId, at(rRow, x), {
-							board: boardNow,
-							props: res.props,
-							span: res.span
-						}));
-						putLed(led, dRow, x + res.span);
-					})
+		const whole = twoLeads.filter((t) => t.group === group);
+		const area = whole[0].area;
+		const lists = grouped ? Array.from({ length: parts.count }, (_, p) => whole.filter((t) => (t.part ?? 0) === p)).filter((l) => l.length > 0) : [whole];
+		for (const list of lists) {
+			const part = list[0].part ?? 0;
+			if (group === "led") {
+				const putLed = (led, row, col, a) => components.push(comp(led.id, led.defId, hole(`${row}${led.reversed ? col + 1 : col}`, a), {
+					board: boardNow,
+					...led.reversed ? { rotation: 180 } : {},
+					props: led.props
+				}));
+				const units = [];
+				for (let i = 0; i < list.length; i += 2) units.push([list[i], list[i + 1]]);
+				const ledBlocks = [];
+				const splitLeds = !grouped && variant.split && inOneRow && units.length >= 4;
+				if (variant.leds === "rail") {
+					const railCols = (x, n) => {
+						const cols = [];
+						for (let c = x; cols.length < n; c++) if (c > LAST_COLUMN || railHole(pullRail, c)) cols.push(c);
+						return cols;
+					};
+					const half = Math.floor(units.length / 2);
+					const chunks = splitLeds ? [units.slice(0, half), units.slice(half)] : [units];
+					for (const chunk of chunks) {
+						const n = chunk.length;
+						ledBlocks.push({
+							width: n <= 5 ? n : n + Math.ceil(n / 5),
+							align: n <= 5 ? (x) => railCols(x, n)[n - 1] === x + n - 1 : void 0,
+							place: (x, a) => railCols(x, n).forEach((col, j) => {
+								const [res, led] = chunk[j];
+								components.push(comp(res.id, res.defId, hole(`E${col}`, a), {
+									board: boardNow,
+									rotation: 90,
+									props: res.props,
+									span: 3
+								}));
+								const top = hole(`J${col}`, a);
+								const rails = railsOf(a);
+								const rail = holeOn(boardNow, `${led.reversed ? rails.plusBottom : rails.minusBottom}${col}`, layout);
+								const span = rail.y - top.y;
+								components.push(led.reversed ? comp(led.id, led.defId, rail, {
+									board: boardNow,
+									rotation: 270,
+									span,
+									props: led.props
+								}) : comp(led.id, led.defId, top, {
+									board: boardNow,
+									rotation: 90,
+									span,
+									props: led.props
+								}));
+							})
+						});
+					}
+				} else if (variant.leds === "straddle") {
+					const half = Math.floor(units.length / 2);
+					const chunks = splitLeds ? [units.slice(0, half), units.slice(half)] : [units];
+					for (const chunk of chunks) ledBlocks.push({
+						width: chunk.length * 2,
+						place: (x, a) => chunk.forEach(([res, led], j) => {
+							components.push(comp(res.id, res.defId, hole(`E${x + 2 * j}`, a), {
+								board: boardNow,
+								rotation: 90,
+								props: res.props,
+								span: 3
+							}));
+							putLed(led, "I", x + 2 * j, a);
+						})
+					});
+				} else for (let i = 0; i < units.length; i += 2) {
+					const pair = units.slice(i, i + 2);
+					ledBlocks.push({
+						width: 5,
+						place: (x, a) => pair.forEach(([res, led], j) => {
+							const [rRow, dRow] = j === 0 ? ["A", "B"] : ["J", "I"];
+							components.push(comp(res.id, res.defId, hole(`${rRow}${x}`, a), {
+								board: boardNow,
+								props: res.props,
+								span: res.span
+							}));
+							putLed(led, dRow, x + res.span, a);
+						})
+					});
+				}
+				for (const blk of ledBlocks) {
+					blk.part = part;
+					blk.rank = 4;
+				}
+				if (splitLeds && ledBlocks.length >= 2) {
+					const before = Math.floor(ledBlocks.length / 2);
+					ledsBefore.push(...ledBlocks.slice(0, before));
+					blocks[3].push(...ledBlocks.slice(before));
+				} else blocks[eic ? area : 3].push(...ledBlocks);
+				continue;
+			}
+			const size = 2;
+			const onBoard = displayBoard(displayParts.findIndex((p) => p.ds === group));
+			for (let i = 0; i < list.length; i += size) {
+				const pair = list.slice(i, i + size);
+				blocks[eic ? area : area === 1 ? 1 : 3].push({
+					board: onBoard,
+					part,
+					rank: 2,
+					width: Math.max(...pair.map((t) => t.span)) + 1,
+					place: (x, a) => pair.forEach((t, j) => components.push(comp(t.id, t.defId, hole(`${j === 0 ? "A" : "J"}${x}`, a), {
+						board: boardNow,
+						props: t.props,
+						...t.defId === "resistor" ? { span: t.span } : {}
+					})))
 				});
 			}
-			if (variant.split && inOneRow && units.length >= 4 && ledBlocks.length >= 2) {
-				const before = Math.floor(ledBlocks.length / 2);
-				ledsBefore.push(...ledBlocks.slice(0, before));
-				blocks[3].push(...ledBlocks.slice(before));
-			} else blocks[eic ? area : 3].push(...ledBlocks);
-			continue;
-		}
-		const size = 2;
-		const onBoard = displayBoard(displayParts.findIndex((p) => p.ds === group));
-		for (let i = 0; i < list.length; i += size) {
-			const pair = list.slice(i, i + size);
-			blocks[eic ? area : area === 1 ? 1 : 3].push({
-				board: onBoard,
-				width: Math.max(...pair.map((t) => t.span)) + 1,
-				place: (x) => pair.forEach((t, j) => components.push(comp(t.id, t.defId, hole(`${j === 0 ? "A" : "J"}${x}`, eic ? area : void 0), {
-					board: boardNow,
-					props: t.props,
-					...t.defId === "resistor" ? { span: t.span } : {}
-				})))
-			});
 		}
 		const shown = displayParts.find((p) => p.ds === group);
 		if (shown) blocks[3].push({
-			board: onBoard,
+			board: displayBoard(displayParts.findIndex((p) => p.ds === group)),
 			width: 5,
 			place: (x) => components.push(comp(shown.ds, dsDef, hole(`H${x}`, eic ? 3 : void 0), {
 				board: boardNow,
@@ -35516,12 +35677,41 @@ function build(d, options, layout, variant) {
 			}))
 		});
 	}
-	if (variant.orderIcs) {
+	if (variant.orderIcs && !grouped) {
 		const order = orderIcs(icBlocks.map((blk) => [...new Set(Object.entries(netOf).filter(([pin, net]) => pin.startsWith(`${blk.ic}#`) && net !== VCC && net !== GND).map(([, net]) => net))]), new Set(inputs.map((n) => n.id)), new Set(outputs.map((n) => driver.get(`${n.id}#0`))), inOneRow);
 		icBlocks.splice(0, icBlocks.length, ...order.map((k) => icBlocks[k]));
 	}
 	icBlocks.sort((a, b) => (a.board ?? 0) - (b.board ?? 0));
-	if (!inOneRow) blocks[2].push(...icBlocks);
+	if (grouped) {
+		const all = [
+			...blocks[1],
+			...blocks[3],
+			...icBlocks
+		];
+		const clock = all.find((blk) => blk.rank === 0);
+		if (clock && clockNode) {
+			const users = Object.entries(netOf).flatMap(([pin, net]) => net === clockNode.id ? [parts.of.get(pin.split("#")[0])] : []).filter((p) => p !== void 0);
+			clock.part = users.length > 0 ? Math.min(...users) : 0;
+		}
+		all.sort((x, y) => (x.part ?? 0) - (y.part ?? 0) || (x.rank ?? 0) - (y.rank ?? 0));
+		for (const k of [
+			1,
+			2,
+			3
+		]) blocks[k] = [];
+		const areas = eic ? [
+			1,
+			2,
+			3
+		] : [1];
+		const fits = (list) => list.reduce((sum, blk) => sum + blk.width + (blk.align ? 2 : 0), 0) + (list.length + 1) * Math.min(variant.gap, 2) <= 61;
+		let k = 0;
+		for (let p = 0; p < parts.count; p++) {
+			const mine = all.filter((blk) => (blk.part ?? 0) === p);
+			while (k < areas.length - 1 && blocks[areas[k]].length > 0 && !fits([...blocks[areas[k]], ...mine])) k++;
+			blocks[areas[k]].push(...mine);
+		}
+	} else if (!inOneRow) blocks[2].push(...icBlocks);
 	else {
 		blocks[1] = [
 			...ledsBefore,
@@ -35688,7 +35878,7 @@ function build(d, options, layout, variant) {
 			boards: two ? 2 : 1,
 			switch: useButtons ? null : swDef,
 			switches: useButtons ? 0 : switches.length,
-			...many && !useButtons ? { switchList: switches.map(defOf) } : {},
+			...listed && !useButtons ? { switchList: switches.map(defOf) } : {},
 			buttons: useButtons ? inputs.length : 0,
 			resistors: components.filter((c) => c.defId === "resistor").length,
 			leds: outputs.length,
@@ -35755,6 +35945,22 @@ var LAYOUT_VARIANTS = {
 			leds: "straddle",
 			split: false,
 			orderIcs: true
+		},
+		{
+			gap: 2,
+			leds: "rail",
+			split: false
+		},
+		{
+			gap: 3,
+			leds: "rail",
+			split: false
+		},
+		{
+			gap: 2,
+			leds: "rail",
+			split: false,
+			parts: true
 		}
 	],
 	EIC1106: [
@@ -35817,6 +36023,18 @@ var LAYOUT_VARIANTS = {
 			leds: "pair",
 			split: false,
 			orderIcs: true
+		},
+		{
+			gap: 3,
+			leds: "rail",
+			split: false,
+			parts: true
+		},
+		{
+			gap: 4,
+			leds: "straddle",
+			split: false,
+			parts: true
 		}
 	]
 };
@@ -35907,7 +36125,7 @@ function* convertSteps(d, options, budget = {}, parallel = 1) {
 				board
 			}, variant);
 			if (!r.ok) {
-				failure = r.reason;
+				if (r.reason) failure = r.reason;
 				continue;
 			}
 			const key = JSON.stringify(r.circuit.components.map((c) => [
@@ -36127,7 +36345,9 @@ function verifySequence(d, circuit, bindings, pulses = 16) {
 	const combos = sequenceCombos(inputs.length);
 	const mismatches = [];
 	for (const bits of combos) {
-		const table = sequenceTable(d, pulses, Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]])));
+		const values = Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]]));
+		const table = sequenceTable(d, pulses, values);
+		const other = topoOrder(d).loop ? sequenceTable(d, pulses, values, 1) : table;
 		if (!table.ok) return {
 			rows: 0,
 			pulses,
@@ -36150,9 +36370,10 @@ function verifySequence(d, circuit, bindings, pulses = 16) {
 				step(1);
 				result = step(0);
 			}
-			const expected = row.out.map((b) => b === "X" ? "?" : String(b));
+			const twin = other.ok ? other.rows.find((r) => r.pulse === row.pulse) : void 0;
+			const expected = row.out.map((b, k) => twin && twin.out[k] !== b ? "X" : b === "X" ? "?" : String(b));
 			const actual = readOutputs(sim, result, bindings, outputs);
-			if (expected.some((e, k) => e !== actual[k])) {
+			if (expected.some((e, k) => e !== "X" && e !== actual[k])) {
 				mismatches.push({
 					inputs: `${bits.join("") || "（沒有其他輸入）"} 第 ${row.pulse} 次脈衝`,
 					expected,
@@ -37963,7 +38184,7 @@ function folderFromArgs(argv, cwd) {
 * 工具的邏輯在 src/mcp/（純函式）；這裡只負責路徑檢查、讀檔、寫檔。
 */
 /** 版本號：打包時換成建置的日期（vite.mcp.config.ts），原始碼版是 1.0.0。 */
-var VERSION = "2026.11.10";
+var VERSION = "2026.11.14";
 if (process.argv.includes("--version")) {
 	console.log(VERSION);
 	process.exit(0);
@@ -38192,7 +38413,7 @@ server.registerTool("logic_truth_table", {
 }, async (args) => withFile(args.file, (lab) => logicTruthTable(lab, { pulses: args.pulses })));
 server.registerTool("logic_to_breadboard", {
 	title: "邏輯圖轉成麵包板",
-	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表（「保持」「不穩定」的格子不比）；輸入最多 12 個，超過 8 個時照名稱順序每 8 個一個指撥開關；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。一般最多 40 秒；用到兩塊 EIC-1106 的大電路最多 90 秒（可以用 seconds 調整）；有 progressToken 時每一批佈線回報一次進度。接不完時不寫入檔案，回覆照這次的設定建議下一步。",
+	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表（「保持」「不穩定」的格子不比）；輸入最多 12 個，超過 8 個時照名稱順序每 8 個一個指撥開關；一張圖裡互相沒有訊號相連的子電路（例如好幾題畫在一起，共用時脈不算相連）可以各自成一組：自己的開關、IC、LED 排在一起，零件清單逐個列出開關；LED 可能直立、一腳直接插進電源軌（少一條線）；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。一般最多 40 秒；用到兩塊 EIC-1106 的大電路最多 90 秒（可以用 seconds 調整）；有 progressToken 時每一批佈線回報一次進度。接不完時不寫入檔案，回覆照這次的設定建議下一步。",
 	inputSchema: {
 		file,
 		switch_to: _enum(["vcc", "gnd"]).optional().describe("開關另一端接 +5 V（ON = 1，預設）或 GND（ON = 0）"),
