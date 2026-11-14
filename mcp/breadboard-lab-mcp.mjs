@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.14（commit 515501b）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.14（commit b4114ca）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -30761,6 +30761,47 @@ function combinational(order, driver, values, seq, memory) {
 		unstable
 	};
 }
+/**
+* 子專案 61（課本圖 10-17 的競跑）：每個閘的延遲一樣時（每一步所有閘同時看上一步的值），從 state 記住的值開始，
+* 這組輸入會不會一直來回跳。只看閘與組合 IC 方塊（有時序方塊的圖不判斷，回傳 false）。
+*/
+function racesFrom(d, values, state) {
+	if (isSequential(d) || !topoOrder(d).loop) return false;
+	const driver = new Map(d.wires.map((w) => [`${w.to.node}#${w.to.pin}`, signalOf(w.from, w.fromPin)]));
+	let now = /* @__PURE__ */ new Map();
+	for (const [key, entry] of Object.entries(state)) if (key.startsWith(LOOP_KEY)) now.set(key.slice(5), entry.out[0]);
+	const seed = now.get(POWER_ON) ?? 0;
+	for (const node of topoOrder(d).order) {
+		const read = (pin) => {
+			const from = driver.get(`${node.id}#${pin}`);
+			return from === void 0 ? "X" : now.get(from) ?? seed;
+		};
+		if (node.kind === "INPUT" || node.kind === "CLOCK") now.set(node.id, values[node.id] ?? node.value ?? 0);
+		else if (node.kind === "HIGH") now.set(node.id, 1);
+		else if (node.kind === "LOW") now.set(node.id, 0);
+		else if (node.kind === "BLOCK" && node.chip) blockOutputs(node.chip, Array.from({ length: inputCountOf(node) }, (_, i) => read(i))).forEach((v, k) => now.set(signalOf(node.id, k), v));
+		else if (isGate(node.kind)) now.set(node.id, gateValue(node.kind, Array.from({ length: inputCountOf(node) }, (_, i) => read(i))));
+	}
+	const seen = /* @__PURE__ */ new Set();
+	for (let step = 0; step < MAX_LOOP_PASSES; step++) {
+		const next = /* @__PURE__ */ new Map();
+		const inputOf = (node, pin) => {
+			const from = driver.get(`${node.id}#${pin}`);
+			return from === void 0 ? "X" : now.get(from) ?? seed;
+		};
+		for (const node of d.nodes) if (node.kind === "INPUT" || node.kind === "CLOCK") next.set(node.id, values[node.id] ?? node.value ?? 0);
+		else if (node.kind === "HIGH") next.set(node.id, 1);
+		else if (node.kind === "LOW") next.set(node.id, 0);
+		else if (node.kind === "BLOCK" && node.chip) blockOutputs(node.chip, Array.from({ length: inputCountOf(node) }, (_, i) => inputOf(node, i))).forEach((v, k) => next.set(signalOf(node.id, k), v));
+		else if (isGate(node.kind)) next.set(node.id, gateValue(node.kind, Array.from({ length: inputCountOf(node) }, (_, i) => inputOf(node, i))));
+		const key = [...next].sort(([a], [b]) => a < b ? -1 : 1).map(([s, v]) => `${s}=${v}`).join(",");
+		if ([...next].every(([s, v]) => now.get(s) === v)) return false;
+		if (seen.has(key)) return true;
+		seen.add(key);
+		now = next;
+	}
+	return true;
+}
 var byName = (a, b) => (a.name ?? "") < (b.name ?? "") ? -1 : (a.name ?? "") > (b.name ?? "") ? 1 : 0;
 function sortedIo(d) {
 	return {
@@ -30825,7 +30866,8 @@ function truthTable(d) {
 		inputs: inputs.map((n) => n.name ?? n.id),
 		outputs: outputs.map((n) => n.name ?? n.id)
 	};
-	if (!topoOrder(d).loop) return {
+	const topo = topoOrder(d);
+	if (!topo.loop) return {
 		...head,
 		rows: rowBits.map((bits) => ({
 			in: bits,
@@ -30847,11 +30889,18 @@ function truthTable(d) {
 			starts.push(v.seq);
 		}
 	});
+	const afterLoop = new Set(d.nodes.filter((n) => !topo.order.includes(n)).map((n) => n.id));
+	const races = rowBits.map((bits, r) => {
+		const own = memoryKey(evaluate$1(d, valuesOf(bits)).seq);
+		const others = starts.slice(1).filter((st) => memoryKey(st) !== own);
+		return others.length > 0 && others.every((st) => racesFrom(d, valuesOf(bits), st));
+	});
 	const rows = rowBits.map((bits, r) => ({
 		in: bits,
-		out: outputs.map((_, k) => {
+		out: outputs.map((o, k) => {
 			const cells = results[r];
 			if (cells.some((c) => c.unstable && c.out[k] === "X")) return UNSTABLE;
+			if (races[r] && afterLoop.has(o.id)) return UNSTABLE;
 			return cells.every((c) => c.out[k] === cells[0].out[k]) ? cells[0].out[k] : HOLD;
 		})
 	}));
@@ -34491,6 +34540,46 @@ function checkDiagram(d) {
 	return issues;
 }
 //#endregion
+//#region src/core/routing/area.ts
+/**
+* 子專案 60（指南 3.6）：佔用面積 = 元件（腳與本體）和導線實際佔用的範圍（全域格子的外框）。
+* 電源符號也算（它也佔一個孔）。
+*/
+function occupiedArea(circuit) {
+	const lattice = buildLattice(circuit.boards);
+	const xs = [];
+	const ys = [];
+	const add = (p) => {
+		const at = latticeOf(lattice, p);
+		if (!at) return;
+		xs.push(at.x);
+		ys.push(at.y);
+	};
+	for (const c of circuit.components) {
+		const def = getComponentDefinition(c.defId);
+		if (!def) continue;
+		const fp = resolveFootprint(c, def);
+		for (const p of [...fp.pins.map((q) => q.point), ...fp.blocked]) add(p);
+	}
+	for (const w of circuit.wires) for (const p of [
+		w.start,
+		w.end,
+		...w.path
+	]) add(p);
+	if (xs.length === 0) return {
+		columns: 0,
+		rows: 0,
+		cells: 0
+	};
+	const columns = Math.max(...xs) - Math.min(...xs) + 1;
+	const rows = Math.max(...ys) - Math.min(...ys) + 1;
+	return {
+		columns,
+		rows,
+		cells: columns * rows
+	};
+}
+//#endregion
 //#region src/logic/synth.ts
 /** 規格（2026-10-13 logic-to-breadboard）第 3 節：單元 → IC；順序也是 IC 編號（U1、U2…）的順序。 */
 var IC_FOR = {
@@ -35272,8 +35361,8 @@ function build(d, options, layout, variant) {
 	const many = inputs.length > 8;
 	const splitSwitches = !grouped && !many && inputs.length > 4 && (variant.splitSwitches === true || two && variant.displayBoards === true || uprightPulls && inputs.length >= 6);
 	/** 每個開關接的輸入（依名稱排序）；拆開時依「哪顆 IC 先用到」分組（子專案 45），開關比較靠近用到它的 IC。 */
-	const chunks8 = (list) => Array.from({ length: Math.ceil(list.length / 8) }, (_, s) => list.slice(s * 8, s * 8 + 8));
-	const switches = grouped ? Array.from({ length: parts.count }, (_, p) => chunks8(inputs.filter((n) => partOf(n.id) === p))).flat() : many ? chunks8(inputs) : splitSwitches ? splitByIc(inputs, icOrderOf(d, plans, chips)) : [inputs];
+	const chunks4 = (list) => Array.from({ length: Math.ceil(list.length / 4) }, (_, s) => list.slice(s * 4, s * 4 + 4));
+	const switches = grouped ? Array.from({ length: parts.count }, (_, p) => chunks4(inputs.filter((n) => partOf(n.id) === p))).flat() : many ? chunks4(inputs) : splitSwitches ? splitByIc(inputs, icOrderOf(d, plans, chips)) : [inputs];
 	/** 開關不只一種（8 位元與 4 位元混用）：超過 8 個輸入或分組。 */
 	const listed = many || grouped;
 	/** 用平放電阻的輸入（第幾個）：6 個以上接在同一個開關時，第 6 個那一欄電源軌沒有孔。 */
@@ -35369,7 +35458,7 @@ function build(d, options, layout, variant) {
 			}
 		});
 	});
-	const laterSwitches = splitSwitches && inOneRow ? switchBlocks.slice(1) : [];
+	const laterSwitches = (splitSwitches || many && !grouped) && inOneRow ? switchBlocks.slice(1) : [];
 	blocks[1].push(...switchBlocks.filter((b) => !laterSwitches.includes(b)));
 	for (const plan of plans) {
 		icBlocks.push({
@@ -36086,6 +36175,27 @@ var POLISHED = 2;
 */
 var CLOSE_NETS = 2;
 /**
+* 子專案 61（指南 1、3.6：先縮小占用面積，再減少線數）：兩種擺法的佈線哪個好：接不完的線少 → 交叉少 → 佔用面積小 → 線少 → 總長短。
+* 面積是元件和導線實際佔用的範圍（全域格子的外框）。
+*/
+function isBetterConversion(a, b) {
+	const area = (e) => occupiedArea(e.routed.status === "success" ? applyRouting(e.result.circuit, e.routed) : {
+		...e.result.circuit,
+		wires: e.routed.wires
+	}).cells;
+	const key = (e) => [
+		e.routed.failedNets.length,
+		e.routed.metrics.crossings,
+		area(e),
+		e.routed.metrics.wireCount,
+		e.routed.metrics.totalLength
+	];
+	const ka = key(a);
+	const kb = key(b);
+	for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] < kb[i];
+	return false;
+}
+/**
 * 子專案 41（規格 2026-10-24 faster-conversion）：轉換的步驟。每次 yield 一批互不相關的佈線（同一塊板的快速試、要排到最好的那幾種），
 * 拿到這一批的結果再往下走。parallel：同時能跑幾件（網頁用好幾個 Worker；MCP 一次一件），只影響時間怎麼分，每件分到的時間和一次一件時一樣。
 */
@@ -36160,7 +36270,7 @@ function* convertSteps(d, options, budget = {}, parallel = 1) {
 			result,
 			routed: quick[k]
 		}));
-		ranked.sort((a, b) => isBetterRouting(a.routed, b.routed) ? -1 : isBetterRouting(b.routed, a.routed) ? 1 : 0);
+		ranked.sort((a, b) => isBetterConversion(a, b) ? -1 : isBetterConversion(b, a) ? 1 : 0);
 		let best = ranked[0];
 		const last = i === boards.length - 1;
 		const close = best.routed.status !== "success" && best.routed.failedNets.length <= CLOSE_NETS;
@@ -36181,8 +36291,14 @@ function* convertSteps(d, options, budget = {}, parallel = 1) {
 					from: entry.routed
 				}));
 				for (const [j, entry] of group.entries()) {
-					const routed = isBetterRouting(polished[j], entry.routed) ? polished[j] : entry.routed;
-					if (isBetterRouting(routed, best.routed) || entry === best) best = {
+					const routed = isBetterConversion({
+						result: entry.result,
+						routed: polished[j]
+					}, entry) ? polished[j] : entry.routed;
+					if (isBetterConversion({
+						result: entry.result,
+						routed
+					}, best) || entry === best) best = {
 						result: entry.result,
 						routed
 					};
@@ -37273,7 +37389,7 @@ function logicTruthTable(f, args = {}) {
 	}
 	const cell = (v) => v === "X" ? "?" : String(v);
 	const lines = [`${t.inputs.join(" ")} | ${t.outputs.join(" ")}`, ...t.rows.map((r) => `${r.in.join(" ")} | ${r.out.map(cell).join(" ")}`)];
-	if (t.feedback) lines.push("", "有迴授（閘接回前面）：「保持」是輸出跟之前的狀態有關（維持原來的值），「不穩定」是一直來回跳、停不下來。");
+	if (t.feedback) lines.push("", "有迴授（閘接回前面）：「保持」是輸出跟之前的狀態有關（維持原來的值），「不穩定」是一直來回跳、停不下來（例如 T 閂鎖 T = CP = 1 時的競跑：每個閘的延遲一樣時，從其他狀態切過來都會來回跳）。");
 	const formulas = diagramFormulas(f.logic).outputs;
 	if (formulas.length > 0) {
 		lines.push("", "布林式：");
@@ -37321,17 +37437,25 @@ function diagramCheckText(d, circuit) {
 function retryHints(retry) {
 	if (!retry) return ["可以多給時間（seconds，例如 120）、改用自動選板，或只用一種閘再轉一次。"];
 	const limit = retry.seconds ?? Math.round(retry.elapsedMs / 1e3);
-	const hints = [`seconds: ${Math.min(300, Math.max(120, limit * 2))}（多給佈線器時間，常常就補得上最後幾條）`];
+	const allowed = (retry.seconds ?? DEFAULT_SECONDS) * 1e3;
+	const early = retry.elapsedMs < allowed / 2;
+	const hints = early ? [] : [`seconds: ${Math.min(300, Math.max(120, limit * 2))}（多給佈線器時間，常常就補得上最後幾條）`];
 	if (retry.displays && retry.displayResistors === "each") hints.push("display_resistors: \"shared\"（顯示器共用一顆電阻，線比較少）");
 	if (retry.board !== "auto") hints.push("board: \"auto\"（排不完時可以用兩塊 EIC-1106 左右貼在一起）");
 	if (retry.gates === "direct") hints.push("gates: \"nand\"（只用 NAND，擺法不同，有時比較好排）");
 	hints.push("簡化邏輯圖（少一個閘、少幾條線都有幫助）");
-	return ["可以這樣再轉一次：", ...hints.map((h) => `- ${h}`)];
+	return [
+		...early ? [`佈線器只用了 ${Math.round(retry.elapsedMs / 1e3)} 秒就停下來（上限 ${allowed / 1e3} 秒）：已經確定照這些擺法排不通，是擺法的問題，多給時間沒有用。`] : [],
+		"可以這樣再轉一次：",
+		...hints.map((h) => `- ${h}`)
+	];
 }
 function checkAgainstDiagram(f) {
 	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
 	return { text: diagramCheckText(f.logic, f.circuit) };
 }
+/** 子專案 61：沒給 seconds 時的總時間（秒），和 convertRoute 的 TOTAL_MS 一樣。 */
+var DEFAULT_SECONDS = 40;
 var budgetOf = (args) => args.seconds ? { totalMs: args.seconds * 1e3 } : {};
 var retryOf = (f, args, elapsedMs) => {
 	const displays = f.logic.nodes.filter((n) => n.kind === "DISPLAY").length;
@@ -38413,7 +38537,7 @@ server.registerTool("logic_truth_table", {
 }, async (args) => withFile(args.file, (lab) => logicTruthTable(lab, { pulses: args.pulses })));
 server.registerTool("logic_to_breadboard", {
 	title: "邏輯圖轉成麵包板",
-	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表（「保持」「不穩定」的格子不比）；輸入最多 12 個，超過 8 個時照名稱順序每 8 個一個指撥開關；一張圖裡互相沒有訊號相連的子電路（例如好幾題畫在一起，共用時脈不算相連）可以各自成一組：自己的開關、IC、LED 排在一起，零件清單逐個列出開關；LED 可能直立、一腳直接插進電源軌（少一條線）；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。一般最多 40 秒；用到兩塊 EIC-1106 的大電路最多 90 秒（可以用 seconds 調整）；有 progressToken 時每一批佈線回報一次進度。接不完時不寫入檔案，回覆照這次的設定建議下一步。",
+	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表（「保持」「不穩定」的格子不比）；輸入最多 12 個，超過 8 個時照名稱順序每 4 個一個 4 位元指撥開關（第 1 個開關在第一顆 IC 前面，其他的在後面）；擺法先比佔用面積、再比線數；一張圖裡互相沒有訊號相連的子電路（例如好幾題畫在一起，共用時脈不算相連）可以各自成一組：自己的開關、IC、LED 排在一起，零件清單逐個列出開關；LED 可能直立、一腳直接插進電源軌（少一條線）；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。一般最多 40 秒；用到兩塊 EIC-1106 的大電路最多 90 秒（可以用 seconds 調整）；有 progressToken 時每一批佈線回報一次進度。接不完時不寫入檔案，回覆照這次的設定建議下一步；佈線器還沒用到一半的時間就停下來時，表示是擺法的問題，不會建議多給時間。",
 	inputSchema: {
 		file,
 		switch_to: _enum(["vcc", "gnd"]).optional().describe("開關另一端接 +5 V（ON = 1，預設）或 GND（ON = 0）"),
