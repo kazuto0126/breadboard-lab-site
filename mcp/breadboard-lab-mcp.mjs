@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.14（commit b4114ca）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.14（commit d3215fd）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -32306,124 +32306,393 @@ function parseCircuitData(raw) {
 	}
 }
 //#endregion
-//#region src/logic/stateCheck.ts
-var text = (b) => b === 0 || b === 1 ? String(b) : "?";
-/**
-* 規格第 2、3 節：依名稱對應輸入、輸出與狀態位元（輸出端 Q0、Q1…），從重設開始走：
-* 每個走到的狀態、每種輸入組合先讀輸出（脈衝前），再送一個脈衝讀下一個狀態，和題目那一列比（X 的格子不比）。
-*/
-function compareDiagramToStateTask(d, task) {
-	if (d.nodes.length === 0) return { kind: "none" };
-	const bits = stateBitNames(task.states);
-	const inputs = new Map(d.nodes.filter((n) => n.kind === "INPUT").map((n) => [n.name ?? n.id, n.id]));
-	const outputs = new Map(d.nodes.filter((n) => n.kind === "OUTPUT").map((n) => [n.name ?? n.id, n.id]));
-	const clock = d.nodes.find((n) => n.kind === "CLOCK");
-	const issues = [];
-	if (!clock) issues.push("邏輯圖沒有時脈：放一個時脈，接到每個正反器的 CLK");
-	const missingBits = bits.filter((q) => !outputs.has(q));
-	if (missingBits.length > 0) issues.push(`要有輸出端 ${missingBits.join("、")}（接到正反器的 Q，Q0 是最低位元），才知道電路在哪個狀態`);
-	for (const name of task.inputs) if (!inputs.has(name)) issues.push(`題目的輸入 ${name} 在邏輯圖找不到輸入端`);
-	for (const name of inputs.keys()) if (!task.inputs.includes(name)) issues.push(`邏輯圖的輸入端 ${name} 不在題目裡`);
-	for (const name of task.outputs) if (!outputs.has(name)) issues.push(`題目的輸出 ${name} 在邏輯圖找不到輸出端`);
-	if (issues.length > 0) return {
-		kind: "issues",
-		issues
+//#region src/core/simulation/simulate.ts
+/** 7 段顯示器的段，依這個順序回報。 */
+var SEGMENT_ORDER = [
+	"a",
+	"b",
+	"c",
+	"d",
+	"e",
+	"f",
+	"g",
+	"dp"
+];
+var cache$1 = /* @__PURE__ */ new WeakMap();
+/** 依電路參照快取；電路一改（包括切換指撥開關）就重新編譯，成本很低。 */
+function compileSimulation(circuit) {
+	const cached = cache$1.get(circuit);
+	if (cached) return cached;
+	const index = indexCircuit(circuit);
+	const uf = new UnionFind();
+	const groups = /* @__PURE__ */ new Set();
+	const touch = (g) => {
+		if (g) {
+			groups.add(g);
+			uf.find(g);
+		}
+		return g;
 	};
-	const m = task.inputs.length;
-	const clk = clock.id;
-	const valuesOf = (c) => Object.fromEntries(task.inputs.map((name, b) => [inputs.get(name), c >> m - 1 - b & 1]));
-	/** 讀狀態位元：編碼（數字），有不確定的位元時是 null。 */
-	const codeOf = (v) => {
-		const qs = bits.map((q) => v.nodes.get(outputs.get(q)));
-		return qs.every((b) => b === 0 || b === 1) ? parseInt(qs.join(""), 2) : null;
+	for (const w of circuit.wires) {
+		const a = touch(groupOfPoint(index, w.start));
+		const b = touch(groupOfPoint(index, w.end));
+		if (a && b) uf.union(a, b);
+	}
+	const groupOfPin = /* @__PURE__ */ new Map();
+	for (const pc of index.placed) {
+		for (const pin of pc.footprint.pins) {
+			const g = touch(groupOfPoint(index, pin.point));
+			if (g) groupOfPin.set(pinKey({
+				componentId: pc.instance.id,
+				pinNumber: pin.pinNumber
+			}), g);
+		}
+		for (const set of pc.def.internalConnections) {
+			const linked = set.map((n) => groupOfPin.get(pinKey({
+				componentId: pc.instance.id,
+				pinNumber: n
+			}))).filter((g) => !!g);
+			for (let i = 1; i < linked.length; i++) uf.union(linked[0], linked[i]);
+		}
+	}
+	const nodeOfGroup = new Map([...groups].sort().map((g) => [g, uf.find(g)]));
+	const nodeOfPin = new Map([...groupOfPin].map(([key, g]) => [key, uf.find(g)]));
+	const nodeOf = (componentId, pinNumber) => nodeOfPin.get(pinKey({
+		componentId,
+		pinNumber
+	})) ?? null;
+	const sim = {
+		circuit,
+		nodeOfGroup,
+		nodeOfPin,
+		switches: [],
+		buttons: [],
+		resistors: [],
+		sources: [],
+		clocks: [],
+		ics: [],
+		leds: [],
+		displays: []
 	};
-	const name = (code) => code === null ? "?" : code < task.states ? `S${code}` : code.toString(2).padStart(bits.length, "0");
-	const reset = evaluate$1(d, {
-		...valuesOf(0),
-		[clk]: 0
-	});
-	const start = codeOf(reset);
-	const mismatches = [];
-	const unusedCodes = [];
-	let rows = 0;
-	const seen = /* @__PURE__ */ new Set();
-	const queue = [];
-	if (start !== null) {
-		seen.add(start);
-		queue.push({
-			code: start,
-			seq: reset.seq
+	for (const [g, node] of nodeOfGroup) {
+		const source = groupInfo(index, g)?.source;
+		if (source) sim.sources.push({
+			componentId: `post:${g}`,
+			node,
+			level: source === "vcc" ? 1 : 0
 		});
 	}
-	while (queue.length > 0) {
-		const { code, seq } = queue.shift();
-		if (code >= task.states) {
-			unusedCodes.push(name(code));
-			continue;
-		}
-		for (let c = 0; c < 1 << m; c++) {
-			const values = valuesOf(c);
-			const before = evaluate$1(d, {
-				...values,
-				[clk]: 0
-			}, seq);
-			const up = evaluate$1(d, {
-				...values,
-				[clk]: 1
-			}, before.seq);
-			const down = evaluate$1(d, {
-				...values,
-				[clk]: 0
-			}, up.seq);
-			const next = codeOf(down);
-			const row = code << m | c;
-			const want = task.rows[row];
-			const actual = task.outputs.map((o) => text(before.nodes.get(outputs.get(o))));
-			const expected = want.out.map(String);
-			rows++;
-			if (want.next !== "X" && want.next !== next || expected.some((e, k) => e !== "X" && e !== actual[k])) mismatches.push({
-				row,
-				state: code,
-				inputs: m === 0 ? "" : c.toString(2).padStart(m, "0"),
-				expectedNext: want.next === "X" ? "X" : `S${want.next}`,
-				actualNext: name(next),
-				expected,
-				actual
+	for (const pc of index.placed) {
+		const id = pc.instance.id;
+		const def = pc.def;
+		const props = propsOf(pc);
+		for (const pin of def.pins) {
+			const node = nodeOf(id, pin.number);
+			if (!node) continue;
+			if (pin.role === "vcc-source") sim.sources.push({
+				componentId: id,
+				node,
+				level: (props.voltage ?? 5) > 0 ? 1 : 0
 			});
-			if (next !== null && !seen.has(next)) {
-				seen.add(next);
-				queue.push({
-					code: next,
-					seq: down.seq
+			if (pin.role === "gnd-source") sim.sources.push({
+				componentId: id,
+				node,
+				level: 0
+			});
+		}
+		switch (def.category) {
+			case "clock": {
+				const node = nodeOf(id, 1);
+				if (node) sim.clocks.push({
+					componentId: id,
+					node,
+					frequency: props.frequency ?? 1
 				});
+				break;
+			}
+			case "dip-switch": {
+				const n = def.pins.length;
+				const states = props.switchStates ?? [];
+				for (let k = 1; k <= n / 2; k++) {
+					const a = nodeOf(id, k);
+					const b = nodeOf(id, n + 1 - k);
+					if (a && b) sim.switches.push({
+						componentId: id,
+						index: k - 1,
+						a,
+						b,
+						closed: states[k - 1] === true
+					});
+				}
+				break;
+			}
+			case "pushbutton": {
+				const a = nodeOf(id, 1);
+				const b = nodeOf(id, 3);
+				if (a && b) sim.buttons.push({
+					componentId: id,
+					a,
+					b
+				});
+				break;
+			}
+			case "resistor": {
+				const a = nodeOf(id, 1);
+				const b = nodeOf(id, 2);
+				if (a && b) sim.resistors.push({
+					componentId: id,
+					a,
+					b
+				});
+				break;
+			}
+			case "led": {
+				const anode = def.pins.find((p) => p.role === "anode");
+				const cathode = def.pins.find((p) => p.role === "cathode");
+				sim.leds.push({
+					componentId: id,
+					anode: anode ? nodeOf(id, anode.number) : null,
+					cathode: cathode ? nodeOf(id, cathode.number) : null
+				});
+				break;
+			}
+			case "seven-seg": {
+				const cathode = def.pins.some((p) => p.name === "CC");
+				const anode = def.pins.find((p) => p.name === (cathode ? "CC" : "CA"));
+				const segments = def.pins.filter((p) => p.role === (cathode ? "anode" : "cathode")).sort((a, b) => SEGMENT_ORDER.indexOf(a.name) - SEGMENT_ORDER.indexOf(b.name)).map((p) => ({
+					name: p.name,
+					node: nodeOf(id, p.number)
+				}));
+				sim.displays.push({
+					componentId: id,
+					common: anode ? nodeOf(id, anode.number) : null,
+					cathode,
+					segments
+				});
+				break;
+			}
+			case "ic": {
+				if (!def.logic) break;
+				const counts = /* @__PURE__ */ new Map();
+				for (const p of def.pins) counts.set(p.name, (counts.get(p.name) ?? 0) + 1);
+				const pinNodes = /* @__PURE__ */ new Map();
+				for (const p of def.pins) {
+					const node = nodeOf(id, p.number);
+					if (node && counts.get(p.name) === 1) pinNodes.set(p.name, node);
+				}
+				const nodesWithRole = (role) => def.pins.filter((p) => p.role === role).map((p) => nodeOf(id, p.number) ?? `missing:${id}#${p.number}`);
+				if (def.logic.model === "timer555") {
+					const osc = `osc:${id}`;
+					pinNodes.set(OSC_PIN, osc);
+					sim.clocks.push({
+						componentId: id,
+						node: osc,
+						frequency: props.frequency ?? 1
+					});
+				}
+				sim.ics.push({
+					componentId: id,
+					defId: def.id,
+					model: createModel(def.logic),
+					pinNodes,
+					vccNodes: nodesWithRole("power"),
+					gndNodes: nodesWithRole("ground")
+				});
+				break;
 			}
 		}
 	}
-	const unreached = Array.from({ length: task.states }, (_, s) => s).filter((s) => !seen.has(s));
+	cache$1.set(circuit, sim);
+	return sim;
+}
+/** 上電時的輸出：所有輸出腳都是未知（X），直到第一次求值。 */
+function powerUpOutputs(ic) {
+	return Object.fromEntries(ic.model.outputs.map((pin) => [pin, "X"]));
+}
+/**
+* 沿用前一份狀態中仍然存在、而且是同一種 IC 的內部狀態（例如只切換了開關、或只改了導線）；
+* 新放的 IC 從上電狀態開始。沒有前一份狀態時就是全新的上電狀態。
+*/
+function adoptSimState(sim, previous) {
+	const models = {};
+	const outputs = {};
+	for (const ic of sim.ics) {
+		const old = previous?.models[ic.componentId];
+		if (old && old.defId === ic.defId) {
+			models[ic.componentId] = old;
+			outputs[ic.componentId] = previous?.outputs[ic.componentId] ?? powerUpOutputs(ic);
+		} else {
+			models[ic.componentId] = {
+				defId: ic.defId,
+				state: ic.model.init()
+			};
+			outputs[ic.componentId] = powerUpOutputs(ic);
+		}
+	}
 	return {
-		kind: "done",
-		rows,
-		mismatches,
-		unreached,
-		unusedCodes,
-		...start === 0 ? {} : { resetAt: name(start) }
+		models,
+		outputs
 	};
 }
-/** 一列不一致的白話：「S1、X = 1：題目 → S2、Z = 0；邏輯圖 → S0、Z = 1」（不在乎的輸出寫「任意」）。 */
-function mismatchText$1(m, task) {
-	const where = [`S${m.state}`, ...task.inputs.map((n, b) => `${n} = ${m.inputs[b]}`)].join("、");
-	const side = (next, outs) => [next === "X" ? "任意" : next, ...task.outputs.map((o, k) => `${o} = ${outs[k] === "X" ? "任意" : outs[k]}`)].join("、");
-	return `${where}：題目 → ${side(m.expectedNext, m.expected)}；邏輯圖 → ${side(m.actualNext, m.actual)}`;
+function initialSimState(sim) {
+	return adoptSimState(sim);
 }
-/** 比對結果的總結與補充說明（網頁與 MCP 共用）。 */
-function comparisonNotes(r, task) {
+function combine(current, value) {
+	return current === void 0 || current === value ? value : "X";
+}
+/** 解析每個（動態）節點的電位：強驅動合併 → 沿電阻一層一層取弱驅動 → 其餘為 Z。 */
+function resolve$1(sim, node, outputs, inputs) {
+	const strongLevels = /* @__PURE__ */ new Map();
+	const drive = (n, v) => {
+		if (v === "Z") return;
+		const d = node(n);
+		strongLevels.set(d, combine(strongLevels.get(d), v));
+	};
+	for (const s of sim.sources) drive(s.node, s.level);
+	for (const c of sim.clocks) drive(c.node, inputs.clocks[c.componentId] ?? 0);
+	for (const ic of sim.ics) {
+		const out = outputs[ic.componentId] ?? {};
+		for (const pin of Object.keys(out).sort()) {
+			const n = ic.pinNodes.get(pin);
+			if (n) drive(n, out[pin]);
+		}
+	}
+	const levels = new Map(strongLevels);
+	/** 電位經電阻傳到還沒有電位的節點（弱電位）。 */
+	const throughResistors = () => {
+		for (let layer = 0; layer < sim.resistors.length + 1; layer++) {
+			const next = /* @__PURE__ */ new Map();
+			for (const r of sim.resistors) {
+				const a = node(r.a);
+				const b = node(r.b);
+				if (a === b) continue;
+				const va = levels.get(a);
+				const vb = levels.get(b);
+				if (va !== void 0 && vb === void 0) next.set(b, combine(next.get(b), va));
+				if (vb !== void 0 && va === void 0) next.set(a, combine(next.get(a), vb));
+			}
+			if (next.size === 0) break;
+			for (const [n, v] of next) levels.set(n, v);
+		}
+	};
+	throughResistors();
+	const ideal = /* @__PURE__ */ new Map();
+	const open = [...sim.switches.filter((s) => !s.closed), ...sim.buttons.filter((b) => !inputs.pressed[b.componentId])];
+	for (const s of open) {
+		const a = node(s.a);
+		const b = node(s.b);
+		if (a === b) continue;
+		const va = levels.get(a);
+		const vb = levels.get(b);
+		if ((va === 0 || va === 1) && vb === void 0) ideal.set(b, combine(ideal.get(b), va === 1 ? 0 : 1));
+		if ((vb === 0 || vb === 1) && va === void 0) ideal.set(a, combine(ideal.get(a), vb === 1 ? 0 : 1));
+	}
+	if (ideal.size > 0) {
+		for (const [n, v] of ideal) levels.set(n, v);
+		throughResistors();
+	}
 	return {
-		summary: r.mismatches.length === 0 ? `從 S0 開始比對了 ${r.rows} 列，邏輯圖和狀態表全部一致${task.rows.some((row) => row.next === "X" || row.out.includes("X")) ? "（不在乎的格子不比）" : ""}` : `比對了 ${r.rows} 列，有 ${r.mismatches.length} 列不一致`,
-		notes: [
-			...r.resetAt ? [`重設後邏輯圖在 ${r.resetAt}（應該是 S0，正反器都是 0）`] : [],
-			...r.unreached.length > 0 ? [`${r.unreached.map((s) => `S${s}`).join("、")} 從 S0 走不到，沒有比對`] : [],
-			...r.unusedCodes.length > 0 ? [`走到沒用到的編碼 ${r.unusedCodes.join("、")}，沒有往下比`] : []
-		]
+		levels,
+		strong: new Set(strongLevels.keys())
+	};
+}
+function powered(ic, node, r) {
+	const is = (nodes, level) => nodes.length > 0 && nodes.every((n) => r.strong.has(node(n)) && r.levels.get(node(n)) === level);
+	return is(ic.vccNodes, 1) && is(ic.gndNodes, 0);
+}
+function sameOutputs(a, b) {
+	for (const id of /* @__PURE__ */ new Set([...Object.keys(a), ...Object.keys(b)])) {
+		const x = a[id] ?? {};
+		const y = b[id] ?? {};
+		const keys = /* @__PURE__ */ new Set([...Object.keys(x), ...Object.keys(y)]);
+		for (const k of keys) if ((x[k] ?? "Z") !== (y[k] ?? "Z")) return false;
+	}
+	return true;
+}
+/**
+* 依目前的輸入把電路算到穩定：所有 IC 每一輪讀同一份節點電位（結果與 IC 順序無關），
+* 循序 IC 比較上一次的輸入找出時脈邊緣；輸出不再改變就是穩定。
+*/
+function settle(sim, state, inputs) {
+	const dyn = new UnionFind();
+	for (const s of sim.switches) if (s.closed) dyn.union(s.a, s.b);
+	for (const b of sim.buttons) if (inputs.pressed[b.componentId]) dyn.union(b.a, b.b);
+	const node = (n) => dyn.find(n);
+	let models = { ...state.models };
+	let outputs = state.outputs;
+	for (const ic of sim.ics) if (!models[ic.componentId]) models[ic.componentId] = {
+		defId: ic.defId,
+		state: ic.model.init()
+	};
+	let resolved = resolve$1(sim, node, outputs, inputs);
+	let unpowered = [];
+	let stable = false;
+	let iterations = 0;
+	while (iterations < 100) {
+		iterations++;
+		const nextOutputs = {};
+		const nextModels = {};
+		unpowered = [];
+		for (const ic of sim.ics) {
+			const current = models[ic.componentId];
+			if (!powered(ic, node, resolved)) {
+				unpowered.push(ic.componentId);
+				nextOutputs[ic.componentId] = {};
+				nextModels[ic.componentId] = current;
+				continue;
+			}
+			const read = (pin) => {
+				const n = ic.pinNodes.get(pin);
+				const v = n ? resolved.levels.get(node(n)) : void 0;
+				return v === void 0 || v === "Z" ? 1 : v;
+			};
+			const r = ic.model.evaluate(read, current.state);
+			nextOutputs[ic.componentId] = r.outputs;
+			nextModels[ic.componentId] = {
+				defId: ic.defId,
+				state: r.state
+			};
+		}
+		models = nextModels;
+		const settled = sameOutputs(outputs, nextOutputs);
+		outputs = nextOutputs;
+		if (settled) {
+			stable = true;
+			break;
+		}
+		resolved = resolve$1(sim, node, outputs, inputs);
+	}
+	const levelOf = (n) => n ? resolved.levels.get(node(n)) ?? "Z" : "Z";
+	const groupLevels = {};
+	const conflicts = [];
+	for (const [g, n] of sim.nodeOfGroup) {
+		const v = levelOf(n);
+		groupLevels[g] = v;
+		if (v === "X") conflicts.push(g);
+	}
+	const pinLevels = {};
+	for (const [key, n] of sim.nodeOfPin) pinLevels[key] = levelOf(n);
+	const litLeds = sim.leds.filter((l) => levelOf(l.anode) === 1 && levelOf(l.cathode) === 0).map((l) => l.componentId);
+	const litSegments = {};
+	for (const d of sim.displays) {
+		const on = d.cathode ? 0 : 1;
+		litSegments[d.componentId] = levelOf(d.common) === on ? d.segments.filter((s) => levelOf(s.node) === (d.cathode ? 1 : 0)).map((s) => s.name) : [];
+	}
+	return {
+		state: {
+			models,
+			outputs
+		},
+		result: {
+			stable,
+			iterations,
+			groupLevels,
+			pinLevels,
+			litLeds,
+			litSegments,
+			unpowered,
+			conflicts
+		}
 	};
 }
 //#endregion
@@ -32916,6 +33185,691 @@ function occupancyOf(circuit, boardId) {
 		perBoard.set(boardId, occ);
 	}
 	return occ;
+}
+//#endregion
+//#region src/core/simulation/darkDisplay.ts
+/**
+* 7 段顯示器為什麼全暗（74LS47 輸入 15 時本來就全暗，和沒通電看起來一樣，要分開說）；有亮的段或不是顯示器時回傳 null。
+* 驅動它的 74LS47：輸出腳直接或經過一顆電阻接到顯示器的段。
+*/
+function whyDark(sim, result, displayId) {
+	const display = sim.displays.find((d) => d.componentId === displayId);
+	if (!display || (result.litSegments[displayId] ?? []).some((s) => s !== "dp")) return null;
+	const keyOf = /* @__PURE__ */ new Map();
+	for (const [key, node] of sim.nodeOfPin) if (!keyOf.has(node)) keyOf.set(node, key);
+	const levelAt = (node) => {
+		const key = node ? keyOf.get(node) : void 0;
+		return key ? result.pinLevels[key] ?? "Z" : "Z";
+	};
+	if (levelAt(display.common) !== (display.cathode ? 0 : 1)) return display.cathode ? {
+		kind: "no-power",
+		cathode: true
+	} : { kind: "no-power" };
+	const segments = new Set(display.segments.flatMap((s) => s.node ? [s.node] : []));
+	const near = new Set(segments);
+	for (const r of sim.resistors) {
+		if (segments.has(r.a)) near.add(r.b);
+		if (segments.has(r.b)) near.add(r.a);
+	}
+	for (const ic of sim.ics) {
+		const logic = getComponentDefinition(ic.defId)?.logic;
+		if (logic?.model !== "bcd7seg") continue;
+		const spec = logic;
+		if (!spec.segments.some((pin) => near.has(ic.pinNodes.get(pin) ?? ""))) continue;
+		const driver = ic.componentId;
+		if (result.unpowered.includes(driver)) return {
+			kind: "driver-unpowered",
+			driver
+		};
+		const read = (pin) => {
+			const v = levelAt(ic.pinNodes.get(pin));
+			return v === "Z" ? 1 : v;
+		};
+		if (read(spec.blanking) === 0) return {
+			kind: "blanked",
+			driver
+		};
+		const value = toNumber(spec.inputs.map(read));
+		if (value === 15 && read(spec.lampTest) !== 0) return spec.activeHigh ? {
+			kind: "fifteen",
+			driver,
+			chip: "74LS48"
+		} : {
+			kind: "fifteen",
+			driver
+		};
+		if (value === 0 && read(spec.rippleBlanking) === 0) return {
+			kind: "blanked",
+			driver
+		};
+	}
+	return { kind: "unwired" };
+}
+/** 全暗原因的說明文字。 */
+function darkReasonText(r) {
+	switch (r.kind) {
+		case "no-power": return r.cathode ? "共陰極（COM）沒有接到 GND，所以全暗。" : "共陽極（COM）沒有接到 +5 V，所以全暗。";
+		case "fifteen": {
+			const chip = r.chip ?? "74LS47";
+			return `${r.driver}（${chip}）的輸入 DCBA 是 1111，也就是 15：${chip} 遇到 15 本來就全暗，不是沒通電（沒接的輸入腳算 1）。`;
+		}
+		case "blanked": return `${r.driver}（74LS47）的消隱腳（/BI/RBO 或 /RBI）是 0，讓顯示器全暗。`;
+		case "driver-unpowered": return `${r.driver}（74LS47）沒有接好 VCC / GND，所以全暗。`;
+		case "unwired": return "a–g 都沒有被拉到 0：檢查 a–g 有沒有經過電阻接到 74LS47 的輸出。";
+	}
+}
+//#endregion
+//#region src/logic/sevenSeg.ts
+/** 亮的段（不管順序）對回 0–15；對不到任何字形時回傳 null。 */
+function valueOfSegments(lit) {
+	const key = [...lit].sort().join("");
+	const v = BCD_GLYPHS.findIndex((g) => [...g].sort().join("") === key);
+	return v < 0 ? null : v;
+}
+//#endregion
+//#region src/logic/verifyBreadboard.ts
+/** 子專案 30：按鈕對應的這一列要不要按住。 */
+function pressedFor(inputs, bits) {
+	const pressed = {};
+	inputs.forEach((b, k) => {
+		if (b.button && bits[k] !== void 0) pressed[b.switchId] = bits[k] === b.onIs;
+	});
+	return pressed;
+}
+/** 把每個對應到的開關撥成這一列的值（值 === onIs 就撥 ON）；沒對應到的開關維持原狀；按鈕不在這裡處理。 */
+function withSwitches(circuit, inputs, bits) {
+	const changes = /* @__PURE__ */ new Map();
+	inputs.forEach((b, k) => {
+		if (bits[k] === void 0 || b.button) return;
+		if (!changes.has(b.switchId)) changes.set(b.switchId, /* @__PURE__ */ new Map());
+		changes.get(b.switchId).set(b.index, bits[k] === b.onIs);
+	});
+	return {
+		...circuit,
+		components: circuit.components.map((c) => {
+			const set = changes.get(c.id);
+			if (!set) return c;
+			const states = [...c.props.switchStates ?? getComponentDefinition(c.defId)?.defaultProps.switchStates ?? []];
+			for (const [index, on] of set) states[index] = on;
+			return {
+				...c,
+				props: {
+					...c.props,
+					switchStates: states
+				}
+			};
+		})
+	};
+}
+/**
+* 規格（2026-10-13 logic-to-breadboard）第 7 節：真值表的每一列都在麵包板上模擬一次，讀 LED 亮不亮，和邏輯圖比較。
+* 顯示器（規格 2026-10-13 seven-seg 第 7 節）讀亮的段、對回數字。
+* 子專案 22：開關可以分在好幾個指撥開關上，每個開關自己決定撥 ON 是 1 還是 0。
+* 全暗的顯示器只有在 74LS47 的輸入真的是 15 時才算 15（沒通電、沒接好也是全暗，不能算對）。
+*/
+function verifyRows(d, circuit, bindings) {
+	const table = truthTable(d);
+	if (!table.ok) return {
+		rows: 0,
+		mismatches: []
+	};
+	const outputs = sortedIo(d).outputs.map((o) => ({
+		id: o.id,
+		display: o.kind === "DISPLAY",
+		segments: !!o.segments
+	}));
+	const cell = (b) => b === "X" ? "?" : b === "保持" || b === "不穩定" ? "X" : String(b);
+	return verifyExpected(circuit, bindings, outputs, table.rows.map((row) => ({
+		in: row.in,
+		out: row.out.map(cell)
+	})));
+}
+/** 子專案 37：陽極直接接在 +5 V 的 LED 是低態致動（陰極經過電阻接到輸出，訊號 0 時亮）。 */
+function activeLowLeds(sim) {
+	const vcc = new Set(sim.sources.filter((s) => s.level === 1).map((s) => s.node));
+	return new Set(sim.leds.filter((l) => l.anode !== null && vcc.has(l.anode)).map((l) => l.componentId));
+}
+/**
+* 逐列撥好開關、模擬、讀 LED 與顯示器，和期望值比較（`verifyRows` 與題目的比對共用）。
+* 子專案 37：LED 讀成訊號的值：陽極接 +5 V 的 LED 亮 = 0，其他 LED 亮 = 1。
+*/
+function verifyExpected(circuit, bindings, outputs, rows) {
+	const mismatches = [];
+	for (const row of rows) {
+		const sim = compileSimulation(withSwitches(circuit, bindings.inputs, row.in));
+		const result = settle(sim, initialSimState(sim), {
+			pressed: pressedFor(bindings.inputs, row.in),
+			clocks: {}
+		}).result;
+		const actual = readOutputs(sim, result, bindings, outputs);
+		if (row.out.some((e, k) => e !== "X" && e !== actual[k])) mismatches.push({
+			inputs: row.in.join(""),
+			expected: row.out,
+			actual
+		});
+	}
+	return {
+		rows: rows.length,
+		mismatches
+	};
+}
+/** 讀 LED 與顯示器，寫成和真值表 / 時序表一樣的格子。 */
+function readOutputs(sim, result, bindings, outputs) {
+	const lit = new Set(result.litLeds);
+	const low = activeLowLeds(sim);
+	return outputs.map((o) => {
+		if (!o.display) {
+			const led = bindings.leds[o.id] ?? "";
+			return lit.has(led) !== low.has(led) ? "1" : "0";
+		}
+		const id = bindings.displays[o.id] ?? "";
+		const shown = result.litSegments[id] ?? [];
+		if (o.segments) return segmentToken(shown);
+		const segments = shown.filter((s) => s !== "dp");
+		const dot = shown.includes("dp") ? "." : "";
+		if (segments.length === 0) return whyDark(sim, result, id)?.kind === "fifteen" ? `15${dot}` : "暗";
+		const v = valueOfSegments(segments);
+		return v === null ? "?" : `${v}${dot}`;
+	});
+}
+/** 子專案 46：時序電路比對的輸入組合：4 個以內每一種都試，超過時試 16 種固定的組合（全 0、全 1 與其他）。 */
+function sequenceCombos(count) {
+	const toBits = (r) => Array.from({ length: count }, (_, i) => r >> count - 1 - i & 1);
+	if (count <= 4) return Array.from({ length: 1 << count }, (_, r) => toBits(r));
+	const picks = /* @__PURE__ */ new Set([0, (1 << count) - 1]);
+	for (let k = 1; picks.size < 16; k++) picks.add(k * 2654435761 % (1 << count));
+	return [...picks].map(toBits);
+}
+/**
+* 子專案 46（規格 2026-10-24 sequential-logic 第 5 節）：時序電路的比對。每種輸入組合都從重設開始（麵包板的模擬也從全部 0 開始），
+* 送 VERIFY_PULSES 個脈衝，每一步（第 0 次到最後一次）比較每個輸出端、顯示器。不一致的那一列寫成「輸入 第 k 次」。
+*/
+function verifySequence(d, circuit, bindings, pulses = 16) {
+	const { inputs, outputs: sinks } = sortedIo(d);
+	const outputs = sinks.map((o) => ({
+		id: o.id,
+		display: o.kind === "DISPLAY",
+		segments: !!o.segments
+	}));
+	const clock = bindings.clock ?? "";
+	const combos = sequenceCombos(inputs.length);
+	const mismatches = [];
+	for (const bits of combos) {
+		const values = Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]]));
+		const table = sequenceTable(d, pulses, values);
+		const other = topoOrder(d).loop ? sequenceTable(d, pulses, values, 1) : table;
+		if (!table.ok) return {
+			rows: 0,
+			pulses,
+			mismatches: []
+		};
+		const sim = compileSimulation(withSwitches(circuit, bindings.inputs, bits));
+		const pressed = pressedFor(bindings.inputs, bits);
+		let state = initialSimState(sim);
+		const step = (level) => {
+			const r = settle(sim, state, {
+				pressed,
+				clocks: { [clock]: level }
+			});
+			state = r.state;
+			return r.result;
+		};
+		let result = step(0);
+		for (const row of table.rows) {
+			if (row.pulse > 0) {
+				step(1);
+				result = step(0);
+			}
+			const twin = other.ok ? other.rows.find((r) => r.pulse === row.pulse) : void 0;
+			const expected = row.out.map((b, k) => twin && twin.out[k] !== b ? "X" : b === "X" ? "?" : String(b));
+			const actual = readOutputs(sim, result, bindings, outputs);
+			if (expected.some((e, k) => e !== "X" && e !== actual[k])) {
+				mismatches.push({
+					inputs: `${bits.join("") || "（沒有其他輸入）"} 第 ${row.pulse} 次脈衝`,
+					expected,
+					actual
+				});
+				break;
+			}
+		}
+	}
+	return {
+		rows: combos.length,
+		pulses,
+		mismatches
+	};
+}
+/** 結果的白話說明（最多列 5 列）。 */
+function verifyText(r, outputs) {
+	if (r.pulses !== void 0 && r.mismatches.length === 0) return `${r.rows} 種輸入組合各送 ${r.pulses} 個脈衝，麵包板的模擬結果和時序表全部一致`;
+	if (r.mismatches.length === 0) return `${r.rows} 種輸入組合，麵包板的模擬結果和真值表全部一致`;
+	const pair = (bits) => outputs.map((name, i) => `${name} = ${bits[i] ?? "?"}`).join("、");
+	const list = r.mismatches.slice(0, 5).map((m) => `輸入 ${m.inputs} 應該是 ${pair(m.expected)}，麵包板是 ${pair(m.actual)}`).join("；");
+	return `有 ${r.mismatches.length} 列不一致：${list}${r.mismatches.length > 5 ? "…" : ""}`;
+}
+//#endregion
+//#region src/logic/diagramCheck.ts
+/** 某一類零件上的名稱 → 有這個名稱的位置（指撥開關是第幾個開關，其他零件是 0）。 */
+function labelsOf(circuit, category) {
+	const byName = /* @__PURE__ */ new Map();
+	for (const c of circuit.components) {
+		if (getComponentDefinition(c.defId)?.category !== category) continue;
+		(category === "dip-switch" ? c.props.labels ?? [] : (c.props.labels ?? []).slice(0, 1)).forEach((raw, index) => {
+			const name = raw.trim();
+			if (name) byName.set(name, [...byName.get(name) ?? [], {
+				id: c.id,
+				index
+			}]);
+		});
+	}
+	return byName;
+}
+function ioOfDiagram(d) {
+	const { inputs, outputs } = sortedIo(d);
+	return {
+		inputs: inputs.map((n) => ({
+			id: n.id,
+			name: n.name ?? n.id
+		})),
+		outputs: outputs.map((n) => ({
+			id: n.id,
+			name: n.name ?? n.id,
+			display: n.kind === "DISPLAY"
+		}))
+	};
+}
+/**
+* 規格第 2 節：依名稱把邏輯圖的輸入端、輸出端、顯示器對應到指撥開關的某一個開關、LED、7 段顯示器；
+* 開關一邊接到 +5 V 時撥 ON = 1，接到 GND 時撥 ON = 0。
+*/
+function bindByLabels(d, circuit) {
+	return bindByNames(ioOfDiagram(d), circuit);
+}
+/** 依名稱對應（邏輯圖與題目共用）。 */
+function bindByNames(io, circuit) {
+	const { inputs, outputs } = io;
+	const analysis = analyzeCircuit(circuit);
+	const switches = labelsOf(circuit, "dip-switch");
+	const buttons = labelsOf(circuit, "pushbutton");
+	const leds = labelsOf(circuit, "led");
+	const displays = labelsOf(circuit, "seven-seg");
+	const bindings = {
+		inputs: [],
+		leds: {},
+		displays: {}
+	};
+	const missing = [];
+	const twice = [];
+	const rails = [];
+	let matched = 0;
+	for (const node of inputs) {
+		const name = node.name;
+		const asButtons = (buttons.get(name) ?? []).map((f) => ({
+			...f,
+			button: true
+		}));
+		const found = [...(switches.get(name) ?? []).map((f) => ({
+			...f,
+			button: false
+		})), ...asButtons];
+		if (found.length === 0) {
+			missing.push(`輸入 ${name}：找不到名稱是 ${name} 的開關或按鈕`);
+			continue;
+		}
+		matched++;
+		if (found.length > 1) {
+			twice.push(`名稱 ${name} 用在好幾個開關或按鈕：${found.map((f) => f.button ? f.id : `${f.id} 第 ${f.index + 1} 個`).join("、")}`);
+			continue;
+		}
+		const { id, index } = found[0];
+		if (found[0].button) {
+			const kinds = [1, 3].map((p) => analysis.netByPin.get(`${id}#${p}`)?.kind).filter((k) => k === "power" || k === "ground");
+			if (kinds.length === 0) rails.push(`${id}（${name}）沒有接到 +5 V 或 GND`);
+			else if (kinds.length === 2) rails.push(`${id}（${name}）兩邊都接到電源`);
+			else bindings.inputs.push({
+				node: node.id,
+				switchId: id,
+				index: 0,
+				onIs: kinds[0] === "power" ? 1 : 0,
+				button: true
+			});
+			continue;
+		}
+		const n = getComponentDefinition(circuit.components.find((c) => c.id === id).defId).pins.length;
+		const kinds = [index + 1, n - index].map((p) => analysis.netByPin.get(`${id}#${p}`)?.kind).filter((k) => k === "power" || k === "ground");
+		const where = `${id} 第 ${index + 1} 個開關（${name}）`;
+		if (kinds.length === 0) rails.push(`${where}沒有接到 +5 V 或 GND`);
+		else if (kinds.length === 2) rails.push(`${where}兩邊都接到電源`);
+		else bindings.inputs.push({
+			node: node.id,
+			switchId: id,
+			index,
+			onIs: kinds[0] === "power" ? 1 : 0
+		});
+	}
+	for (const node of outputs) {
+		const { name, display } = node;
+		const found = (display ? displays : leds).get(name) ?? [];
+		if (found.length === 0) {
+			missing.push(display ? `顯示器 ${name}：找不到名稱是 ${name} 的 7 段顯示器` : `輸出 ${name}：找不到名稱是 ${name} 的 LED`);
+			continue;
+		}
+		matched++;
+		if (found.length > 1) {
+			twice.push(`名稱 ${name} 用在好幾${display ? "個 7 段顯示器" : "顆 LED"}：${found.map((f) => f.id).join("、")}`);
+			continue;
+		}
+		(display ? bindings.displays : bindings.leds)[node.id] = found[0].id;
+	}
+	return {
+		bindings,
+		issues: [
+			...missing,
+			...twice,
+			...rails
+		],
+		matched
+	};
+}
+/** 「A → SW1 第 1 個開關（ON = 1）、B → BTN1（按下 = 1）、X → D1」。 */
+function mappingText$1(io, b) {
+	const name = (id) => io.inputs.find((n) => n.id === id)?.name ?? id;
+	return [...b.inputs.map((s) => s.button ? `${name(s.node)} → ${s.switchId}（按下 = ${s.onIs}）` : `${name(s.node)} → ${s.switchId} 第 ${s.index + 1} 個開關（ON = ${s.onIs}）`), ...io.outputs.map((o) => `${o.name} → ${(o.display ? b.displays : b.leds)[o.id]}`)].join("、");
+}
+/** 規格第 3 節。 */
+function checkAgainstDiagram$1(d, circuit) {
+	if (circuit.components.length === 0) return { kind: "none" };
+	if (isSequential(d)) return checkSequence(d, circuit);
+	const table = truthTable(d);
+	if (!table.ok || table.inputs.length === 0 || table.outputs.length === 0) return { kind: "none" };
+	const { bindings, issues, matched } = bindByLabels(d, circuit);
+	if (matched === 0) return { kind: "hint" };
+	const all = [...issues];
+	if (table.rows.some((r) => r.out.includes("X"))) all.push("邏輯圖有些輸出不確定（還有沒接好的腳），先把邏輯圖接好");
+	if (all.length > 0) return {
+		kind: "incomplete",
+		issues: all
+	};
+	return {
+		kind: "done",
+		bindings,
+		result: verifyRows(d, circuit, bindings),
+		inputs: table.inputs,
+		outputs: table.outputs,
+		mapping: mappingText$1(ioOfDiagram(d), bindings)
+	};
+}
+/**
+* 子專案 46（規格 2026-10-24 sequential-logic 第 5 節）：時序電路依名稱對應開關、LED、顯示器，時脈對應到麵包板上唯一的時脈元件，
+* 每種輸入組合從重設開始送脈衝比對（verifySequence）。
+*/
+function checkSequence(d, circuit) {
+	if (!sequenceTable(d, 1).ok) return { kind: "none" };
+	const { bindings, issues, matched } = bindByLabels(d, circuit);
+	if (matched === 0) return { kind: "hint" };
+	const all = [...issues];
+	const clocks = circuit.components.filter((c) => getComponentDefinition(c.defId)?.category === "clock");
+	if (clocks.length === 0) all.push("麵包板上沒有時脈元件（邏輯圖的時脈要接到時脈元件）");
+	else if (clocks.length > 1) all.push(`麵包板上有好幾個時脈元件（${clocks.map((c) => c.id).join("、")}），比對時只能有一個`);
+	if (all.length > 0) return {
+		kind: "incomplete",
+		issues: all
+	};
+	const withClock = {
+		...bindings,
+		clock: clocks[0].id
+	};
+	const io = ioOfDiagram(d);
+	return {
+		kind: "done",
+		bindings: withClock,
+		result: verifySequence(d, circuit, withClock),
+		inputs: io.inputs.map((n) => n.name),
+		outputs: io.outputs.map((n) => n.name),
+		mapping: mappingText$1(io, withClock)
+	};
+}
+/**
+* 子專案 24（規格 2026-10-17 truth-table-task 第 4 節）：依名稱把麵包板對應到真值表題目，逐列模擬比對；X 的格子不比。
+* 題目的名稱當作對應的 id（開關的 `node` 就是輸入名稱）。
+*/
+function checkAgainstTask(task, circuit) {
+	if (!task || circuit.components.length === 0) return { kind: "none" };
+	const io = {
+		inputs: task.inputs.map((name) => ({
+			id: name,
+			name
+		})),
+		outputs: task.outputs.map((name) => ({
+			id: name,
+			name,
+			display: task.displays?.includes(name) ?? false
+		}))
+	};
+	const { bindings, issues, matched } = bindByNames(io, circuit);
+	if (matched === 0) return { kind: "hint" };
+	if (issues.length > 0) return {
+		kind: "incomplete",
+		issues
+	};
+	const rows = task.rows.map((out, r) => ({
+		in: rowBits(task, r),
+		out: out.map(String)
+	}));
+	return {
+		kind: "done",
+		bindings,
+		result: verifyExpected(circuit, bindings, io.outputs, rows),
+		inputs: task.inputs,
+		outputs: task.outputs,
+		mapping: mappingText$1(io, bindings)
+	};
+}
+//#endregion
+//#region src/logic/stateCheck.ts
+var text = (b) => b === 0 || b === 1 ? String(b) : "?";
+/**
+* 規格第 2、3 節：依名稱對應輸入、輸出與狀態位元（輸出端 Q0、Q1…），從重設開始走：
+* 每個走到的狀態、每種輸入組合先讀輸出（脈衝前），再送一個脈衝讀下一個狀態，和題目那一列比（X 的格子不比）。
+*/
+function compareDiagramToStateTask(d, task) {
+	if (d.nodes.length === 0) return { kind: "none" };
+	const bits = stateBitNames(task.states);
+	const inputs = new Map(d.nodes.filter((n) => n.kind === "INPUT").map((n) => [n.name ?? n.id, n.id]));
+	const outputs = new Map(d.nodes.filter((n) => n.kind === "OUTPUT").map((n) => [n.name ?? n.id, n.id]));
+	const clock = d.nodes.find((n) => n.kind === "CLOCK");
+	const issues = [];
+	if (!clock) issues.push("邏輯圖沒有時脈：放一個時脈，接到每個正反器的 CLK");
+	const missingBits = bits.filter((q) => !outputs.has(q));
+	if (missingBits.length > 0) issues.push(`要有輸出端 ${missingBits.join("、")}（接到正反器的 Q，Q0 是最低位元），才知道電路在哪個狀態`);
+	for (const name of task.inputs) if (!inputs.has(name)) issues.push(`題目的輸入 ${name} 在邏輯圖找不到輸入端`);
+	for (const name of inputs.keys()) if (!task.inputs.includes(name)) issues.push(`邏輯圖的輸入端 ${name} 不在題目裡`);
+	for (const name of task.outputs) if (!outputs.has(name)) issues.push(`題目的輸出 ${name} 在邏輯圖找不到輸出端`);
+	if (issues.length > 0) return {
+		kind: "issues",
+		issues
+	};
+	const clk = clock.id;
+	const valuesOf = (bits) => Object.fromEntries(task.inputs.map((name, b) => [inputs.get(name), bits[b]]));
+	const reader = (v) => (name) => text(v.nodes.get(outputs.get(name)));
+	return walkStateTask(task, {
+		reset: () => {
+			const v = evaluate$1(d, {
+				...valuesOf(task.inputs.map(() => 0)),
+				[clk]: 0
+			});
+			return {
+				handle: v.seq,
+				read: reader(v)
+			};
+		},
+		apply: (seq, bits, level) => {
+			const v = evaluate$1(d, {
+				...valuesOf(bits),
+				[clk]: level
+			}, seq);
+			return {
+				handle: v.seq,
+				read: reader(v)
+			};
+		}
+	});
+}
+/**
+* 規格第 2、3 節：從重設開始走：每個走到的狀態、每種輸入組合先讀輸出（脈衝前），再送一個脈衝讀下一個狀態，
+* 和題目那一列比（X 的格子不比）。
+*/
+function walkStateTask(task, machine) {
+	const bits = stateBitNames(task.states);
+	const m = task.inputs.length;
+	const bitsOf = (c) => Array.from({ length: m }, (_, b) => c >> m - 1 - b & 1);
+	/** 讀狀態位元：編碼（數字），有不確定的位元時是 null。 */
+	const codeOf = (read) => {
+		const qs = bits.map(read);
+		return qs.every((b) => b === "0" || b === "1") ? parseInt(qs.join(""), 2) : null;
+	};
+	const name = (code) => code === null ? "?" : code < task.states ? `S${code}` : code.toString(2).padStart(bits.length, "0");
+	const reset = machine.reset();
+	const start = codeOf(reset.read);
+	const mismatches = [];
+	const unusedCodes = [];
+	let rows = 0;
+	const seen = /* @__PURE__ */ new Set();
+	const queue = [];
+	if (start !== null) {
+		seen.add(start);
+		queue.push({
+			code: start,
+			handle: reset.handle
+		});
+	}
+	while (queue.length > 0) {
+		const { code, handle } = queue.shift();
+		if (code >= task.states) {
+			unusedCodes.push(name(code));
+			continue;
+		}
+		for (let c = 0; c < 1 << m; c++) {
+			const input = bitsOf(c);
+			const before = machine.apply(handle, input, 0);
+			const up = machine.apply(before.handle, input, 1);
+			const down = machine.apply(up.handle, input, 0);
+			const next = codeOf(down.read);
+			const row = code << m | c;
+			const want = task.rows[row];
+			const actual = task.outputs.map(before.read);
+			const expected = want.out.map(String);
+			rows++;
+			if (want.next !== "X" && want.next !== next || expected.some((e, k) => e !== "X" && e !== actual[k])) mismatches.push({
+				row,
+				state: code,
+				inputs: m === 0 ? "" : c.toString(2).padStart(m, "0"),
+				expectedNext: want.next === "X" ? "X" : `S${want.next}`,
+				actualNext: name(next),
+				expected,
+				actual
+			});
+			if (next !== null && !seen.has(next)) {
+				seen.add(next);
+				queue.push({
+					code: next,
+					handle: down.handle
+				});
+			}
+		}
+	}
+	const unreached = Array.from({ length: task.states }, (_, s) => s).filter((s) => !seen.has(s));
+	return {
+		kind: "done",
+		rows,
+		mismatches,
+		unreached,
+		unusedCodes,
+		...start === 0 ? {} : { resetAt: name(start) }
+	};
+}
+/** 一列不一致的白話：「S1、X = 1：題目 → S2、Z = 0；邏輯圖 → S0、Z = 1」（不在乎的輸出寫「任意」）。 */
+function mismatchText$1(m, task, what = "邏輯圖") {
+	const where = [`S${m.state}`, ...task.inputs.map((n, b) => `${n} = ${m.inputs[b]}`)].join("、");
+	const side = (next, outs) => [next === "X" ? "任意" : next, ...task.outputs.map((o, k) => `${o} = ${outs[k] === "X" ? "任意" : outs[k]}`)].join("、");
+	return `${where}：題目 → ${side(m.expectedNext, m.expected)}；${what} → ${side(m.actualNext, m.actual)}`;
+}
+/** 比對結果的總結與補充說明（網頁與 MCP 共用）。 */
+function comparisonNotes(r, task, what = "邏輯圖") {
+	return {
+		summary: r.mismatches.length === 0 ? `從 S0 開始比對了 ${r.rows} 列，${what}和狀態表全部一致${task.rows.some((row) => row.next === "X" || row.out.includes("X")) ? "（不在乎的格子不比）" : ""}` : `比對了 ${r.rows} 列，有 ${r.mismatches.length} 列不一致`,
+		notes: [
+			...r.resetAt ? [`重設後${what}在 ${r.resetAt}（應該是 S0，正反器都是 0）`] : [],
+			...r.unreached.length > 0 ? [`${r.unreached.map((s) => `S${s}`).join("、")} 從 S0 走不到，沒有比對`] : [],
+			...r.unusedCodes.length > 0 ? [`走到沒用到的編碼 ${r.unusedCodes.join("、")}，沒有往下比`] : []
+		]
+	};
+}
+//#endregion
+//#region src/logic/stateBreadboardCheck.ts
+/**
+* 規格第 2、3 節：依名稱把題目的輸入對應到開關或按鈕、輸出與狀態位元 Q0、Q1… 對應到 LED，時脈是麵包板上唯一的時脈元件；
+* 從麵包板模擬的上電狀態開始走（和邏輯圖用同一套走法）。換輸入時 IC 的內部狀態沿用，和實際撥開關一樣。
+*/
+function checkBreadboardAgainstStateTask(task, circuit) {
+	if (!task || circuit.components.length === 0) return { kind: "none" };
+	const bits = stateBitNames(task.states);
+	const io = {
+		inputs: task.inputs.map((name) => ({
+			id: name,
+			name
+		})),
+		outputs: [...task.outputs, ...bits].map((name) => ({
+			id: name,
+			name,
+			display: false
+		}))
+	};
+	const { bindings, issues, matched } = bindByNames(io, circuit);
+	if (matched === 0) return { kind: "hint" };
+	const all = issues.map((i) => bits.some((q) => i.startsWith(`輸出 ${q}：`)) ? `${i}（狀態位元：接到正反器的 Q，Q0 是最低位元）` : i);
+	const clocks = circuit.components.filter((c) => getComponentDefinition(c.defId)?.category === "clock");
+	if (clocks.length === 0) all.push("麵包板上沒有時脈元件（接到每個正反器的 CLK）");
+	else if (clocks.length > 1) all.push(`麵包板上有好幾個時脈元件（${clocks.map((c) => c.id).join("、")}），比對時只能有一個`);
+	if (all.length > 0) return {
+		kind: "incomplete",
+		issues: all
+	};
+	const clock = clocks[0].id;
+	const sims = /* @__PURE__ */ new Map();
+	const simOf = (input) => {
+		const key = input.join("");
+		if (!sims.has(key)) sims.set(key, compileSimulation(withSwitches(circuit, bindings.inputs, input)));
+		return sims.get(key);
+	};
+	const run = (previous, input, level) => {
+		const sim = simOf(input);
+		const r = settle(sim, adoptSimState(sim, previous), {
+			pressed: pressedFor(bindings.inputs, input),
+			clocks: { [clock]: level }
+		});
+		const lit = new Set(r.result.litLeds);
+		const low = activeLowLeds(sim);
+		const read = (name) => {
+			const led = bindings.leds[name] ?? "";
+			return lit.has(led) !== low.has(led) ? "1" : "0";
+		};
+		return {
+			handle: r.state,
+			read
+		};
+	};
+	return {
+		...walkStateTask(task, {
+			reset: () => run(void 0, task.inputs.map(() => 0), 0),
+			apply: (state, input, level) => run(state, input, level)
+		}),
+		mapping: mappingText(io, bindings)
+	};
+}
+/** 「X → SW1 第 1 個開關（ON = 1）、Z → D1、Q1 → D2、Q0 → D3、時脈」。 */
+function mappingText(io, b) {
+	return [...b.inputs.map((s) => s.button ? `${s.node} → ${s.switchId}（按下 = ${s.onIs}）` : `${s.node} → ${s.switchId} 第 ${s.index + 1} 個開關（ON = ${s.onIs}）`), ...io.outputs.map((o) => `${o.name} → ${b.leds[o.id]}`)].join("、");
 }
 //#endregion
 //#region src/editor/manualWire.ts
@@ -33739,13 +34693,13 @@ var EXPLAINERS = {
 	LED_NO_RESISTOR: explainLedNoResistor,
 	SHORT_CIRCUIT: explainShort
 };
-var cache$1 = /* @__PURE__ */ new WeakMap();
+var cache = /* @__PURE__ */ new WeakMap();
 /** 針對一個檢查錯誤產生解說。解說函式出錯時退回通用說明；同一個電路與錯誤只算一次。 */
 function explainIssue(circuit, issue) {
-	let perCircuit = cache$1.get(circuit);
+	let perCircuit = cache.get(circuit);
 	if (!perCircuit) {
 		perCircuit = /* @__PURE__ */ new WeakMap();
-		cache$1.set(circuit, perCircuit);
+		cache.set(circuit, perCircuit);
 	}
 	const cached = perCircuit.get(issue);
 	if (cached) return cached;
@@ -33974,468 +34928,6 @@ function applyRouting(circuit, result) {
 			end: { ...w.end },
 			path: w.path.map((p) => ({ ...p }))
 		}))
-	};
-}
-//#endregion
-//#region src/core/simulation/darkDisplay.ts
-/**
-* 7 段顯示器為什麼全暗（74LS47 輸入 15 時本來就全暗，和沒通電看起來一樣，要分開說）；有亮的段或不是顯示器時回傳 null。
-* 驅動它的 74LS47：輸出腳直接或經過一顆電阻接到顯示器的段。
-*/
-function whyDark(sim, result, displayId) {
-	const display = sim.displays.find((d) => d.componentId === displayId);
-	if (!display || (result.litSegments[displayId] ?? []).some((s) => s !== "dp")) return null;
-	const keyOf = /* @__PURE__ */ new Map();
-	for (const [key, node] of sim.nodeOfPin) if (!keyOf.has(node)) keyOf.set(node, key);
-	const levelAt = (node) => {
-		const key = node ? keyOf.get(node) : void 0;
-		return key ? result.pinLevels[key] ?? "Z" : "Z";
-	};
-	if (levelAt(display.common) !== (display.cathode ? 0 : 1)) return display.cathode ? {
-		kind: "no-power",
-		cathode: true
-	} : { kind: "no-power" };
-	const segments = new Set(display.segments.flatMap((s) => s.node ? [s.node] : []));
-	const near = new Set(segments);
-	for (const r of sim.resistors) {
-		if (segments.has(r.a)) near.add(r.b);
-		if (segments.has(r.b)) near.add(r.a);
-	}
-	for (const ic of sim.ics) {
-		const logic = getComponentDefinition(ic.defId)?.logic;
-		if (logic?.model !== "bcd7seg") continue;
-		const spec = logic;
-		if (!spec.segments.some((pin) => near.has(ic.pinNodes.get(pin) ?? ""))) continue;
-		const driver = ic.componentId;
-		if (result.unpowered.includes(driver)) return {
-			kind: "driver-unpowered",
-			driver
-		};
-		const read = (pin) => {
-			const v = levelAt(ic.pinNodes.get(pin));
-			return v === "Z" ? 1 : v;
-		};
-		if (read(spec.blanking) === 0) return {
-			kind: "blanked",
-			driver
-		};
-		const value = toNumber(spec.inputs.map(read));
-		if (value === 15 && read(spec.lampTest) !== 0) return spec.activeHigh ? {
-			kind: "fifteen",
-			driver,
-			chip: "74LS48"
-		} : {
-			kind: "fifteen",
-			driver
-		};
-		if (value === 0 && read(spec.rippleBlanking) === 0) return {
-			kind: "blanked",
-			driver
-		};
-	}
-	return { kind: "unwired" };
-}
-/** 全暗原因的說明文字。 */
-function darkReasonText(r) {
-	switch (r.kind) {
-		case "no-power": return r.cathode ? "共陰極（COM）沒有接到 GND，所以全暗。" : "共陽極（COM）沒有接到 +5 V，所以全暗。";
-		case "fifteen": {
-			const chip = r.chip ?? "74LS47";
-			return `${r.driver}（${chip}）的輸入 DCBA 是 1111，也就是 15：${chip} 遇到 15 本來就全暗，不是沒通電（沒接的輸入腳算 1）。`;
-		}
-		case "blanked": return `${r.driver}（74LS47）的消隱腳（/BI/RBO 或 /RBI）是 0，讓顯示器全暗。`;
-		case "driver-unpowered": return `${r.driver}（74LS47）沒有接好 VCC / GND，所以全暗。`;
-		case "unwired": return "a–g 都沒有被拉到 0：檢查 a–g 有沒有經過電阻接到 74LS47 的輸出。";
-	}
-}
-//#endregion
-//#region src/core/simulation/simulate.ts
-/** 7 段顯示器的段，依這個順序回報。 */
-var SEGMENT_ORDER = [
-	"a",
-	"b",
-	"c",
-	"d",
-	"e",
-	"f",
-	"g",
-	"dp"
-];
-var cache = /* @__PURE__ */ new WeakMap();
-/** 依電路參照快取；電路一改（包括切換指撥開關）就重新編譯，成本很低。 */
-function compileSimulation(circuit) {
-	const cached = cache.get(circuit);
-	if (cached) return cached;
-	const index = indexCircuit(circuit);
-	const uf = new UnionFind();
-	const groups = /* @__PURE__ */ new Set();
-	const touch = (g) => {
-		if (g) {
-			groups.add(g);
-			uf.find(g);
-		}
-		return g;
-	};
-	for (const w of circuit.wires) {
-		const a = touch(groupOfPoint(index, w.start));
-		const b = touch(groupOfPoint(index, w.end));
-		if (a && b) uf.union(a, b);
-	}
-	const groupOfPin = /* @__PURE__ */ new Map();
-	for (const pc of index.placed) {
-		for (const pin of pc.footprint.pins) {
-			const g = touch(groupOfPoint(index, pin.point));
-			if (g) groupOfPin.set(pinKey({
-				componentId: pc.instance.id,
-				pinNumber: pin.pinNumber
-			}), g);
-		}
-		for (const set of pc.def.internalConnections) {
-			const linked = set.map((n) => groupOfPin.get(pinKey({
-				componentId: pc.instance.id,
-				pinNumber: n
-			}))).filter((g) => !!g);
-			for (let i = 1; i < linked.length; i++) uf.union(linked[0], linked[i]);
-		}
-	}
-	const nodeOfGroup = new Map([...groups].sort().map((g) => [g, uf.find(g)]));
-	const nodeOfPin = new Map([...groupOfPin].map(([key, g]) => [key, uf.find(g)]));
-	const nodeOf = (componentId, pinNumber) => nodeOfPin.get(pinKey({
-		componentId,
-		pinNumber
-	})) ?? null;
-	const sim = {
-		circuit,
-		nodeOfGroup,
-		nodeOfPin,
-		switches: [],
-		buttons: [],
-		resistors: [],
-		sources: [],
-		clocks: [],
-		ics: [],
-		leds: [],
-		displays: []
-	};
-	for (const [g, node] of nodeOfGroup) {
-		const source = groupInfo(index, g)?.source;
-		if (source) sim.sources.push({
-			componentId: `post:${g}`,
-			node,
-			level: source === "vcc" ? 1 : 0
-		});
-	}
-	for (const pc of index.placed) {
-		const id = pc.instance.id;
-		const def = pc.def;
-		const props = propsOf(pc);
-		for (const pin of def.pins) {
-			const node = nodeOf(id, pin.number);
-			if (!node) continue;
-			if (pin.role === "vcc-source") sim.sources.push({
-				componentId: id,
-				node,
-				level: (props.voltage ?? 5) > 0 ? 1 : 0
-			});
-			if (pin.role === "gnd-source") sim.sources.push({
-				componentId: id,
-				node,
-				level: 0
-			});
-		}
-		switch (def.category) {
-			case "clock": {
-				const node = nodeOf(id, 1);
-				if (node) sim.clocks.push({
-					componentId: id,
-					node,
-					frequency: props.frequency ?? 1
-				});
-				break;
-			}
-			case "dip-switch": {
-				const n = def.pins.length;
-				const states = props.switchStates ?? [];
-				for (let k = 1; k <= n / 2; k++) {
-					const a = nodeOf(id, k);
-					const b = nodeOf(id, n + 1 - k);
-					if (a && b) sim.switches.push({
-						componentId: id,
-						index: k - 1,
-						a,
-						b,
-						closed: states[k - 1] === true
-					});
-				}
-				break;
-			}
-			case "pushbutton": {
-				const a = nodeOf(id, 1);
-				const b = nodeOf(id, 3);
-				if (a && b) sim.buttons.push({
-					componentId: id,
-					a,
-					b
-				});
-				break;
-			}
-			case "resistor": {
-				const a = nodeOf(id, 1);
-				const b = nodeOf(id, 2);
-				if (a && b) sim.resistors.push({
-					componentId: id,
-					a,
-					b
-				});
-				break;
-			}
-			case "led": {
-				const anode = def.pins.find((p) => p.role === "anode");
-				const cathode = def.pins.find((p) => p.role === "cathode");
-				sim.leds.push({
-					componentId: id,
-					anode: anode ? nodeOf(id, anode.number) : null,
-					cathode: cathode ? nodeOf(id, cathode.number) : null
-				});
-				break;
-			}
-			case "seven-seg": {
-				const cathode = def.pins.some((p) => p.name === "CC");
-				const anode = def.pins.find((p) => p.name === (cathode ? "CC" : "CA"));
-				const segments = def.pins.filter((p) => p.role === (cathode ? "anode" : "cathode")).sort((a, b) => SEGMENT_ORDER.indexOf(a.name) - SEGMENT_ORDER.indexOf(b.name)).map((p) => ({
-					name: p.name,
-					node: nodeOf(id, p.number)
-				}));
-				sim.displays.push({
-					componentId: id,
-					common: anode ? nodeOf(id, anode.number) : null,
-					cathode,
-					segments
-				});
-				break;
-			}
-			case "ic": {
-				if (!def.logic) break;
-				const counts = /* @__PURE__ */ new Map();
-				for (const p of def.pins) counts.set(p.name, (counts.get(p.name) ?? 0) + 1);
-				const pinNodes = /* @__PURE__ */ new Map();
-				for (const p of def.pins) {
-					const node = nodeOf(id, p.number);
-					if (node && counts.get(p.name) === 1) pinNodes.set(p.name, node);
-				}
-				const nodesWithRole = (role) => def.pins.filter((p) => p.role === role).map((p) => nodeOf(id, p.number) ?? `missing:${id}#${p.number}`);
-				if (def.logic.model === "timer555") {
-					const osc = `osc:${id}`;
-					pinNodes.set(OSC_PIN, osc);
-					sim.clocks.push({
-						componentId: id,
-						node: osc,
-						frequency: props.frequency ?? 1
-					});
-				}
-				sim.ics.push({
-					componentId: id,
-					defId: def.id,
-					model: createModel(def.logic),
-					pinNodes,
-					vccNodes: nodesWithRole("power"),
-					gndNodes: nodesWithRole("ground")
-				});
-				break;
-			}
-		}
-	}
-	cache.set(circuit, sim);
-	return sim;
-}
-/** 上電時的輸出：所有輸出腳都是未知（X），直到第一次求值。 */
-function powerUpOutputs(ic) {
-	return Object.fromEntries(ic.model.outputs.map((pin) => [pin, "X"]));
-}
-/**
-* 沿用前一份狀態中仍然存在、而且是同一種 IC 的內部狀態（例如只切換了開關、或只改了導線）；
-* 新放的 IC 從上電狀態開始。沒有前一份狀態時就是全新的上電狀態。
-*/
-function adoptSimState(sim, previous) {
-	const models = {};
-	const outputs = {};
-	for (const ic of sim.ics) {
-		const old = previous?.models[ic.componentId];
-		if (old && old.defId === ic.defId) {
-			models[ic.componentId] = old;
-			outputs[ic.componentId] = previous?.outputs[ic.componentId] ?? powerUpOutputs(ic);
-		} else {
-			models[ic.componentId] = {
-				defId: ic.defId,
-				state: ic.model.init()
-			};
-			outputs[ic.componentId] = powerUpOutputs(ic);
-		}
-	}
-	return {
-		models,
-		outputs
-	};
-}
-function initialSimState(sim) {
-	return adoptSimState(sim);
-}
-function combine(current, value) {
-	return current === void 0 || current === value ? value : "X";
-}
-/** 解析每個（動態）節點的電位：強驅動合併 → 沿電阻一層一層取弱驅動 → 其餘為 Z。 */
-function resolve$1(sim, node, outputs, inputs) {
-	const strongLevels = /* @__PURE__ */ new Map();
-	const drive = (n, v) => {
-		if (v === "Z") return;
-		const d = node(n);
-		strongLevels.set(d, combine(strongLevels.get(d), v));
-	};
-	for (const s of sim.sources) drive(s.node, s.level);
-	for (const c of sim.clocks) drive(c.node, inputs.clocks[c.componentId] ?? 0);
-	for (const ic of sim.ics) {
-		const out = outputs[ic.componentId] ?? {};
-		for (const pin of Object.keys(out).sort()) {
-			const n = ic.pinNodes.get(pin);
-			if (n) drive(n, out[pin]);
-		}
-	}
-	const levels = new Map(strongLevels);
-	/** 電位經電阻傳到還沒有電位的節點（弱電位）。 */
-	const throughResistors = () => {
-		for (let layer = 0; layer < sim.resistors.length + 1; layer++) {
-			const next = /* @__PURE__ */ new Map();
-			for (const r of sim.resistors) {
-				const a = node(r.a);
-				const b = node(r.b);
-				if (a === b) continue;
-				const va = levels.get(a);
-				const vb = levels.get(b);
-				if (va !== void 0 && vb === void 0) next.set(b, combine(next.get(b), va));
-				if (vb !== void 0 && va === void 0) next.set(a, combine(next.get(a), vb));
-			}
-			if (next.size === 0) break;
-			for (const [n, v] of next) levels.set(n, v);
-		}
-	};
-	throughResistors();
-	const ideal = /* @__PURE__ */ new Map();
-	const open = [...sim.switches.filter((s) => !s.closed), ...sim.buttons.filter((b) => !inputs.pressed[b.componentId])];
-	for (const s of open) {
-		const a = node(s.a);
-		const b = node(s.b);
-		if (a === b) continue;
-		const va = levels.get(a);
-		const vb = levels.get(b);
-		if ((va === 0 || va === 1) && vb === void 0) ideal.set(b, combine(ideal.get(b), va === 1 ? 0 : 1));
-		if ((vb === 0 || vb === 1) && va === void 0) ideal.set(a, combine(ideal.get(a), vb === 1 ? 0 : 1));
-	}
-	if (ideal.size > 0) {
-		for (const [n, v] of ideal) levels.set(n, v);
-		throughResistors();
-	}
-	return {
-		levels,
-		strong: new Set(strongLevels.keys())
-	};
-}
-function powered(ic, node, r) {
-	const is = (nodes, level) => nodes.length > 0 && nodes.every((n) => r.strong.has(node(n)) && r.levels.get(node(n)) === level);
-	return is(ic.vccNodes, 1) && is(ic.gndNodes, 0);
-}
-function sameOutputs(a, b) {
-	for (const id of /* @__PURE__ */ new Set([...Object.keys(a), ...Object.keys(b)])) {
-		const x = a[id] ?? {};
-		const y = b[id] ?? {};
-		const keys = /* @__PURE__ */ new Set([...Object.keys(x), ...Object.keys(y)]);
-		for (const k of keys) if ((x[k] ?? "Z") !== (y[k] ?? "Z")) return false;
-	}
-	return true;
-}
-/**
-* 依目前的輸入把電路算到穩定：所有 IC 每一輪讀同一份節點電位（結果與 IC 順序無關），
-* 循序 IC 比較上一次的輸入找出時脈邊緣；輸出不再改變就是穩定。
-*/
-function settle(sim, state, inputs) {
-	const dyn = new UnionFind();
-	for (const s of sim.switches) if (s.closed) dyn.union(s.a, s.b);
-	for (const b of sim.buttons) if (inputs.pressed[b.componentId]) dyn.union(b.a, b.b);
-	const node = (n) => dyn.find(n);
-	let models = { ...state.models };
-	let outputs = state.outputs;
-	for (const ic of sim.ics) if (!models[ic.componentId]) models[ic.componentId] = {
-		defId: ic.defId,
-		state: ic.model.init()
-	};
-	let resolved = resolve$1(sim, node, outputs, inputs);
-	let unpowered = [];
-	let stable = false;
-	let iterations = 0;
-	while (iterations < 100) {
-		iterations++;
-		const nextOutputs = {};
-		const nextModels = {};
-		unpowered = [];
-		for (const ic of sim.ics) {
-			const current = models[ic.componentId];
-			if (!powered(ic, node, resolved)) {
-				unpowered.push(ic.componentId);
-				nextOutputs[ic.componentId] = {};
-				nextModels[ic.componentId] = current;
-				continue;
-			}
-			const read = (pin) => {
-				const n = ic.pinNodes.get(pin);
-				const v = n ? resolved.levels.get(node(n)) : void 0;
-				return v === void 0 || v === "Z" ? 1 : v;
-			};
-			const r = ic.model.evaluate(read, current.state);
-			nextOutputs[ic.componentId] = r.outputs;
-			nextModels[ic.componentId] = {
-				defId: ic.defId,
-				state: r.state
-			};
-		}
-		models = nextModels;
-		const settled = sameOutputs(outputs, nextOutputs);
-		outputs = nextOutputs;
-		if (settled) {
-			stable = true;
-			break;
-		}
-		resolved = resolve$1(sim, node, outputs, inputs);
-	}
-	const levelOf = (n) => n ? resolved.levels.get(node(n)) ?? "Z" : "Z";
-	const groupLevels = {};
-	const conflicts = [];
-	for (const [g, n] of sim.nodeOfGroup) {
-		const v = levelOf(n);
-		groupLevels[g] = v;
-		if (v === "X") conflicts.push(g);
-	}
-	const pinLevels = {};
-	for (const [key, n] of sim.nodeOfPin) pinLevels[key] = levelOf(n);
-	const litLeds = sim.leds.filter((l) => levelOf(l.anode) === 1 && levelOf(l.cathode) === 0).map((l) => l.componentId);
-	const litSegments = {};
-	for (const d of sim.displays) {
-		const on = d.cathode ? 0 : 1;
-		litSegments[d.componentId] = levelOf(d.common) === on ? d.segments.filter((s) => levelOf(s.node) === (d.cathode ? 1 : 0)).map((s) => s.name) : [];
-	}
-	return {
-		state: {
-			models,
-			outputs
-		},
-		result: {
-			stable,
-			iterations,
-			groupLevels,
-			pinLevels,
-			litLeds,
-			litSegments,
-			unpowered,
-			conflicts
-		}
 	};
 }
 //#endregion
@@ -36325,413 +36817,6 @@ async function convertAndRouteParallel(d, options, routeMany, parallel, budget =
 	return step.value;
 }
 //#endregion
-//#region src/logic/sevenSeg.ts
-/** 亮的段（不管順序）對回 0–15；對不到任何字形時回傳 null。 */
-function valueOfSegments(lit) {
-	const key = [...lit].sort().join("");
-	const v = BCD_GLYPHS.findIndex((g) => [...g].sort().join("") === key);
-	return v < 0 ? null : v;
-}
-//#endregion
-//#region src/logic/verifyBreadboard.ts
-/** 子專案 30：按鈕對應的這一列要不要按住。 */
-function pressedFor(inputs, bits) {
-	const pressed = {};
-	inputs.forEach((b, k) => {
-		if (b.button && bits[k] !== void 0) pressed[b.switchId] = bits[k] === b.onIs;
-	});
-	return pressed;
-}
-/** 把每個對應到的開關撥成這一列的值（值 === onIs 就撥 ON）；沒對應到的開關維持原狀；按鈕不在這裡處理。 */
-function withSwitches(circuit, inputs, bits) {
-	const changes = /* @__PURE__ */ new Map();
-	inputs.forEach((b, k) => {
-		if (bits[k] === void 0 || b.button) return;
-		if (!changes.has(b.switchId)) changes.set(b.switchId, /* @__PURE__ */ new Map());
-		changes.get(b.switchId).set(b.index, bits[k] === b.onIs);
-	});
-	return {
-		...circuit,
-		components: circuit.components.map((c) => {
-			const set = changes.get(c.id);
-			if (!set) return c;
-			const states = [...c.props.switchStates ?? getComponentDefinition(c.defId)?.defaultProps.switchStates ?? []];
-			for (const [index, on] of set) states[index] = on;
-			return {
-				...c,
-				props: {
-					...c.props,
-					switchStates: states
-				}
-			};
-		})
-	};
-}
-/**
-* 規格（2026-10-13 logic-to-breadboard）第 7 節：真值表的每一列都在麵包板上模擬一次，讀 LED 亮不亮，和邏輯圖比較。
-* 顯示器（規格 2026-10-13 seven-seg 第 7 節）讀亮的段、對回數字。
-* 子專案 22：開關可以分在好幾個指撥開關上，每個開關自己決定撥 ON 是 1 還是 0。
-* 全暗的顯示器只有在 74LS47 的輸入真的是 15 時才算 15（沒通電、沒接好也是全暗，不能算對）。
-*/
-function verifyRows(d, circuit, bindings) {
-	const table = truthTable(d);
-	if (!table.ok) return {
-		rows: 0,
-		mismatches: []
-	};
-	const outputs = sortedIo(d).outputs.map((o) => ({
-		id: o.id,
-		display: o.kind === "DISPLAY",
-		segments: !!o.segments
-	}));
-	const cell = (b) => b === "X" ? "?" : b === "保持" || b === "不穩定" ? "X" : String(b);
-	return verifyExpected(circuit, bindings, outputs, table.rows.map((row) => ({
-		in: row.in,
-		out: row.out.map(cell)
-	})));
-}
-/** 子專案 37：陽極直接接在 +5 V 的 LED 是低態致動（陰極經過電阻接到輸出，訊號 0 時亮）。 */
-function activeLowLeds(sim) {
-	const vcc = new Set(sim.sources.filter((s) => s.level === 1).map((s) => s.node));
-	return new Set(sim.leds.filter((l) => l.anode !== null && vcc.has(l.anode)).map((l) => l.componentId));
-}
-/**
-* 逐列撥好開關、模擬、讀 LED 與顯示器，和期望值比較（`verifyRows` 與題目的比對共用）。
-* 子專案 37：LED 讀成訊號的值：陽極接 +5 V 的 LED 亮 = 0，其他 LED 亮 = 1。
-*/
-function verifyExpected(circuit, bindings, outputs, rows) {
-	const mismatches = [];
-	for (const row of rows) {
-		const sim = compileSimulation(withSwitches(circuit, bindings.inputs, row.in));
-		const result = settle(sim, initialSimState(sim), {
-			pressed: pressedFor(bindings.inputs, row.in),
-			clocks: {}
-		}).result;
-		const actual = readOutputs(sim, result, bindings, outputs);
-		if (row.out.some((e, k) => e !== "X" && e !== actual[k])) mismatches.push({
-			inputs: row.in.join(""),
-			expected: row.out,
-			actual
-		});
-	}
-	return {
-		rows: rows.length,
-		mismatches
-	};
-}
-/** 讀 LED 與顯示器，寫成和真值表 / 時序表一樣的格子。 */
-function readOutputs(sim, result, bindings, outputs) {
-	const lit = new Set(result.litLeds);
-	const low = activeLowLeds(sim);
-	return outputs.map((o) => {
-		if (!o.display) {
-			const led = bindings.leds[o.id] ?? "";
-			return lit.has(led) !== low.has(led) ? "1" : "0";
-		}
-		const id = bindings.displays[o.id] ?? "";
-		const shown = result.litSegments[id] ?? [];
-		if (o.segments) return segmentToken(shown);
-		const segments = shown.filter((s) => s !== "dp");
-		const dot = shown.includes("dp") ? "." : "";
-		if (segments.length === 0) return whyDark(sim, result, id)?.kind === "fifteen" ? `15${dot}` : "暗";
-		const v = valueOfSegments(segments);
-		return v === null ? "?" : `${v}${dot}`;
-	});
-}
-/** 子專案 46：時序電路比對的輸入組合：4 個以內每一種都試，超過時試 16 種固定的組合（全 0、全 1 與其他）。 */
-function sequenceCombos(count) {
-	const toBits = (r) => Array.from({ length: count }, (_, i) => r >> count - 1 - i & 1);
-	if (count <= 4) return Array.from({ length: 1 << count }, (_, r) => toBits(r));
-	const picks = /* @__PURE__ */ new Set([0, (1 << count) - 1]);
-	for (let k = 1; picks.size < 16; k++) picks.add(k * 2654435761 % (1 << count));
-	return [...picks].map(toBits);
-}
-/**
-* 子專案 46（規格 2026-10-24 sequential-logic 第 5 節）：時序電路的比對。每種輸入組合都從重設開始（麵包板的模擬也從全部 0 開始），
-* 送 VERIFY_PULSES 個脈衝，每一步（第 0 次到最後一次）比較每個輸出端、顯示器。不一致的那一列寫成「輸入 第 k 次」。
-*/
-function verifySequence(d, circuit, bindings, pulses = 16) {
-	const { inputs, outputs: sinks } = sortedIo(d);
-	const outputs = sinks.map((o) => ({
-		id: o.id,
-		display: o.kind === "DISPLAY",
-		segments: !!o.segments
-	}));
-	const clock = bindings.clock ?? "";
-	const combos = sequenceCombos(inputs.length);
-	const mismatches = [];
-	for (const bits of combos) {
-		const values = Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]]));
-		const table = sequenceTable(d, pulses, values);
-		const other = topoOrder(d).loop ? sequenceTable(d, pulses, values, 1) : table;
-		if (!table.ok) return {
-			rows: 0,
-			pulses,
-			mismatches: []
-		};
-		const sim = compileSimulation(withSwitches(circuit, bindings.inputs, bits));
-		const pressed = pressedFor(bindings.inputs, bits);
-		let state = initialSimState(sim);
-		const step = (level) => {
-			const r = settle(sim, state, {
-				pressed,
-				clocks: { [clock]: level }
-			});
-			state = r.state;
-			return r.result;
-		};
-		let result = step(0);
-		for (const row of table.rows) {
-			if (row.pulse > 0) {
-				step(1);
-				result = step(0);
-			}
-			const twin = other.ok ? other.rows.find((r) => r.pulse === row.pulse) : void 0;
-			const expected = row.out.map((b, k) => twin && twin.out[k] !== b ? "X" : b === "X" ? "?" : String(b));
-			const actual = readOutputs(sim, result, bindings, outputs);
-			if (expected.some((e, k) => e !== "X" && e !== actual[k])) {
-				mismatches.push({
-					inputs: `${bits.join("") || "（沒有其他輸入）"} 第 ${row.pulse} 次脈衝`,
-					expected,
-					actual
-				});
-				break;
-			}
-		}
-	}
-	return {
-		rows: combos.length,
-		pulses,
-		mismatches
-	};
-}
-/** 結果的白話說明（最多列 5 列）。 */
-function verifyText(r, outputs) {
-	if (r.pulses !== void 0 && r.mismatches.length === 0) return `${r.rows} 種輸入組合各送 ${r.pulses} 個脈衝，麵包板的模擬結果和時序表全部一致`;
-	if (r.mismatches.length === 0) return `${r.rows} 種輸入組合，麵包板的模擬結果和真值表全部一致`;
-	const pair = (bits) => outputs.map((name, i) => `${name} = ${bits[i] ?? "?"}`).join("、");
-	const list = r.mismatches.slice(0, 5).map((m) => `輸入 ${m.inputs} 應該是 ${pair(m.expected)}，麵包板是 ${pair(m.actual)}`).join("；");
-	return `有 ${r.mismatches.length} 列不一致：${list}${r.mismatches.length > 5 ? "…" : ""}`;
-}
-//#endregion
-//#region src/logic/diagramCheck.ts
-/** 某一類零件上的名稱 → 有這個名稱的位置（指撥開關是第幾個開關，其他零件是 0）。 */
-function labelsOf(circuit, category) {
-	const byName = /* @__PURE__ */ new Map();
-	for (const c of circuit.components) {
-		if (getComponentDefinition(c.defId)?.category !== category) continue;
-		(category === "dip-switch" ? c.props.labels ?? [] : (c.props.labels ?? []).slice(0, 1)).forEach((raw, index) => {
-			const name = raw.trim();
-			if (name) byName.set(name, [...byName.get(name) ?? [], {
-				id: c.id,
-				index
-			}]);
-		});
-	}
-	return byName;
-}
-function ioOfDiagram(d) {
-	const { inputs, outputs } = sortedIo(d);
-	return {
-		inputs: inputs.map((n) => ({
-			id: n.id,
-			name: n.name ?? n.id
-		})),
-		outputs: outputs.map((n) => ({
-			id: n.id,
-			name: n.name ?? n.id,
-			display: n.kind === "DISPLAY"
-		}))
-	};
-}
-/**
-* 規格第 2 節：依名稱把邏輯圖的輸入端、輸出端、顯示器對應到指撥開關的某一個開關、LED、7 段顯示器；
-* 開關一邊接到 +5 V 時撥 ON = 1，接到 GND 時撥 ON = 0。
-*/
-function bindByLabels(d, circuit) {
-	return bindByNames(ioOfDiagram(d), circuit);
-}
-/** 依名稱對應（邏輯圖與題目共用）。 */
-function bindByNames(io, circuit) {
-	const { inputs, outputs } = io;
-	const analysis = analyzeCircuit(circuit);
-	const switches = labelsOf(circuit, "dip-switch");
-	const buttons = labelsOf(circuit, "pushbutton");
-	const leds = labelsOf(circuit, "led");
-	const displays = labelsOf(circuit, "seven-seg");
-	const bindings = {
-		inputs: [],
-		leds: {},
-		displays: {}
-	};
-	const missing = [];
-	const twice = [];
-	const rails = [];
-	let matched = 0;
-	for (const node of inputs) {
-		const name = node.name;
-		const asButtons = (buttons.get(name) ?? []).map((f) => ({
-			...f,
-			button: true
-		}));
-		const found = [...(switches.get(name) ?? []).map((f) => ({
-			...f,
-			button: false
-		})), ...asButtons];
-		if (found.length === 0) {
-			missing.push(`輸入 ${name}：找不到名稱是 ${name} 的開關或按鈕`);
-			continue;
-		}
-		matched++;
-		if (found.length > 1) {
-			twice.push(`名稱 ${name} 用在好幾個開關或按鈕：${found.map((f) => f.button ? f.id : `${f.id} 第 ${f.index + 1} 個`).join("、")}`);
-			continue;
-		}
-		const { id, index } = found[0];
-		if (found[0].button) {
-			const kinds = [1, 3].map((p) => analysis.netByPin.get(`${id}#${p}`)?.kind).filter((k) => k === "power" || k === "ground");
-			if (kinds.length === 0) rails.push(`${id}（${name}）沒有接到 +5 V 或 GND`);
-			else if (kinds.length === 2) rails.push(`${id}（${name}）兩邊都接到電源`);
-			else bindings.inputs.push({
-				node: node.id,
-				switchId: id,
-				index: 0,
-				onIs: kinds[0] === "power" ? 1 : 0,
-				button: true
-			});
-			continue;
-		}
-		const n = getComponentDefinition(circuit.components.find((c) => c.id === id).defId).pins.length;
-		const kinds = [index + 1, n - index].map((p) => analysis.netByPin.get(`${id}#${p}`)?.kind).filter((k) => k === "power" || k === "ground");
-		const where = `${id} 第 ${index + 1} 個開關（${name}）`;
-		if (kinds.length === 0) rails.push(`${where}沒有接到 +5 V 或 GND`);
-		else if (kinds.length === 2) rails.push(`${where}兩邊都接到電源`);
-		else bindings.inputs.push({
-			node: node.id,
-			switchId: id,
-			index,
-			onIs: kinds[0] === "power" ? 1 : 0
-		});
-	}
-	for (const node of outputs) {
-		const { name, display } = node;
-		const found = (display ? displays : leds).get(name) ?? [];
-		if (found.length === 0) {
-			missing.push(display ? `顯示器 ${name}：找不到名稱是 ${name} 的 7 段顯示器` : `輸出 ${name}：找不到名稱是 ${name} 的 LED`);
-			continue;
-		}
-		matched++;
-		if (found.length > 1) {
-			twice.push(`名稱 ${name} 用在好幾${display ? "個 7 段顯示器" : "顆 LED"}：${found.map((f) => f.id).join("、")}`);
-			continue;
-		}
-		(display ? bindings.displays : bindings.leds)[node.id] = found[0].id;
-	}
-	return {
-		bindings,
-		issues: [
-			...missing,
-			...twice,
-			...rails
-		],
-		matched
-	};
-}
-/** 「A → SW1 第 1 個開關（ON = 1）、B → BTN1（按下 = 1）、X → D1」。 */
-function mappingText(io, b) {
-	const name = (id) => io.inputs.find((n) => n.id === id)?.name ?? id;
-	return [...b.inputs.map((s) => s.button ? `${name(s.node)} → ${s.switchId}（按下 = ${s.onIs}）` : `${name(s.node)} → ${s.switchId} 第 ${s.index + 1} 個開關（ON = ${s.onIs}）`), ...io.outputs.map((o) => `${o.name} → ${(o.display ? b.displays : b.leds)[o.id]}`)].join("、");
-}
-/** 規格第 3 節。 */
-function checkAgainstDiagram$1(d, circuit) {
-	if (circuit.components.length === 0) return { kind: "none" };
-	if (isSequential(d)) return checkSequence(d, circuit);
-	const table = truthTable(d);
-	if (!table.ok || table.inputs.length === 0 || table.outputs.length === 0) return { kind: "none" };
-	const { bindings, issues, matched } = bindByLabels(d, circuit);
-	if (matched === 0) return { kind: "hint" };
-	const all = [...issues];
-	if (table.rows.some((r) => r.out.includes("X"))) all.push("邏輯圖有些輸出不確定（還有沒接好的腳），先把邏輯圖接好");
-	if (all.length > 0) return {
-		kind: "incomplete",
-		issues: all
-	};
-	return {
-		kind: "done",
-		bindings,
-		result: verifyRows(d, circuit, bindings),
-		inputs: table.inputs,
-		outputs: table.outputs,
-		mapping: mappingText(ioOfDiagram(d), bindings)
-	};
-}
-/**
-* 子專案 46（規格 2026-10-24 sequential-logic 第 5 節）：時序電路依名稱對應開關、LED、顯示器，時脈對應到麵包板上唯一的時脈元件，
-* 每種輸入組合從重設開始送脈衝比對（verifySequence）。
-*/
-function checkSequence(d, circuit) {
-	if (!sequenceTable(d, 1).ok) return { kind: "none" };
-	const { bindings, issues, matched } = bindByLabels(d, circuit);
-	if (matched === 0) return { kind: "hint" };
-	const all = [...issues];
-	const clocks = circuit.components.filter((c) => getComponentDefinition(c.defId)?.category === "clock");
-	if (clocks.length === 0) all.push("麵包板上沒有時脈元件（邏輯圖的時脈要接到時脈元件）");
-	else if (clocks.length > 1) all.push(`麵包板上有好幾個時脈元件（${clocks.map((c) => c.id).join("、")}），比對時只能有一個`);
-	if (all.length > 0) return {
-		kind: "incomplete",
-		issues: all
-	};
-	const withClock = {
-		...bindings,
-		clock: clocks[0].id
-	};
-	const io = ioOfDiagram(d);
-	return {
-		kind: "done",
-		bindings: withClock,
-		result: verifySequence(d, circuit, withClock),
-		inputs: io.inputs.map((n) => n.name),
-		outputs: io.outputs.map((n) => n.name),
-		mapping: mappingText(io, withClock)
-	};
-}
-/**
-* 子專案 24（規格 2026-10-17 truth-table-task 第 4 節）：依名稱把麵包板對應到真值表題目，逐列模擬比對；X 的格子不比。
-* 題目的名稱當作對應的 id（開關的 `node` 就是輸入名稱）。
-*/
-function checkAgainstTask(task, circuit) {
-	if (!task || circuit.components.length === 0) return { kind: "none" };
-	const io = {
-		inputs: task.inputs.map((name) => ({
-			id: name,
-			name
-		})),
-		outputs: task.outputs.map((name) => ({
-			id: name,
-			name,
-			display: task.displays?.includes(name) ?? false
-		}))
-	};
-	const { bindings, issues, matched } = bindByNames(io, circuit);
-	if (matched === 0) return { kind: "hint" };
-	if (issues.length > 0) return {
-		kind: "incomplete",
-		issues
-	};
-	const rows = task.rows.map((out, r) => ({
-		in: rowBits(task, r),
-		out: out.map(String)
-	}));
-	return {
-		kind: "done",
-		bindings,
-		result: verifyExpected(circuit, bindings, io.outputs, rows),
-		inputs: task.inputs,
-		outputs: task.outputs,
-		mapping: mappingText(io, bindings)
-	};
-}
-//#endregion
 //#region src/logic/waveform.ts
 /** 時序表的每一欄變成一條線：最上面是時脈，再依表格的順序放輸出端與顯示器。 */
 function waveLanes(t) {
@@ -37642,10 +37727,28 @@ function checkText(d, task) {
 		...notes.map((n) => `（${n}）`)
 	].join("\n");
 }
+/** 子專案 62（規格 2026-11-14 breadboard-state-check 第 5 節）：麵包板和狀態表比對的文字。 */
+function breadboardText$1(f, task) {
+	const r = checkBreadboardAgainstStateTask(task, f.circuit);
+	if (r.kind === "none") return "麵包板上還沒有元件；可以用 logic_to_breadboard 轉換，或自己接";
+	if (r.kind === "hint") return `還不能比對：把開關、LED 的名稱設成題目上的名稱，狀態位元的 LED 叫 ${stateBitNames(task.states).join("、")}（可以用 set_part 設定）`;
+	if (r.kind === "incomplete") return `還不能比對：\n${r.issues.map((i) => `- ${i}`).join("\n")}`;
+	const { summary, notes } = comparisonNotes(r, task, "麵包板");
+	return [
+		summary,
+		...r.mismatches.map((m) => `- ${mismatchText$1(m, task, "麵包板")}`),
+		...notes.map((n) => `（${n}）`),
+		`對應：${r.mapping}`
+	].join("\n");
+}
 function stateTaskCheck(f) {
 	const task = f.logic.stateTask;
 	if (!task) return fail(NO_TASK$1);
-	return { text: `和狀態表比對（依名稱：題目的輸入、輸出，狀態位元是輸出端 ${stateBitNames(task.states).join("、")}）：${checkText(f.logic, task)}` };
+	return { text: [
+		`和狀態表比對（依名稱：題目的輸入、輸出；狀態位元 ${stateBitNames(task.states).join("、")} 在邏輯圖是輸出端，在麵包板是 LED）`,
+		`邏輯圖：${checkText(f.logic, task)}`,
+		`麵包板：${breadboardText$1(f, task)}`
+	].join("\n") };
 }
 //#endregion
 //#region src/logic/expression.ts
@@ -38379,7 +38482,7 @@ var server = new McpServer({
 	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
 	"從真值表題目開始：task_set → task_show → task_to_diagram → logic_to_breadboard → task_check。",
 	"時序電路（正反器、計數器）：logic_set 用 CLOCK 節點與 74LS74 / 76 / 90 / 93 / 161 / 193 方塊或單顆正反器 DFF / JKFF → logic_truth_table 看時序表與文字波形 → logic_to_breadboard。",
-	"從狀態表題目開始（時序電路的設計題）：state_task_set → state_task_to_diagram（用 DFF / JKFF 產生電路並列出化簡後的式子）→ logic_truth_table → logic_to_breadboard；自己畫的電路（logic_set，狀態位元接輸出端 Q0、Q1…）用 state_task_check 比對。"
+	"從狀態表題目開始（時序電路的設計題）：state_task_set → state_task_to_diagram（用 DFF / JKFF 產生電路並列出化簡後的式子）→ logic_truth_table → logic_to_breadboard；自己畫的電路（logic_set，狀態位元接輸出端 Q0、Q1…）或接好的麵包板（狀態位元的 LED 叫 Q0、Q1…）用 state_task_check 比對。"
 ].join("\n") });
 server.registerTool("list_files", {
 	title: "電路檔清單",
@@ -38659,7 +38762,7 @@ server.registerTool("state_task_to_diagram", {
 }, async (args) => withFile(args.file, (lab) => stateTaskToDiagram(lab)));
 server.registerTool("state_task_check", {
 	title: "和狀態表比對",
-	description: "拿狀態表題目和檔案裡的邏輯圖比對：依名稱對應輸入、輸出，狀態位元要是輸出端 Q0、Q1…（接到正反器的 Q）；從重設（S0）開始，每個走到的狀態、每種輸入先讀輸出再送一個脈衝，列出下一個狀態或輸出不一致的列（X 的格子不比）與走不到的狀態。",
+	description: "拿狀態表題目和檔案裡的邏輯圖、麵包板比對：依名稱對應輸入、輸出，狀態位元在邏輯圖要是輸出端 Q0、Q1…（接到正反器的 Q），在麵包板是名稱 Q0、Q1… 的 LED（輸入是開關或按鈕，要有一個時脈元件；可以用 set_part 設名稱）；從重設（S0）開始，每個走到的狀態、每種輸入先讀輸出再送一個脈衝，列出下一個狀態或輸出不一致的列（X 的格子不比）與走不到的狀態。",
 	inputSchema: { file }
 }, async (args) => withFile(args.file, (lab) => stateTaskCheck(lab)));
 if (isMainThread) await server.connect(new StdioServerTransport());
