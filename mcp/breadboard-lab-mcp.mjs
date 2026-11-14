@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.14（commit 78e9215）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.14（commit befb654）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -29253,7 +29253,7 @@ function updateComponentProps(circuit, id, patch) {
 /** 名稱可以設幾個：指撥開關每個開關一個、LED 一個，其他元件沒有。 */
 function labelSlots(instance) {
 	const def = definitionOf(instance.defId);
-	if (def.category === "led" || def.category === "seven-seg") return 1;
+	if (def.category === "led" || def.category === "seven-seg" || def.category === "pushbutton" || def.category === "clock") return 1;
 	if (def.category === "dip-switch") return (instance.props.switchStates ?? def.defaultProps.switchStates ?? []).length;
 	return 0;
 }
@@ -29641,7 +29641,6 @@ function emptyDiagram() {
 	};
 }
 var isGate = (kind) => GATE_KINDS.includes(kind);
-/** 沒有輸入腳、只當線的來源：輸入端、5V、GND、時脈。 */
 var isSource = (kind) => kind === "INPUT" || kind === "HIGH" || kind === "LOW" || kind === "CLOCK";
 /** 訊號名稱：方塊第 k 個輸出（k > 0）是 `${id}.${k}`，其他都是節點 id。 */
 var signalOf = (from, fromPin) => fromPin ? `${from}.${fromPin}` : from;
@@ -30914,16 +30913,33 @@ function truthTable(d) {
 function memoryKey(seq) {
 	return Object.keys(seq).filter((k) => k.startsWith(LOOP_KEY)).sort().map((k) => `${k}=${seq[k].out[0]}`).join(",");
 }
+/** 子專案 64：圖上的時脈，依名稱排序。 */
+function clockNodes(d) {
+	return d.nodes.filter((n) => n.kind === "CLOCK").sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id, "en", { numeric: true }));
+}
+/** 子專案 64：輪流送每一個時脈的順序（比對麵包板時用，每個時脈都比得到）。 */
+var allClocks = (d) => clockNodes(d).map((n) => n.name ?? n.id);
 /**
 * 子專案 46（規格 2026-10-24 sequential-logic 第 4 節）：從重設（全部 0）開始，其他輸入用 values（沒給時用開關目前的值），
 * 送 pulses 個脈衝（0 → 1 → 0），列出每次之後每個輸出端、顯示器的值。
 */
-/** 子專案 60：seed 是迴授（閂鎖）上電時的值（預設 0）。 */
-function sequenceTable(d, pulses = 16, values = {}, seed = 0) {
-	const clock = d.nodes.find((n) => n.kind === "CLOCK");
-	if (!clock) return {
+/**
+* 子專案 60：seed 是迴授（閂鎖）上電時的值（預設 0）。
+* 子專案 64：order 是時脈名稱的清單，照順序一直重複送；沒給時送名稱排第一個的時脈。每次送一個時脈，其他時脈留在 0。
+*/
+function sequenceTable(d, pulses = 16, values = {}, seed = 0, order) {
+	const clocks = clockNodes(d);
+	if (clocks.length === 0) return {
 		ok: false,
 		reason: "no-clock"
+	};
+	const byName = new Map(clocks.map((n) => [n.name ?? n.id, n]));
+	const names = order && order.length > 0 ? order : [clocks[0].name ?? clocks[0].id];
+	const unknown = names.filter((n) => !byName.has(n));
+	if (unknown.length > 0) return {
+		ok: false,
+		reason: "bad-order",
+		unknown
 	};
 	const { outputs } = sortedIo(d);
 	if (outputs.length === 0) return {
@@ -30931,31 +30947,37 @@ function sequenceTable(d, pulses = 16, values = {}, seed = 0) {
 		reason: "empty"
 	};
 	const read = (v) => outputs.map((o) => o.kind === "DISPLAY" ? displayValue(o, v) : v.nodes.get(o.id) ?? "X");
+	const low = Object.fromEntries(clocks.map((n) => [n.id, 0]));
 	let v = evaluate$1(d, {
 		...values,
-		[clock.id]: 0
+		...low
 	}, seed === 0 ? void 0 : powerOnState(seed));
 	const rows = [{
 		pulse: 0,
 		out: read(v)
 	}];
 	for (let k = 1; k <= pulses; k++) {
+		const name = names[(k - 1) % names.length];
+		const id = byName.get(name).id;
 		const up = evaluate$1(d, {
 			...values,
-			[clock.id]: 1
+			...low,
+			[id]: 1
 		}, v.seq);
 		v = evaluate$1(d, {
 			...values,
-			[clock.id]: 0
+			...low
 		}, up.seq);
 		rows.push({
 			pulse: k,
-			out: read(v)
+			out: read(v),
+			clock: name
 		});
 	}
 	return {
 		ok: true,
-		clock: clock.name ?? clock.id,
+		clock: names[0],
+		clocks: clocks.map((n) => n.name ?? n.id),
 		outputs: outputs.map((n) => n.name ?? n.id),
 		display: outputs.map((n) => n.kind === "DISPLAY"),
 		rows
@@ -31876,7 +31898,7 @@ function parseLogicDiagram(raw) {
 			}
 		}
 		nodes.forEach((a, i) => nodes.slice(i + 1).forEach((b) => overlaps(a, b) && fail$2(`元件 ${a.id} 和 ${b.id} 重疊`)));
-		if (nodes.filter((n) => n.kind === "CLOCK").length > 1) fail$2("一張圖只能有一個時脈");
+		if (nodes.filter((n) => n.kind === "CLOCK").length > 4) fail$2(`一張圖最多 4 個時脈`);
 		const wires = r.wires.map((w, i) => parseWire$1(w, i, byId));
 		const ids = /* @__PURE__ */ new Set();
 		const pins = /* @__PURE__ */ new Set();
@@ -33391,13 +33413,14 @@ function verifySequence(d, circuit, bindings, pulses = 16) {
 		display: o.kind === "DISPLAY",
 		segments: !!o.segments
 	}));
-	const clock = bindings.clock ?? "";
+	const order = allClocks(d);
+	const clockOf = (name) => (name !== void 0 ? bindings.clocks?.[name] : void 0) ?? bindings.clock ?? "";
 	const combos = sequenceCombos(inputs.length);
 	const mismatches = [];
 	for (const bits of combos) {
 		const values = Object.fromEntries(inputs.map((n, i) => [n.id, bits[i]]));
-		const table = sequenceTable(d, pulses, values);
-		const other = topoOrder(d).loop ? sequenceTable(d, pulses, values, 1) : table;
+		const table = sequenceTable(d, pulses, values, 0, order);
+		const other = topoOrder(d).loop ? sequenceTable(d, pulses, values, 1, order) : table;
 		if (!table.ok) return {
 			rows: 0,
 			pulses,
@@ -33406,10 +33429,10 @@ function verifySequence(d, circuit, bindings, pulses = 16) {
 		const sim = compileSimulation(withSwitches(circuit, bindings.inputs, bits));
 		const pressed = pressedFor(bindings.inputs, bits);
 		let state = initialSimState(sim);
-		const step = (level) => {
+		const step = (level, clock = "") => {
 			const r = settle(sim, state, {
 				pressed,
-				clocks: { [clock]: level }
+				clocks: level === 1 ? { [clock]: 1 } : {}
 			});
 			state = r.state;
 			return r.result;
@@ -33417,7 +33440,7 @@ function verifySequence(d, circuit, bindings, pulses = 16) {
 		let result = step(0);
 		for (const row of table.rows) {
 			if (row.pulse > 0) {
-				step(1);
+				step(1, clockOf(row.clock));
 				result = step(0);
 			}
 			const twin = other.ok ? other.rows.find((r) => r.pulse === row.pulse) : void 0;
@@ -33574,7 +33597,11 @@ function bindByNames(io, circuit) {
 /** 「A → SW1 第 1 個開關（ON = 1）、B → BTN1（按下 = 1）、X → D1」。 */
 function mappingText$1(io, b) {
 	const name = (id) => io.inputs.find((n) => n.id === id)?.name ?? id;
-	return [...b.inputs.map((s) => s.button ? `${name(s.node)} → ${s.switchId}（按下 = ${s.onIs}）` : `${name(s.node)} → ${s.switchId} 第 ${s.index + 1} 個開關（ON = ${s.onIs}）`), ...io.outputs.map((o) => `${o.name} → ${(o.display ? b.displays : b.leds)[o.id]}`)].join("、");
+	return [
+		...b.inputs.map((s) => s.button ? `${name(s.node)} → ${s.switchId}（按下 = ${s.onIs}）` : `${name(s.node)} → ${s.switchId} 第 ${s.index + 1} 個開關（ON = ${s.onIs}）`),
+		...io.outputs.map((o) => `${o.name} → ${(o.display ? b.displays : b.leds)[o.id]}`),
+		...Object.keys(b.clocks ?? {}).length > 1 ? Object.entries(b.clocks).map(([name, id]) => `${name} → ${id}`) : []
+	].join("、");
 }
 /** 規格第 3 節。 */
 function checkAgainstDiagram$1(d, circuit) {
@@ -33609,15 +33636,24 @@ function checkSequence(d, circuit) {
 	if (matched === 0) return { kind: "hint" };
 	const all = [...issues];
 	const clocks = circuit.components.filter((c) => getComponentDefinition(c.defId)?.category === "clock");
+	const names = allClocks(d);
+	const byName = {};
 	if (clocks.length === 0) all.push("麵包板上沒有時脈元件（邏輯圖的時脈要接到時脈元件）");
-	else if (clocks.length > 1) all.push(`麵包板上有好幾個時脈元件（${clocks.map((c) => c.id).join("、")}），比對時只能有一個`);
+	else if (names.length === 1 && clocks.length === 1) byName[names[0]] = clocks[0].id;
+	else for (const name of names) {
+		const found = clocks.filter((c) => (c.props.labels?.[0] ?? "").trim() === name);
+		if (found.length === 1) byName[name] = found[0].id;
+		else if (found.length === 0) all.push(`時脈 ${name}：找不到名稱是 ${name} 的時脈元件（麵包板上有好幾個時脈元件時，用名稱對應）`);
+		else all.push(`名稱 ${name} 用在好幾個時脈元件：${found.map((c) => c.id).join("、")}`);
+	}
 	if (all.length > 0) return {
 		kind: "incomplete",
 		issues: all
 	};
 	const withClock = {
 		...bindings,
-		clock: clocks[0].id
+		clock: byName[names[0]],
+		clocks: byName
 	};
 	const io = ioOfDiagram(d);
 	return {
@@ -33680,6 +33716,7 @@ function compareDiagramToStateTask(d, task) {
 	const clock = d.nodes.find((n) => n.kind === "CLOCK");
 	const issues = [];
 	if (!clock) issues.push("邏輯圖沒有時脈：放一個時脈，接到每個正反器的 CLK");
+	else if (d.nodes.filter((n) => n.kind === "CLOCK").length > 1) issues.push("邏輯圖有好幾個時脈；狀態表題目的電路只能有一個時脈，接到每個正反器的 CLK");
 	const missingBits = bits.filter((q) => !outputs.has(q));
 	if (missingBits.length > 0) issues.push(`要有輸出端 ${missingBits.join("、")}（接到正反器的 Q，Q0 是最低位元），才知道電路在哪個狀態`);
 	for (const name of task.inputs) if (!inputs.has(name)) issues.push(`題目的輸入 ${name} 在邏輯圖找不到輸入端`);
@@ -35933,15 +35970,21 @@ function build(d, options, layout, variant) {
 			plusBottom: `P${a + 2}+`
 		};
 	};
-	const clockNode = d.nodes.find((n) => n.kind === "CLOCK");
-	if (clockNode) {
-		blocks[1].push({
+	const clockBlocks = /* @__PURE__ */ new Map();
+	clockNodes(d).forEach((clockNode, k) => {
+		const id = `CLK${k + 1}`;
+		const block = {
 			width: 2,
 			rank: 0,
-			place: (x, area) => components.push(comp("CLK1", "clock", hole(`C${x}`, area), { board: boardNow }))
-		});
-		tie("CLK1#1", clockNode.id);
-	}
+			place: (x, area) => components.push(comp(id, "clock", hole(`C${x}`, area), {
+				board: boardNow,
+				props: { labels: [clockNode.name ?? ""] }
+			}))
+		};
+		blocks[1].push(block);
+		clockBlocks.set(block, clockNode.id);
+		tie(`${id}#1`, clockNode.id);
+	});
 	const useButtons = options.inputs === "button";
 	const buttonIds = inputs.map((_, k) => `BTN${k + 1}`);
 	if (useButtons) inputs.forEach((node, k) => {
@@ -36324,9 +36367,8 @@ function build(d, options, layout, variant) {
 			...blocks[3],
 			...icBlocks
 		];
-		const clock = all.find((blk) => blk.rank === 0);
-		if (clock && clockNode) {
-			const users = Object.entries(netOf).flatMap(([pin, net]) => net === clockNode.id ? [parts.of.get(pin.split("#")[0])] : []).filter((p) => p !== void 0);
+		for (const [clock, clockNode] of clockBlocks) {
+			const users = Object.entries(netOf).flatMap(([pin, net]) => net === clockNode ? [parts.of.get(pin.split("#")[0])] : []).filter((p) => p !== void 0);
 			clock.part = users.length > 0 ? Math.min(...users) : 0;
 		}
 		all.sort((x, y) => (x.part ?? 0) - (y.part ?? 0) || (x.rank ?? 0) - (y.rank ?? 0));
@@ -36873,13 +36915,13 @@ async function convertAndRouteParallel(d, options, routeMany, parallel, budget =
 }
 //#endregion
 //#region src/logic/waveform.ts
-/** 時序表的每一欄變成一條線：最上面是時脈，再依表格的順序放輸出端與顯示器。 */
+/** 時序表的每一欄變成一條線：最上面是時脈（子專案 64：每個時脈一條，只有送了它的格子有脈衝），再依表格的順序放輸出端與顯示器。 */
 function waveLanes(t) {
-	return [{
-		name: t.clock,
+	return [...t.clocks.map((name) => ({
+		name,
 		kind: "clock",
-		values: t.rows.map((r) => r.pulse === 0 ? 0 : 1)
-	}, ...t.outputs.map((name, i) => ({
+		values: t.rows.map((r) => r.pulse > 0 && (r.clock ?? t.clock) === name ? 1 : 0)
+	})), ...t.outputs.map((name, i) => ({
 		name,
 		kind: t.display[i] ? "value" : "bit",
 		values: t.rows.map((r) => r.out[i])
@@ -37521,7 +37563,7 @@ function logicSet(f, args) {
 var NO_LOGIC = "檔案裡還沒有邏輯圖；用 logic_set 寫入";
 function logicTruthTable(f, args = {}) {
 	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
-	if (isSequential(f.logic)) return sequenceReply(f.logic, args.pulses ?? 16);
+	if (isSequential(f.logic)) return sequenceReply(f.logic, args.pulses ?? 16, args.clocks);
 	const t = truthTable(f.logic);
 	if (!t.ok) {
 		if (t.reason === "too-many") return { text: `輸入超過 12 個，真值表太長，不列出。` };
@@ -37543,19 +37585,17 @@ function logicTruthTable(f, args = {}) {
 	return { text: lines.join("\n") };
 }
 /** 子專案 46（規格 2026-10-24 sequential-logic 第 6 節）：時序表的文字（從重設開始，其他輸入用檔案裡開關的值）。 */
-function sequenceReply(d, pulses) {
-	const t = sequenceTable(d, Math.max(1, Math.min(64, Math.floor(pulses))));
+function sequenceReply(d, pulses, clocks) {
+	const t = sequenceTable(d, Math.max(1, Math.min(64, Math.floor(pulses))), {}, 0, clocks);
 	if (!t.ok) {
+		if (t.reason === "bad-order") return fail(`沒有叫 ${t.unknown.join("、")} 的時脈；圖上的時脈：${allClocks(d).join("、")}`);
 		if (t.reason === "no-clock") return { text: "這是時序電路（有正反器或計數器），但沒有時脈：加一個 kind 為 CLOCK 的節點，接到 CLK 腳。" };
 		return { text: "邏輯圖沒有輸出端或 7 段顯示器。" };
 	}
 	const cell = (v) => v === "X" ? "?" : String(v);
 	const inputs = sortedIo(d).inputs;
-	const lines = [
-		`時序表（從重設開始：正反器、計數器都是 0；${inputs.length > 0 ? `其他輸入：${inputs.map((n) => `${n.name} = ${n.value ?? 0}`).join("、")}` : "沒有其他輸入"}）：`,
-		`${t.clock} 第幾次 | ${t.outputs.join(" ")}`,
-		...t.rows.map((r) => `${r.pulse} | ${r.out.map(cell).join(" ")}`)
-	];
+	const multi = t.clocks.length > 1;
+	const lines = [`時序表（從重設開始：正反器、計數器都是 0；${inputs.length > 0 ? `其他輸入：${inputs.map((n) => `${n.name} = ${n.value ?? 0}`).join("、")}` : "沒有其他輸入"}）：`, ...multi ? [`第幾次 時脈 | ${t.outputs.join(" ")}`, ...t.rows.map((r) => `${r.pulse} ${r.clock ?? "-"} | ${r.out.map(cell).join(" ")}`)] : [`${t.clock} 第幾次 | ${t.outputs.join(" ")}`, ...t.rows.map((r) => `${r.pulse} | ${r.out.map(cell).join(" ")}`)]];
 	if (t.display.some((d) => !d)) lines.push("", "波形（每格是那次脈衝之後的值；‾ 是 1、_ 是 0、? 是不確定；時脈每個 | 是一個脈衝）：", waveText(t));
 	const issues = checkDiagram(d);
 	if (issues.length > 0) lines.push("", "檢查：", ...issues.map((i) => `- ${i.message}`));
@@ -38538,7 +38578,7 @@ var server = new McpServer({
 	"建議流程：new_circuit → list_parts（查元件名稱與腳位）→ place_part（IC 第 1 腳放在 F 列，跨過凹槽）→ add_wire → check_circuit → auto_route → simulate。",
 	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
 	"從真值表題目開始：task_set → task_show → task_to_diagram → logic_to_breadboard → task_check。",
-	"時序電路（正反器、計數器）：logic_set 用 CLOCK 節點與 74LS74 / 76 / 90 / 93 / 161 / 193 方塊或單顆正反器 DFF / JKFF → logic_truth_table 看時序表與文字波形 → logic_to_breadboard。",
+	"時序電路（正反器、計數器）：logic_set 用 CLOCK 節點（最多 4 個，各自獨立）與 74LS74 / 76 / 90 / 93 / 161 / 193 方塊或單顆正反器 DFF / JKFF → logic_truth_table 看時序表與文字波形（好幾個時脈時用 clocks 指定送的順序）→ logic_to_breadboard。",
 	"從狀態表題目開始（時序電路的設計題）：state_task_set → state_task_to_diagram（用 DFF / JKFF 產生電路並列出化簡後的式子）→ logic_truth_table → logic_to_breadboard；自己畫的電路（logic_set，狀態位元接輸出端 Q0、Q1…）或接好的麵包板（狀態位元的 LED 叫 Q0、Q1…）用 state_task_check 比對。"
 ].join("\n") });
 server.registerTool("list_files", {
@@ -38675,7 +38715,7 @@ server.registerTool("logic_set", {
 	description: [
 		"寫入（取代）電路檔裡的邏輯圖。節點種類：AND、OR、NAND、NOR（inputs 2–4）、NOT、XOR、INPUT、OUTPUT（要有 name；activeLow: true 是低態致動，0 時亮，轉成麵包板時 LED 正極接 +5 V、負極經過電阻接到輸出）、DISPLAY（7 段顯示器，name）、",
 		"HIGH（5V）、LOW（GND）、BLOCK（chip：74LS83、74LS151、74LS153、74LS138、74LS85；時序 IC：74LS74 雙 D 正反器、74LS76 雙 JK 正反器、74LS90、74LS93、74LS161、74LS193 計數器；單顆正反器 DFF（D、CLK、/PRE、/CLR → Q、/Q）、JKFF（J、CLK、K、/PRE、/CLR → Q、/Q），轉成麵包板時兩顆合用一片 74LS74 / 74LS76；輸入可以不接：清除 / 預設 / 載入不用、資料 0、時脈 1）、",
-		"CLOCK（時脈，name，一張圖最多一個；接到正反器、計數器的 CLK）。腳的順序用 BLOCK 的腳名（和 74LS 資料表一樣），fromPin 是第幾個輸出。",
+		"CLOCK（時脈，name，一張圖最多 4 個，各自接不同的正反器、計數器的 CLK；轉成麵包板時每個時脈一個時脈元件，名稱一樣）。腳的順序用 BLOCK 的腳名（和 74LS 資料表一樣），fromPin 是第幾個輸出。",
 		"線：{ id, from, fromPin?（方塊的第幾個輸出）, to: { node, pin } }。節點沒有 x、y 時自動排版。",
 		"閘的輸出可以接回前面（迴授，例如 NAND 交叉接成的 SR 閂鎖）。輸入端最多 12 個；名稱英文字母開頭、最多 8 個英數字（Q̄ 寫成 QBAR、清除寫成 CLR）。"
 	].join(""),
@@ -38689,12 +38729,16 @@ server.registerTool("logic_set", {
 }, async ({ file: f, diagram }) => withFile(f, (lab) => logicSet(lab, { diagram })));
 server.registerTool("logic_truth_table", {
 	title: "真值表",
-	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元，最多 12 個輸入）、每個輸出的布林式（照圖寫出來與化簡後）與檢查結果。有迴授（閂鎖）時，輸出跟之前的狀態有關的格子寫「保持」，一直來回跳的寫「不穩定」。時序電路（有正反器、計數器或時脈）回傳時序表：從重設開始每次脈衝之後的輸出，再加一段文字波形（每格一個字元，‾ 是 1、_ 是 0）。",
+	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元，最多 12 個輸入）、每個輸出的布林式（照圖寫出來與化簡後）與檢查結果。有迴授（閂鎖）時，輸出跟之前的狀態有關的格子寫「保持」，一直來回跳的寫「不穩定」。時序電路（有正反器、計數器或時脈）回傳時序表：從重設開始每次脈衝之後的輸出，再加一段文字波形（每格一個字元，‾ 是 1、_ 是 0）。有好幾個時脈時，每次送一個時脈：預設送名稱排第一個的，clocks 指定順序（照順序一直重複），表格多一欄寫送了哪個時脈，波形每個時脈一條。",
 	inputSchema: {
 		file,
-		pulses: number().int().min(1).max(64).optional().describe("時序表列到第幾次脈衝（預設 16）")
+		pulses: number().int().min(1).max(64).optional().describe("時序表列到第幾次脈衝（預設 16）"),
+		clocks: array(string()).optional().describe("送時脈的順序（時脈名稱，照順序一直重複），例如 [\"CLK\", \"CLK\", \"CLK2\"]；只有一個時脈時不用給")
 	}
-}, async (args) => withFile(args.file, (lab) => logicTruthTable(lab, { pulses: args.pulses })));
+}, async (args) => withFile(args.file, (lab) => logicTruthTable(lab, {
+	pulses: args.pulses,
+	clocks: args.clocks
+})));
 server.registerTool("logic_to_breadboard", {
 	title: "邏輯圖轉成麵包板",
 	description: "把邏輯圖轉成 74LS IC、指撥開關、LED 的麵包板（取代目前的電路），接著 AI 佈線、逐列模擬比對真值表（「保持」「不穩定」的格子不比）；輸入最多 12 個，超過 8 個時照名稱順序每 4 個一個 4 位元指撥開關（第 1 個開關在第一顆 IC 前面，其他的在後面）；擺法先比佔用面積、再比線數；一張圖裡互相沒有訊號相連的子電路（例如好幾題畫在一起，共用時脈不算相連）可以各自成一組：自己的開關、IC、LED 排在一起，零件清單逐個列出開關；LED 可能直立、一腳直接插進電源軌（少一條線）；時序電路的時脈換成時脈元件，從重設開始送 16 個脈衝比對時序表。一般最多 40 秒；用到兩塊 EIC-1106 的大電路最多 90 秒（可以用 seconds 調整）；有 progressToken 時每一批佈線回報一次進度。接不完時不寫入檔案，回覆照這次的設定建議下一步；佈線器還沒用到一半的時間就停下來時，表示是擺法的問題，不會建議多給時間。",
