@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.14（commit befb654）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.14（commit e3292b3）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -21857,14 +21857,14 @@ function getLayout(layoutId) {
 	if (!layout) throw new Error(`Unknown board layout: ${layoutId}`);
 	return layout;
 }
-var cache$4 = /* @__PURE__ */ new Map();
+var cache$5 = /* @__PURE__ */ new Map();
 /** 回傳快取的板子模型。回傳值是共用物件，呼叫端不可修改。 */
 function getBoard(layoutId, boardId) {
 	const key = `${layoutId}/${boardId}`;
-	let board = cache$4.get(key);
+	let board = cache$5.get(key);
 	if (!board) {
 		board = buildBoard(getLayout(layoutId), boardId);
-		cache$4.set(key, board);
+		cache$5.set(key, board);
 	}
 	return board;
 }
@@ -21882,9 +21882,9 @@ function alignedAdjacent(a, b) {
 	if (a.oy === b.oy && a.height === b.height && (a.ox + a.width === b.ox || b.ox + b.width === a.ox)) return "horizontal";
 	return null;
 }
-var cache$3 = /* @__PURE__ */ new WeakMap();
+var cache$4 = /* @__PURE__ */ new WeakMap();
 function buildLattice(instances) {
-	const cached = cache$3.get(instances);
+	const cached = cache$4.get(instances);
 	if (cached) return cached;
 	const boards = instances.map((inst) => {
 		const board = getBoard(inst.layoutId, inst.id);
@@ -21917,7 +21917,7 @@ function buildLattice(instances) {
 		byId: new Map(boards.map((b) => [b.id, b])),
 		groupOf
 	};
-	cache$3.set(instances, lattice);
+	cache$4.set(instances, lattice);
 	return lattice;
 }
 /** 格點的全域座標；板子不存在時回傳 null。 */
@@ -26775,21 +26775,21 @@ var ROLES = /* @__PURE__ */ new Set([
 	"vcc-source",
 	"gnd-source"
 ]);
-function fail$3(id, message) {
+function fail$4(id, message) {
 	throw new Error(`Invalid component definition ${id}: ${message}`);
 }
 function isPositiveInt(value) {
 	return typeof value === "number" && Number.isInteger(value) && value >= 1;
 }
 function parsePackage(id, raw) {
-	if (typeof raw !== "object" || raw === null) fail$3(id, "missing package");
+	if (typeof raw !== "object" || raw === null) fail$4(id, "missing package");
 	const p = raw;
 	switch (p.type) {
 		case "dip": {
 			const pinCount = p.pinCount;
 			const rowSpacing = p.rowSpacing;
-			if (!isPositiveInt(pinCount) || pinCount % 2 !== 0) fail$3(id, "dip pinCount must be a positive even integer");
-			if (rowSpacing !== 3 && rowSpacing !== 6) fail$3(id, "dip rowSpacing must be 3 or 6");
+			if (!isPositiveInt(pinCount) || pinCount % 2 !== 0) fail$4(id, "dip pinCount must be a positive even integer");
+			if (rowSpacing !== 3 && rowSpacing !== 6) fail$4(id, "dip rowSpacing must be 3 or 6");
 			return {
 				pkg: {
 					type: "dip",
@@ -26803,8 +26803,8 @@ function parsePackage(id, raw) {
 			const defaultSpan = p.defaultSpan;
 			const minSpan = p.minSpan;
 			const blocksBetween = p.blocksBetween;
-			if (!isPositiveInt(defaultSpan) || !isPositiveInt(minSpan) || defaultSpan < minSpan) fail$3(id, "two-lead spans must be integers with defaultSpan >= minSpan >= 1");
-			if (typeof blocksBetween !== "boolean") fail$3(id, "two-lead blocksBetween must be a boolean");
+			if (!isPositiveInt(defaultSpan) || !isPositiveInt(minSpan) || defaultSpan < minSpan) fail$4(id, "two-lead spans must be integers with defaultSpan >= minSpan >= 1");
+			if (typeof blocksBetween !== "boolean") fail$4(id, "two-lead blocksBetween must be a boolean");
 			return {
 				pkg: {
 					type: "two-lead",
@@ -26823,31 +26823,31 @@ function parsePackage(id, raw) {
 			pkg: { type: "tactile4" },
 			pinCount: 4
 		};
-		default: return fail$3(id, `unknown package type ${String(p.type)}`);
+		default: return fail$4(id, `unknown package type ${String(p.type)}`);
 	}
 }
 /** 驗證一份 JSON 元件定義；資料錯誤時丟出可讀的錯誤。 */
 function parseDefinition(raw) {
 	if (typeof raw !== "object" || raw === null) throw new Error("Invalid component definition: not an object");
 	const d = raw;
-	const id = typeof d.id === "string" && d.id.length > 0 ? d.id : fail$3("?", "missing id");
+	const id = typeof d.id === "string" && d.id.length > 0 ? d.id : fail$4("?", "missing id");
 	const name = d.name;
-	if (typeof name !== "string") fail$3(id, "missing name");
+	if (typeof name !== "string") fail$4(id, "missing name");
 	const description = d.description ?? "";
-	if (typeof description !== "string") fail$3(id, "description must be a string");
+	if (typeof description !== "string") fail$4(id, "description must be a string");
 	const category = d.category;
-	if (typeof category !== "string" || !CATEGORIES.has(category)) fail$3(id, `unknown category ${String(category)}`);
+	if (typeof category !== "string" || !CATEGORIES.has(category)) fail$4(id, `unknown category ${String(category)}`);
 	const { pkg, pinCount } = parsePackage(id, d.package);
 	const rawPins = d.pins;
-	if (!Array.isArray(rawPins)) fail$3(id, "pins must be an array");
+	if (!Array.isArray(rawPins)) fail$4(id, "pins must be an array");
 	const pins = rawPins.map((entry, i) => {
 		const p = typeof entry === "object" && entry !== null ? entry : {};
 		const num = p.number;
 		const pinName = p.name;
 		const role = p.role;
-		if (!isPositiveInt(num)) fail$3(id, `pin #${i} has an invalid number`);
-		if (typeof pinName !== "string") fail$3(id, `pin ${num} has no name`);
-		if (typeof role !== "string" || !ROLES.has(role)) fail$3(id, `pin ${num} has unknown role ${String(role)}`);
+		if (!isPositiveInt(num)) fail$4(id, `pin #${i} has an invalid number`);
+		if (typeof pinName !== "string") fail$4(id, `pin ${num} has no name`);
+		if (typeof role !== "string" || !ROLES.has(role)) fail$4(id, `pin ${num} has unknown role ${String(role)}`);
 		return {
 			number: num,
 			name: pinName,
@@ -26855,11 +26855,11 @@ function parseDefinition(raw) {
 		};
 	});
 	const numbers = pins.map((p) => p.number).sort((a, b) => a - b);
-	if (numbers.length !== pinCount || numbers.some((n, i) => n !== i + 1)) fail$3(id, `pins must be numbered 1..${pinCount}`);
+	if (numbers.length !== pinCount || numbers.some((n, i) => n !== i + 1)) fail$4(id, `pins must be numbered 1..${pinCount}`);
 	const internalConnections = d.internalConnections ?? [];
-	if (!Array.isArray(internalConnections) || !internalConnections.every((set) => Array.isArray(set) && set.every((n) => isPositiveInt(n) && n <= pinCount))) fail$3(id, "internalConnections must be arrays of pin numbers");
+	if (!Array.isArray(internalConnections) || !internalConnections.every((set) => Array.isArray(set) && set.every((n) => isPositiveInt(n) && n <= pinCount))) fail$4(id, "internalConnections must be arrays of pin numbers");
 	const defaultProps = d.defaultProps ?? {};
-	if (typeof defaultProps !== "object" || defaultProps === null) fail$3(id, "defaultProps must be an object");
+	if (typeof defaultProps !== "object" || defaultProps === null) fail$4(id, "defaultProps must be an object");
 	const nameCounts = /* @__PURE__ */ new Map();
 	for (const p of pins) nameCounts.set(p.name, (nameCounts.get(p.name) ?? 0) + 1);
 	const uniqueNames = new Set([...nameCounts].filter(([, n]) => n === 1).map(([name]) => name));
@@ -26875,18 +26875,18 @@ function parseDefinition(raw) {
 		logic: parseLogic(id, d.logic, uniqueNames)
 	};
 }
-var cache$2 = null;
+var cache$3 = null;
 function getComponentDefinitions() {
-	if (!cache$2) {
+	if (!cache$3) {
 		const defs = RAW_DEFINITIONS.map(parseDefinition);
 		const seen = /* @__PURE__ */ new Set();
 		for (const def of defs) {
 			if (seen.has(def.id)) throw new Error(`Duplicate component definition id: ${def.id}`);
 			seen.add(def.id);
 		}
-		cache$2 = defs;
+		cache$3 = defs;
 	}
-	return cache$2;
+	return cache$3;
 }
 function getComponentDefinition(id) {
 	return getComponentDefinitions().find((def) => def.id === id);
@@ -28947,7 +28947,7 @@ function nextNumbered(ids, prefix) {
 function nextComponentId(circuit, category) {
 	return nextNumbered(circuit.components.map((c) => c.id), ID_PREFIX[category]);
 }
-function nextWireId(circuit) {
+function nextWireId$1(circuit) {
 	return nextNumbered(circuit.wires.map((w) => w.id), "w");
 }
 //#endregion
@@ -29279,7 +29279,7 @@ function setLabel(circuit, id, index, text) {
 }
 /** 手動接線：兩孔之間的一條直線導線（子專案 39 起只能水平或垂直，由 straightWireProblem 把關）。 */
 function addWire$1(circuit, start, end, color) {
-	const id = nextWireId(circuit);
+	const id = nextWireId$1(circuit);
 	const a = {
 		boardId: start.boardId,
 		x: start.x,
@@ -29652,6 +29652,7 @@ var isSink = (kind) => kind === "OUTPUT" || kind === "DISPLAY";
 function inputCountOf(node) {
 	if (isSource(node.kind)) return 0;
 	if (node.kind === "BLOCK") return node.chip ? BLOCK_PINS[node.chip].inputs.length : 0;
+	if (node.kind === "CUSTOM") return node.inputs ?? 0;
 	if (node.kind === "DISPLAY") return node.segments ? 8 : 5;
 	if (node.kind === "OUTPUT" || node.kind === "NOT") return 1;
 	if (node.kind === "XOR") return 2;
@@ -29661,13 +29662,14 @@ function inputCountOf(node) {
 function outputCountOf(node) {
 	if (isSink(node.kind)) return 0;
 	if (node.kind === "BLOCK") return node.chip ? BLOCK_PINS[node.chip].outputs.length : 0;
+	if (node.kind === "CUSTOM") return node.outputs ?? 0;
 	return 1;
 }
 /** 規格 2.1 的表。 */
 function nodeSize(node) {
-	if (node.kind === "BLOCK") return {
+	if (node.kind === "BLOCK" || node.kind === "CUSTOM") return {
 		w: 6,
-		h: Math.max(inputCountOf(node), outputCountOf(node)) + 1
+		h: Math.max(inputCountOf(node), outputCountOf(node), 1) + 1
 	};
 	if (node.kind === "INPUT" || node.kind === "OUTPUT" || node.kind === "HIGH" || node.kind === "LOW" || node.kind === "CLOCK") return {
 		w: 2,
@@ -29747,7 +29749,7 @@ function boxOf(node) {
 }
 function inputPins(node) {
 	const n = inputCountOf(node);
-	if (node.kind === "BLOCK") return Array.from({ length: n }, (_, k) => place(node, 0, k));
+	if (node.kind === "BLOCK" || node.kind === "CUSTOM") return Array.from({ length: n }, (_, k) => place(node, 0, k));
 	if (node.kind === "DISPLAY") return (node.segments ? [
 		0,
 		1,
@@ -29770,7 +29772,7 @@ function inputPins(node) {
 function outputPins(node) {
 	if (isSink(node.kind)) return [];
 	const { w, h } = nodeSize(node);
-	if (node.kind === "BLOCK") return Array.from({ length: outputCountOf(node) }, (_, k) => place(node, w, k));
+	if (node.kind === "BLOCK" || node.kind === "CUSTOM") return Array.from({ length: outputCountOf(node) }, (_, k) => place(node, w, k));
 	return [place(node, w, isGate(node.kind) ? Math.floor(h / 2) : 0)];
 }
 /** 第 k 個輸出腳（預設第 0 個）。 */
@@ -29785,6 +29787,15 @@ function overlaps(a, b) {
 }
 //#endregion
 //#region src/logic/notes.ts
+/** 元件刪除後，指向它的便條拿掉指向（沒有受影響時回傳原本的陣列）。 */
+function dropLogicNoteTargets(notes, removed) {
+	if (!notes || !notes.some((n) => n.target !== void 0 && removed.has(n.target))) return notes;
+	return notes.map((n) => {
+		if (n.target === void 0 || !removed.has(n.target)) return n;
+		const { target: _old, ...rest } = n;
+		return rest;
+	});
+}
 /** 讀檔時檢查便條；格式不對時回傳原因。指向不存在的元件時忽略指向，文字太長截斷。 */
 function parseLogicNotes(raw, nodeIds) {
 	if (!Array.isArray(raw)) return {
@@ -30001,6 +30012,160 @@ function sopText(terms, names) {
 	const parts = terms.map((t) => literalsOf(t, names));
 	if (parts.some((p) => p.length === 0)) return "1";
 	return parts.map((p) => p.map((l) => `${l.name}${l.negated ? "'" : ""}`).join("")).join(" + ");
+}
+//#endregion
+//#region src/logic/flatten.ts
+/**
+* 子專案 65（規格 2026-11-14 custom-blocks 第 1 節）：方塊的腳：裡面的輸入端、輸出端，照圖上的位置由上到下（y，再 x）。
+*/
+function blockPins(b) {
+	const byPlace = (a, c) => a.y - c.y || a.x - c.x;
+	return {
+		inputs: b.nodes.filter((n) => n.kind === "INPUT").sort(byPlace),
+		outputs: b.nodes.filter((n) => n.kind === "OUTPUT").sort(byPlace)
+	};
+}
+/**
+* 規格第 2 節：把每個自訂方塊換成它裡面的元件（巢狀時一層一層展開）。接到方塊輸入腳的線改接到裡面用到那個輸入端的腳，
+* 從方塊輸出腳出去的線改從裡面接到那個輸出端的訊號出去；沒接的腳就是沒接。找不到定義或用到自己的方塊當成空的。
+*/
+function flattenDiagram(d) {
+	if (!d.nodes.some((n) => n.kind === "CUSTOM")) return {
+		diagram: d,
+		alias: /* @__PURE__ */ new Map()
+	};
+	const defs = new Map((d.blocks ?? []).map((b) => [b.id, b]));
+	const nodes = [];
+	const wires = [];
+	/** 方塊節點 → 每個輸入腳、輸出腳在裡面的輸入端、輸出端（展開後的 id）。 */
+	const custom = /* @__PURE__ */ new Map();
+	/** 裡面的輸入端 → 它是哪個方塊節點的第幾個輸入腳。 */
+	const inputPass = /* @__PURE__ */ new Map();
+	const outputPass = /* @__PURE__ */ new Set();
+	const add = (list, ws, prefix, stack) => {
+		for (const n of list) {
+			const id = prefix + n.id;
+			if (n.kind !== "CUSTOM") {
+				nodes.push({
+					...n,
+					id
+				});
+				continue;
+			}
+			const def = n.block === void 0 ? void 0 : defs.get(n.block);
+			if (!def || stack.includes(def.id)) {
+				custom.set(id, {
+					ins: [],
+					outs: []
+				});
+				continue;
+			}
+			const inner = `${id}/`;
+			const pins = blockPins(def);
+			custom.set(id, {
+				ins: pins.inputs.map((p) => inner + p.id),
+				outs: pins.outputs.map((p) => inner + p.id)
+			});
+			pins.inputs.forEach((p, k) => inputPass.set(inner + p.id, {
+				node: id,
+				pin: k
+			}));
+			for (const p of pins.outputs) outputPass.add(inner + p.id);
+			add(def.nodes.filter((m) => m.kind !== "INPUT" && m.kind !== "OUTPUT"), def.wires, inner, [...stack, def.id]);
+		}
+		for (const w of ws) wires.push({
+			...w,
+			id: prefix + w.id,
+			from: prefix + w.from,
+			to: {
+				node: prefix + w.to.node,
+				pin: w.to.pin
+			}
+		});
+	};
+	add(d.nodes, d.wires, "", []);
+	const driver = new Map(wires.map((w) => [`${w.to.node}#${w.to.pin}`, {
+		from: w.from,
+		fromPin: w.fromPin
+	}]));
+	/** 一路找到真正的來源（經過方塊的腳、裡面的輸入端與輸出端）；沒接時是 null。 */
+	const resolve = (start) => {
+		let src = start;
+		for (let guard = 0; src && guard < 1e4; guard++) {
+			const c = custom.get(src.from);
+			if (c) {
+				const out = c.outs[src.fromPin ?? 0];
+				src = out === void 0 ? void 0 : { from: out };
+				continue;
+			}
+			const pass = inputPass.get(src.from);
+			if (pass) {
+				src = driver.get(`${pass.node}#${pass.pin}`);
+				continue;
+			}
+			if (outputPass.has(src.from)) {
+				src = driver.get(`${src.from}#0`);
+				continue;
+			}
+			return src;
+		}
+		return null;
+	};
+	const real = new Set(nodes.map((n) => n.id));
+	const flatWires = [];
+	for (const w of wires) {
+		if (!real.has(w.to.node)) continue;
+		const s = resolve(w);
+		if (!s) continue;
+		const { fromPin: _drop, ...rest } = w;
+		flatWires.push({
+			...rest,
+			from: s.from,
+			...s.fromPin ? { fromPin: s.fromPin } : {}
+		});
+	}
+	const alias = /* @__PURE__ */ new Map();
+	for (const [id, c] of custom) c.outs.forEach((_, k) => {
+		const s = resolve({
+			from: id,
+			fromPin: k
+		});
+		if (s) alias.set(signalOf(id, k), signalOf(s.from, s.fromPin));
+	});
+	const { blocks: _blocks, ...rest } = d;
+	return {
+		diagram: {
+			...rest,
+			nodes,
+			wires: flatWires
+		},
+		alias
+	};
+}
+var cache$2 = /* @__PURE__ */ new WeakMap();
+/** 有快取的展開（同一張圖物件只展開一次）。 */
+function flat(d) {
+	let f = cache$2.get(d);
+	if (!f) {
+		f = flattenDiagram(d);
+		cache$2.set(d, f);
+	}
+	return f;
+}
+/** 方塊會不會直接或間接用到自己（id 是要檢查的方塊）。 */
+function usesItself(blocks, id) {
+	const defs = new Map(blocks.map((b) => [b.id, b]));
+	const seen = /* @__PURE__ */ new Set();
+	const walk = (b) => b.nodes.some((n) => {
+		if (n.kind !== "CUSTOM" || n.block === void 0) return false;
+		if (n.block === id) return true;
+		if (seen.has(n.block)) return false;
+		seen.add(n.block);
+		const inner = defs.get(n.block);
+		return inner ? walk(inner) : false;
+	});
+	const self = defs.get(id);
+	return self ? walk(self) : false;
 }
 //#endregion
 //#region src/core/simulation/models.ts
@@ -30526,6 +30691,7 @@ function gateValue(kind, inputs) {
 var isSequentialNode = (n) => n?.kind === "BLOCK" && isSequentialChip(n.chip);
 /** 子專案 46：圖裡有時序方塊或時脈（真值表改成時序表）。 */
 function isSequential(d) {
+	d = flat(d).diagram;
 	return d.nodes.some((n) => n.kind === "CLOCK" || isSequentialNode(n));
 }
 /**
@@ -30533,6 +30699,7 @@ function isSequential(d) {
 * 子專案 46：接到時序方塊的線不算（時序方塊的輸出由狀態決定），所以經過正反器的迴圈不是迴圈。
 */
 function topoOrder(d) {
+	d = flat(d).diagram;
 	const indegree = new Map(d.nodes.map((n) => [n.id, 0]));
 	const next = new Map(d.nodes.map((n) => [n.id, []]));
 	const sequential = new Set(d.nodes.filter(isSequentialNode).map((n) => n.id));
@@ -30646,7 +30813,13 @@ var MAX_LOOP_PASSES = 64;
 * values：輸入端 id → 0 / 1；沒給的用節點自己的 value。displays：顯示器 id → 0–15（A + 2B + 4C + 8D）或 X。
 * 子專案 32：dps 是小數點（沒接是 0）；segs 是每段直接控制的顯示器亮的段（沒接的段是 0，有不確定的是 X）。
 */
-function evaluate$1(d, values = {}, state) {
+function evaluate$1(d0, values = {}, state) {
+	const { diagram: d, alias } = flat(d0);
+	const r = evaluateFlat(d, values, state);
+	for (const [a, b] of alias) r.nodes.set(a, r.nodes.get(b) ?? "X");
+	return r;
+}
+function evaluateFlat(d, values, state) {
 	const topo = topoOrder(d);
 	const order = topo.loop ? [...topo.order, ...d.nodes.filter((n) => !topo.order.includes(n))] : topo.order;
 	const feedback = topo.loop ? order.slice(topo.order.length).filter((n) => !isSequentialNode(n)) : [];
@@ -30765,6 +30938,7 @@ function combinational(order, driver, values, seq, memory) {
 * 這組輸入會不會一直來回跳。只看閘與組合 IC 方塊（有時序方塊的圖不判斷，回傳 false）。
 */
 function racesFrom(d, values, state) {
+	d = flat(d).diagram;
 	if (isSequential(d) || !topoOrder(d).loop) return false;
 	const driver = new Map(d.wires.map((w) => [`${w.to.node}#${w.to.pin}`, signalOf(w.from, w.fromPin)]));
 	let now = /* @__PURE__ */ new Map();
@@ -30844,6 +31018,7 @@ function segmentToken(lit) {
 * 都一樣就寫那個值，不一樣寫「保持」（跟之前的狀態有關），有一次停不下來就寫「不穩定」。
 */
 function truthTable(d) {
+	d = flat(d).diagram;
 	const { inputs, outputs } = sortedIo(d);
 	if (isSequential(d)) return {
 		ok: false,
@@ -30928,6 +31103,7 @@ var allClocks = (d) => clockNodes(d).map((n) => n.name ?? n.id);
 * 子專案 64：order 是時脈名稱的清單，照順序一直重複送；沒給時送名稱排第一個的時脈。每次送一個時脈，其他時脈留在 0。
 */
 function sequenceTable(d, pulses = 16, values = {}, seed = 0, order) {
+	d = flat(d).diagram;
 	const clocks = clockNodes(d);
 	if (clocks.length === 0) return {
 		ok: false,
@@ -30983,7 +31159,7 @@ function sequenceTable(d, pulses = 16, values = {}, seed = 0, order) {
 		rows
 	};
 }
-var NAME_RULE$1 = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
+var NAME_RULE$2 = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
 /** 用空白或逗號分開的名稱。 */
 function parseNames(text) {
 	const names = text.split(/[\s,，、]+/).filter(Boolean);
@@ -30993,7 +31169,7 @@ function parseNames(text) {
 	};
 	const seen = /* @__PURE__ */ new Set();
 	for (const name of names) {
-		if (!NAME_RULE$1.test(name)) return {
+		if (!NAME_RULE$2.test(name)) return {
 			ok: false,
 			reason: `名稱 ${name} 不合法（英文字母開頭，只能有英數與底線，最多 8 個字）`
 		};
@@ -31015,7 +31191,7 @@ function namesProblem(inputs, outputs) {
 	if (inputs.length > 6) return `輸入最多 6 個（64 列）`;
 	if (outputs.length > 8) return `輸出最多 8 個`;
 	const all = [...inputs, ...outputs];
-	for (const name of all) if (!NAME_RULE$1.test(name)) return `名稱 ${name} 不合法（英文字母開頭，只能有英數與底線，最多 8 個字）`;
+	for (const name of all) if (!NAME_RULE$2.test(name)) return `名稱 ${name} 不合法（英文字母開頭，只能有英數與底線，最多 8 個字）`;
 	for (const name of inputs) if (outputs.includes(name)) return `名稱 ${name} 同時是輸入和輸出`;
 	const twice = all.find((name, i) => all.indexOf(name) !== i);
 	return twice ? `名稱 ${twice} 重複` : null;
@@ -31796,21 +31972,22 @@ var KINDS = [
 	"HIGH",
 	"LOW",
 	"BLOCK",
-	"CLOCK"
+	"CLOCK",
+	"CUSTOM"
 ];
-var NAME_RULE = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
+var NAME_RULE$1 = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
 var isObj$1 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isInt = (v) => Number.isInteger(v);
 var LogicFormatError = class extends Error {};
-var fail$2 = (msg) => {
+var fail$3 = (msg) => {
 	throw new LogicFormatError(msg);
 };
-function parseNode(raw, i) {
-	if (!isObj$1(raw)) fail$2(`第 ${i + 1} 個元件格式不對`);
+function parseNode(raw, i, blocks) {
+	if (!isObj$1(raw)) fail$3(`第 ${i + 1} 個元件格式不對`);
 	const n = raw;
-	if (typeof n.id !== "string" || !n.id) fail$2(`第 ${i + 1} 個元件沒有 id`);
-	if (!KINDS.includes(n.kind)) fail$2(`元件 ${String(n.id)} 的種類 ${String(n.kind)} 不認得`);
-	if (!isInt(n.x) || !isInt(n.y)) fail$2(`元件 ${String(n.id)} 的位置要是整數`);
+	if (typeof n.id !== "string" || !n.id) fail$3(`第 ${i + 1} 個元件沒有 id`);
+	if (!KINDS.includes(n.kind)) fail$3(`元件 ${String(n.id)} 的種類 ${String(n.kind)} 不認得`);
+	if (!isInt(n.x) || !isInt(n.y)) fail$3(`元件 ${String(n.id)} 的位置要是整數`);
 	const node = {
 		id: n.id,
 		kind: n.kind,
@@ -31822,13 +31999,19 @@ function parseNode(raw, i) {
 			2,
 			3,
 			4
-		]).includes(n.inputs)) fail$2(`元件 ${node.id}（${node.kind}）的輸入數 ${String(n.inputs)} 不合法`);
+		]).includes(n.inputs)) fail$3(`元件 ${node.id}（${node.kind}）的輸入數 ${String(n.inputs)} 不合法`);
 		node.inputs = n.inputs;
 	} else if (node.kind === "BLOCK") {
-		if (!isBlockChip(n.chip)) fail$2(`元件 ${node.id} 的 IC ${String(n.chip)} 不認得`);
+		if (!isBlockChip(n.chip)) fail$3(`元件 ${node.id} 的 IC ${String(n.chip)} 不認得`);
 		node.chip = n.chip;
+	} else if (node.kind === "CUSTOM") {
+		const pins = typeof n.block === "string" ? blocks.get(n.block) : void 0;
+		if (!pins) fail$3(`元件 ${node.id} 用到不存在的自訂方塊 ${String(n.block)}`);
+		node.block = n.block;
+		node.inputs = pins.inputs;
+		node.outputs = pins.outputs;
 	} else if (node.kind !== "HIGH" && node.kind !== "LOW") {
-		if (typeof n.name !== "string" || !NAME_RULE.test(n.name)) fail$2(`元件 ${node.id} 的名稱 ${String(n.name)} 不合法`);
+		if (typeof n.name !== "string" || !NAME_RULE$1.test(n.name)) fail$3(`元件 ${node.id} 的名稱 ${String(n.name)} 不合法`);
 		node.name = n.name;
 		if (node.kind === "INPUT") node.value = n.value === 1 ? 1 : 0;
 		if (node.kind === "CLOCK") node.value = 0;
@@ -31838,39 +32021,39 @@ function parseNode(raw, i) {
 			90,
 			180,
 			270
-		].includes(n.rotation)) fail$2(`元件 ${node.id} 的方向 ${String(n.rotation)} 不合法（只能是 0、90、180、270）`);
-		if (!canRotate(node.kind)) fail$2(`元件 ${node.id}（${node.kind}）不能轉向`);
+		].includes(n.rotation)) fail$3(`元件 ${node.id} 的方向 ${String(n.rotation)} 不合法（只能是 0、90、180、270）`);
+		if (!canRotate(node.kind)) fail$3(`元件 ${node.id}（${node.kind}）不能轉向`);
 		node.rotation = n.rotation;
 	}
 	if (n.segments === true) {
-		if (node.kind !== "DISPLAY") fail$2(`元件 ${node.id} 不是顯示器，不能每段直接控制`);
+		if (node.kind !== "DISPLAY") fail$3(`元件 ${node.id} 不是顯示器，不能每段直接控制`);
 		node.segments = true;
 	}
 	if (n.activeLow !== void 0 && n.activeLow !== false) {
-		if (n.activeLow !== true) fail$2(`元件 ${node.id} 的低態致動要是 true 或不寫`);
-		if (node.kind !== "OUTPUT") fail$2(`元件 ${node.id} 不是輸出端，不能設成低態致動`);
+		if (n.activeLow !== true) fail$3(`元件 ${node.id} 的低態致動要是 true 或不寫`);
+		if (node.kind !== "OUTPUT") fail$3(`元件 ${node.id} 不是輸出端，不能設成低態致動`);
 		node.activeLow = true;
 	}
 	if (n.flip !== void 0 && n.flip !== false) {
-		if (n.flip !== true) fail$2(`元件 ${node.id} 的鏡射要是 true 或不寫`);
-		if (!canRotate(node.kind)) fail$2(`元件 ${node.id}（${node.kind}）不能轉向`);
+		if (n.flip !== true) fail$3(`元件 ${node.id} 的鏡射要是 true 或不寫`);
+		if (!canRotate(node.kind)) fail$3(`元件 ${node.id}（${node.kind}）不能轉向`);
 		node.flip = true;
 	}
 	return node;
 }
 function parseWire$1(raw, i, nodes) {
-	if (!isObj$1(raw) || !isObj$1(raw.to)) fail$2(`第 ${i + 1} 條線格式不對`);
+	if (!isObj$1(raw) || !isObj$1(raw.to)) fail$3(`第 ${i + 1} 條線格式不對`);
 	const w = raw;
 	const to = w.to;
-	if (typeof w.id !== "string" || typeof w.from !== "string" || typeof to.node !== "string" || !isInt(to.pin)) fail$2(`第 ${i + 1} 條線格式不對`);
+	if (typeof w.id !== "string" || typeof w.from !== "string" || typeof to.node !== "string" || !isInt(to.pin)) fail$3(`第 ${i + 1} 條線格式不對`);
 	const source = nodes.get(w.from);
 	const target = nodes.get(to.node);
-	if (!source || !target) fail$2(`線 ${String(w.id)} 接到不存在的元件`);
-	const selfOk = source === target && target.kind === "BLOCK" && isSequentialChip(target.chip);
-	if (isSink(source.kind) || target.kind === "INPUT" || target.kind === "CLOCK" || source === target && !selfOk) fail$2(`線 ${String(w.id)} 的方向不對`);
-	if (to.pin < 0 || to.pin >= inputCountOf(target)) fail$2(`線 ${String(w.id)} 接到不存在的輸入腳`);
+	if (!source || !target) fail$3(`線 ${String(w.id)} 接到不存在的元件`);
+	const selfOk = source === target && (target.kind === "BLOCK" && isSequentialChip(target.chip) || target.kind === "CUSTOM");
+	if (isSink(source.kind) || target.kind === "INPUT" || target.kind === "CLOCK" || source === target && !selfOk) fail$3(`線 ${String(w.id)} 的方向不對`);
+	if (to.pin < 0 || to.pin >= inputCountOf(target)) fail$3(`線 ${String(w.id)} 接到不存在的輸入腳`);
 	const fromPin = w.fromPin === void 0 ? 0 : w.fromPin;
-	if (!isInt(fromPin) || fromPin < 0 || fromPin >= outputCountOf(source)) fail$2(`線 ${String(w.id)} 從不存在的輸出腳接出`);
+	if (!isInt(fromPin) || fromPin < 0 || fromPin >= outputCountOf(source)) fail$3(`線 ${String(w.id)} 從不存在的輸出腳接出`);
 	return {
 		id: w.id,
 		from: w.from,
@@ -31881,38 +32064,90 @@ function parseWire$1(raw, i, nodes) {
 		}
 	};
 }
-/** 規格第 6 節：讀檔時檢查邏輯圖；不合法就整個拒絕並說明原因。 */
-function parseLogicDiagram(raw) {
+/** 一張圖（主圖或方塊裡面）的元件與線；where 加在錯誤說明前面。 */
+function parseGraph(rawNodes, rawWires, blocks, where = "") {
 	try {
-		if (!isObj$1(raw) || raw.version !== 1 || !Array.isArray(raw.nodes) || !Array.isArray(raw.wires)) fail$2("格式不對");
-		const r = raw;
-		const nodes = r.nodes.map(parseNode);
+		const r = { wires: rawWires };
+		const nodes = rawNodes.map((n, i) => parseNode(n, i, blocks));
 		const byId = /* @__PURE__ */ new Map();
 		const names = /* @__PURE__ */ new Set();
 		for (const n of nodes) {
-			if (byId.has(n.id)) fail$2(`元件 id ${n.id} 重複`);
+			if (byId.has(n.id)) fail$3(`元件 id ${n.id} 重複`);
 			byId.set(n.id, n);
 			if (n.name !== void 0) {
-				if (names.has(n.name)) fail$2(`名稱 ${n.name} 重複`);
+				if (names.has(n.name)) fail$3(`名稱 ${n.name} 重複`);
 				names.add(n.name);
 			}
 		}
-		nodes.forEach((a, i) => nodes.slice(i + 1).forEach((b) => overlaps(a, b) && fail$2(`元件 ${a.id} 和 ${b.id} 重疊`)));
-		if (nodes.filter((n) => n.kind === "CLOCK").length > 4) fail$2(`一張圖最多 4 個時脈`);
+		nodes.forEach((a, i) => nodes.slice(i + 1).forEach((b) => overlaps(a, b) && fail$3(`元件 ${a.id} 和 ${b.id} 重疊`)));
+		if (nodes.filter((n) => n.kind === "CLOCK").length > 4) fail$3(`一張圖最多 4 個時脈`);
 		const wires = r.wires.map((w, i) => parseWire$1(w, i, byId));
 		const ids = /* @__PURE__ */ new Set();
 		const pins = /* @__PURE__ */ new Set();
 		for (const w of wires) {
-			if (ids.has(w.id)) fail$2(`線 id ${w.id} 重複`);
+			if (ids.has(w.id)) fail$3(`線 id ${w.id} 重複`);
 			ids.add(w.id);
 			const key = `${w.to.node}#${w.to.pin}`;
-			if (pins.has(key)) fail$2(`${w.to.node} 的第 ${w.to.pin + 1} 個輸入接了兩條線`);
+			if (pins.has(key)) fail$3(`${w.to.node} 的第 ${w.to.pin + 1} 個輸入接了兩條線`);
 			pins.add(key);
 		}
+		return {
+			nodes,
+			wires
+		};
+	} catch (err) {
+		if (err instanceof LogicFormatError && where) fail$3(where + err.message);
+		throw err;
+	}
+}
+/** 子專案 65：自訂方塊的定義（id、名稱不重複，名稱照輸入端的規則）；內容在 parseGraph 檢查。 */
+function parseBlocks(raw) {
+	if (!Array.isArray(raw)) fail$3("blocks 要是陣列");
+	const ids = /* @__PURE__ */ new Set();
+	const names = /* @__PURE__ */ new Set();
+	return raw.map((b, i) => {
+		if (!isObj$1(b) || typeof b.id !== "string" || !b.id || !Array.isArray(b.nodes) || !Array.isArray(b.wires)) fail$3(`第 ${i + 1} 個自訂方塊格式不對`);
+		const o = b;
+		if (typeof o.name !== "string" || !NAME_RULE$1.test(o.name)) fail$3(`自訂方塊 ${String(o.id)} 的名稱 ${String(o.name)} 不合法`);
+		if (ids.has(o.id)) fail$3(`自訂方塊 id ${String(o.id)} 重複`);
+		if (names.has(o.name)) fail$3(`自訂方塊名稱 ${String(o.name)} 重複`);
+		ids.add(o.id);
+		names.add(o.name);
+		return {
+			id: o.id,
+			name: o.name,
+			nodes: o.nodes,
+			wires: o.wires
+		};
+	});
+}
+/** 規格第 6 節：讀檔時檢查邏輯圖；不合法就整個拒絕並說明原因。 */
+function parseLogicDiagram(raw) {
+	try {
+		if (!isObj$1(raw) || raw.version !== 1 || !Array.isArray(raw.nodes) || !Array.isArray(raw.wires)) fail$3("格式不對");
+		const r = raw;
+		const blocks = r.blocks === void 0 ? [] : parseBlocks(r.blocks);
+		const pins = new Map(blocks.map((b) => [b.id, {
+			inputs: b.nodes.filter((n) => isObj$1(n) && n.kind === "INPUT").length,
+			outputs: b.nodes.filter((n) => isObj$1(n) && n.kind === "OUTPUT").length
+		}]));
+		const { nodes, wires } = parseGraph(r.nodes, r.wires, pins);
+		const parsed = blocks.map((b) => {
+			const inner = parseGraph(b.nodes, b.wires, pins, `方塊 ${b.name}：`);
+			if (inner.nodes.some((n) => n.kind === "CLOCK" || n.kind === "DISPLAY")) fail$3(`方塊 ${b.name}：裡面不能放時脈或 7 段顯示器`);
+			return {
+				id: b.id,
+				name: b.name,
+				nodes: inner.nodes,
+				wires: inner.wires
+			};
+		});
+		for (const b of parsed) if (usesItself(parsed, b.id)) fail$3(`方塊 ${b.name} 直接或間接用到自己`);
 		const diagram = {
 			version: 1,
 			nodes,
-			wires
+			wires,
+			...parsed.length > 0 ? { blocks: parsed } : {}
 		};
 		if (r.task !== void 0) {
 			const task = parseTask(r.task);
@@ -32085,27 +32320,27 @@ function serializeCircuitFile(circuit, name, now, logic) {
 	return JSON.stringify(toCircuitFile(circuit, name, now, void 0, logic), null, 2);
 }
 var FormatError = class extends Error {};
-function fail$1(path, message) {
+function fail$2(path, message) {
 	throw new FormatError(path ? `${path}：${message}` : message);
 }
 function obj(value, path) {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) fail$1(path, "必須是物件");
+	if (typeof value !== "object" || value === null || Array.isArray(value)) fail$2(path, "必須是物件");
 	return value;
 }
 function arr(value, path) {
-	if (!Array.isArray(value)) fail$1(path, "必須是陣列");
+	if (!Array.isArray(value)) fail$2(path, "必須是陣列");
 	return value;
 }
 function str(value, path) {
-	if (typeof value !== "string" || value.length === 0) fail$1(path, "必須是非空字串");
+	if (typeof value !== "string" || value.length === 0) fail$2(path, "必須是非空字串");
 	return value;
 }
 function int(value, path) {
-	if (typeof value !== "number" || !Number.isInteger(value)) fail$1(path, "必須是整數");
+	if (typeof value !== "number" || !Number.isInteger(value)) fail$2(path, "必須是整數");
 	return value;
 }
 function num(value, path) {
-	if (typeof value !== "number" || !Number.isFinite(value)) fail$1(path, "必須是數字");
+	if (typeof value !== "number" || !Number.isFinite(value)) fail$2(path, "必須是數字");
 	return value;
 }
 var ROTATIONS$1 = /* @__PURE__ */ new Set([
@@ -32122,7 +32357,7 @@ var LED_COLORS$1 = /* @__PURE__ */ new Set([
 ]);
 function parseBoard(raw, path) {
 	const b = obj(raw, path);
-	if (b.layoutId !== "MB102" && b.layoutId !== "EIC1106") fail$1(`${path}.layoutId`, `不支援的麵包板版型 ${String(b.layoutId)}（目前有 MB102、EIC1106）`);
+	if (b.layoutId !== "MB102" && b.layoutId !== "EIC1106") fail$2(`${path}.layoutId`, `不支援的麵包板版型 ${String(b.layoutId)}（目前有 MB102、EIC1106）`);
 	return {
 		id: str(b.id, `${path}.id`),
 		layoutId: b.layoutId,
@@ -32136,32 +32371,32 @@ function parseProps(raw, path) {
 	const props = {};
 	if (p.resistance !== void 0) {
 		const r = num(p.resistance, `${path}.resistance`);
-		if (r <= 0) fail$1(`${path}.resistance`, "必須大於 0");
+		if (r <= 0) fail$2(`${path}.resistance`, "必須大於 0");
 		props.resistance = r;
 	}
 	if (p.color !== void 0) {
-		if (typeof p.color !== "string" || !LED_COLORS$1.has(p.color)) fail$1(`${path}.color`, "LED 顏色必須是 red、green、yellow 或 blue");
+		if (typeof p.color !== "string" || !LED_COLORS$1.has(p.color)) fail$2(`${path}.color`, "LED 顏色必須是 red、green、yellow 或 blue");
 		props.color = p.color;
 	}
 	if (p.voltage !== void 0) props.voltage = num(p.voltage, `${path}.voltage`);
 	if (p.frequency !== void 0) {
 		const f = num(p.frequency, `${path}.frequency`);
-		if (f <= 0) fail$1(`${path}.frequency`, "必須大於 0");
+		if (f <= 0) fail$2(`${path}.frequency`, "必須大於 0");
 		props.frequency = f;
 	}
 	if (p.capacitance !== void 0) {
 		const c = num(p.capacitance, `${path}.capacitance`);
-		if (c <= 0) fail$1(`${path}.capacitance`, "必須大於 0");
+		if (c <= 0) fail$2(`${path}.capacitance`, "必須大於 0");
 		props.capacitance = c;
 	}
 	if (p.switchStates !== void 0) {
 		const states = arr(p.switchStates, `${path}.switchStates`);
-		if (!states.every((s) => typeof s === "boolean")) fail$1(`${path}.switchStates`, "必須是 true / false 陣列");
+		if (!states.every((s) => typeof s === "boolean")) fail$2(`${path}.switchStates`, "必須是 true / false 陣列");
 		props.switchStates = states;
 	}
 	if (p.labels !== void 0) {
 		const labels = arr(p.labels, `${path}.labels`);
-		if (!labels.every((s) => typeof s === "string")) fail$1(`${path}.labels`, "必須是文字陣列");
+		if (!labels.every((s) => typeof s === "string")) fail$2(`${path}.labels`, "必須是文字陣列");
 		props.labels = labels.map((s) => s.slice(0, 8));
 	}
 	return props;
@@ -32169,7 +32404,7 @@ function parseProps(raw, path) {
 function parsePoint(raw, path, boardIds) {
 	const p = obj(raw, path);
 	const boardId = str(p.boardId, `${path}.boardId`);
-	if (!boardIds.has(boardId)) fail$1(`${path}.boardId`, `找不到麵包板 ${boardId}`);
+	if (!boardIds.has(boardId)) fail$2(`${path}.boardId`, `找不到麵包板 ${boardId}`);
 	return {
 		boardId,
 		x: int(p.x, `${path}.x`),
@@ -32180,12 +32415,12 @@ function parseComponent(raw, path, boardIds) {
 	const c = obj(raw, path);
 	const id = str(c.id, `${path}.id`);
 	const defId = str(c.defId, `${path}.defId`);
-	if (!getComponentDefinition(defId)) fail$1(`${path}.defId`, `元件庫裡沒有 ${defId}`);
+	if (!getComponentDefinition(defId)) fail$2(`${path}.defId`, `元件庫裡沒有 ${defId}`);
 	const boardId = str(c.boardId, `${path}.boardId`);
-	if (!boardIds.has(boardId)) fail$1(`${path}.boardId`, `找不到麵包板 ${boardId}`);
+	if (!boardIds.has(boardId)) fail$2(`${path}.boardId`, `找不到麵包板 ${boardId}`);
 	const anchor = obj(c.anchor, `${path}.anchor`);
 	const rotation = c.rotation ?? 0;
-	if (typeof rotation !== "number" || !ROTATIONS$1.has(rotation)) fail$1(`${path}.rotation`, "必須是 0、90、180 或 270");
+	if (typeof rotation !== "number" || !ROTATIONS$1.has(rotation)) fail$2(`${path}.rotation`, "必須是 0、90、180 或 270");
 	const instance = {
 		id,
 		defId,
@@ -32199,7 +32434,7 @@ function parseComponent(raw, path, boardIds) {
 	};
 	if (c.span !== void 0) {
 		const span = int(c.span, `${path}.span`);
-		if (span < 1) fail$1(`${path}.span`, "必須大於等於 1");
+		if (span < 1) fail$2(`${path}.span`, "必須大於等於 1");
 		instance.span = span;
 	}
 	return instance;
@@ -32207,10 +32442,10 @@ function parseComponent(raw, path, boardIds) {
 function parseWire(raw, path, boardIds) {
 	const w = obj(raw, path);
 	const source = w.source ?? "manual";
-	if (source !== "manual" && source !== "auto") fail$1(`${path}.source`, "必須是 manual 或 auto");
-	if (w.straight !== void 0 && w.straight !== true) fail$1(`${path}.straight`, "只能是 true");
+	if (source !== "manual" && source !== "auto") fail$2(`${path}.source`, "必須是 manual 或 auto");
+	if (w.straight !== void 0 && w.straight !== true) fail$2(`${path}.straight`, "只能是 true");
 	const points = arr(w.path, `${path}.path`).map((p, i) => parsePoint(p, `${path}.path[${i}]`, boardIds));
-	if (points.length < 2) fail$1(`${path}.path`, "導線至少要有兩個點");
+	if (points.length < 2) fail$2(`${path}.path`, "導線至少要有兩個點");
 	const wire = {
 		id: str(w.id, `${path}.id`),
 		color: str(w.color ?? "#1565c0", `${path}.color`),
@@ -32229,7 +32464,7 @@ function parseWire(raw, path, boardIds) {
 function assertUnique(ids, what) {
 	const seen = /* @__PURE__ */ new Set();
 	for (const id of ids) {
-		if (seen.has(id)) fail$1("", `${what} ID「${id}」重複`);
+		if (seen.has(id)) fail$2("", `${what} ID「${id}」重複`);
 		seen.add(id);
 	}
 }
@@ -32243,9 +32478,9 @@ function parseNote(raw, path, componentIds, boardIds) {
 		text: "",
 		color: "yellow"
 	};
-	if (typeof n.text !== "string") fail$1(`${path}.text`, "必須是文字");
+	if (typeof n.text !== "string") fail$2(`${path}.text`, "必須是文字");
 	note.text = n.text.slice(0, 200);
-	if (!NOTE_COLORS.includes(n.color)) fail$1(`${path}.color`, `顏色不認得（${String(n.color)}）`);
+	if (!NOTE_COLORS.includes(n.color)) fail$2(`${path}.color`, `顏色不認得（${String(n.color)}）`);
 	note.color = n.color;
 	if (typeof n.target === "string" && componentIds.has(n.target)) note.target = n.target;
 	const h = n.targetHole;
@@ -32258,13 +32493,13 @@ function parseNote(raw, path, componentIds, boardIds) {
 }
 function parseCircuit(raw) {
 	const c = obj(raw, "circuit");
-	if (c.version !== 1) fail$1("circuit.version", `不支援的電路版本 ${String(c.version)}`);
+	if (c.version !== 1) fail$2("circuit.version", `不支援的電路版本 ${String(c.version)}`);
 	const boards = arr(c.boards, "circuit.boards").map((b, i) => parseBoard(b, `circuit.boards[${i}]`));
-	if (boards.length === 0) fail$1("circuit.boards", "至少要有一塊麵包板");
-	if (boards.length > 8) fail$1("circuit.boards", `最多 8 塊麵包板`);
+	if (boards.length === 0) fail$2("circuit.boards", "至少要有一塊麵包板");
+	if (boards.length > 8) fail$2("circuit.boards", `最多 8 塊麵包板`);
 	assertUnique(boards.map((b) => b.id), "麵包板");
 	const rects = boardRects({ boards });
-	for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) if (rectsOverlap(rects[i], rects[j])) fail$1("circuit.boards", `麵包板 ${rects[i].id} 和 ${rects[j].id} 重疊`);
+	for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) if (rectsOverlap(rects[i], rects[j])) fail$2("circuit.boards", `麵包板 ${rects[i].id} 和 ${rects[j].id} 重疊`);
 	const boardIds = new Set(boards.map((b) => b.id));
 	const components = arr(c.components ?? [], "circuit.components").map((x, i) => parseComponent(x, `circuit.components[${i}]`, boardIds));
 	const wires = arr(c.wires ?? [], "circuit.wires").map((x, i) => parseWire(x, `circuit.wires[${i}]`, boardIds));
@@ -32296,14 +32531,14 @@ function parseCircuitData(raw) {
 	try {
 		const top = raw;
 		if (top.format !== void 0) {
-			if (top.format !== "breadboard-lab/circuit") fail$1("format", `不是 Breadboard Lab 的電路檔（${String(top.format)}）`);
-			if (top.version !== 2 && top.version !== 1) fail$1("version", `不支援的檔案版本 ${String(top.version)}`);
+			if (top.format !== "breadboard-lab/circuit") fail$2("format", `不是 Breadboard Lab 的電路檔（${String(top.format)}）`);
+			if (top.version !== 2 && top.version !== 1) fail$2("version", `不支援的檔案版本 ${String(top.version)}`);
 			const name = typeof top.name === "string" && top.name.trim() ? top.name.trim() : null;
 			const checklist = parseChecklist(top.checklist);
 			let logic;
 			if (top.logic !== void 0) {
 				const parsed = parseLogicDiagram(top.logic);
-				if (!parsed.ok) fail$1("logic", `邏輯圖有問題：${parsed.error}`);
+				if (!parsed.ok) fail$2("logic", `邏輯圖有問題：${parsed.error}`);
 				else logic = parsed.diagram;
 			}
 			return {
@@ -33964,6 +34199,216 @@ function stateDiagramText(task) {
 	return lines;
 }
 //#endregion
+//#region src/logic/edit.ts
+var PREFIX$1 = {
+	gate: "g",
+	INPUT: "i",
+	OUTPUT: "o",
+	DISPLAY: "d",
+	HIGH: "k",
+	LOW: "k",
+	BLOCK: "b",
+	CLOCK: "c",
+	CUSTOM: "m"
+};
+var NAME_RULE = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
+"ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+function nextNodeId(d, kind) {
+	const prefix = PREFIX$1[isGate(kind) ? "gate" : kind];
+	const used = new Set(d.nodes.map((n) => n.id));
+	for (let i = 1;; i++) if (!used.has(`${prefix}${i}`)) return `${prefix}${i}`;
+}
+function nextWireId(d) {
+	const used = new Set(d.wires.map((w) => w.id));
+	for (let i = 1;; i++) if (!used.has(`w${i}`)) return `w${i}`;
+}
+function canPlace(d, node, ignoreId) {
+	return d.nodes.every((n) => n.id === ignoreId || n.id === node.id || !overlaps(n, node));
+}
+//#endregion
+//#region src/logic/customBlocks.ts
+/** 子專案 65（規格 2026-11-14 custom-blocks）：自訂方塊的編輯（純函式，網頁與 MCP 共用）。 */
+var fail$1 = (diagram, reason) => ({
+	ok: false,
+	diagram,
+	reason
+});
+/** 方塊裡不能放的元件。 */
+var NOT_INSIDE = /* @__PURE__ */ new Set(["CLOCK", "DISPLAY"]);
+/** 下一個方塊名稱 B1、B2…。 */
+function nextBlockName(d) {
+	const used = new Set((d.blocks ?? []).map((b) => b.name));
+	for (let i = 1;; i++) if (!used.has(`B${i}`)) return `B${i}`;
+}
+function nextBlockId(blocks) {
+	const used = new Set(blocks.map((b) => b.id));
+	for (let i = 1;; i++) if (!used.has(`blk${i}`)) return `blk${i}`;
+}
+/** 名稱規則和輸入端一樣；同一個檔案不能重複。 */
+function blockNameProblem(d, name, ignoreId) {
+	if (!NAME_RULE.test(name)) return "方塊名稱要用英文字母開頭，只能有英文字母、數字、底線，最多 8 個字";
+	if ((d.blocks ?? []).some((b) => b.name === name && b.id !== ignoreId)) return `已經有叫 ${name} 的方塊了`;
+	return null;
+}
+/** 從 (x, y) 開始往右、往下找放得下的位置（找不到時回傳 null）。 */
+function freeSpot(d, node) {
+	for (let r = 0; r < 40; r++) for (let dy = 0; dy <= r; dy++) {
+		const n = {
+			...node,
+			x: node.x + r - dy,
+			y: node.y + dy
+		};
+		if (canPlace(d, n)) return n;
+	}
+	return null;
+}
+/** 名稱不重複：重複時加 2、3…。 */
+function uniqueNames(names) {
+	const used = /* @__PURE__ */ new Set();
+	return names.map((n) => {
+		let name = n;
+		for (let k = 2; used.has(name); k++) name = `${n.slice(0, 7)}${k}`;
+		used.add(name);
+		return name;
+	});
+}
+/**
+* 規格第 3 節：把選取的元件包成一個方塊。從外面接進來的同一個訊號是一個輸入腳（腳名用來源輸入端的名稱，不然是 I1…），
+* 從裡面接出去的同一個訊號是一個輸出腳（腳名用接到的輸出端名稱，不然是 O1…）；腳的順序照圖上的位置由上到下。
+*/
+function wrapAsBlock(d, ids, name = nextBlockName(d)) {
+	const picked = new Set(ids);
+	const inside = d.nodes.filter((n) => picked.has(n.id));
+	if (inside.length === 0) return fail$1(d, "先選取要包起來的元件");
+	if (inside.find((n) => n.kind === "INPUT" || n.kind === "OUTPUT")) return fail$1(d, "輸入端、輸出端留在外面（會自動變成方塊的腳），只選閘與方塊");
+	const bad = inside.find((n) => NOT_INSIDE.has(n.kind));
+	if (bad) return fail$1(d, bad.kind === "CLOCK" ? "時脈不能包進方塊（時脈從方塊的輸入腳接進來）" : "7 段顯示器不能包進方塊");
+	const problem = blockNameProblem(d, name);
+	if (problem) return fail$1(d, problem);
+	const byId = new Map(d.nodes.map((n) => [n.id, n]));
+	const place = (id) => byId.get(id);
+	const byPlace = (a, b) => a.y - b.y || a.x - b.x;
+	const incoming = d.wires.filter((w) => picked.has(w.to.node) && !picked.has(w.from));
+	const outgoing = d.wires.filter((w) => picked.has(w.from) && !picked.has(w.to.node));
+	const internal = d.wires.filter((w) => picked.has(w.from) && picked.has(w.to.node));
+	const inSignals = [...new Map(incoming.map((w) => [signalOf(w.from, w.fromPin), w])).values()].sort((a, b) => byPlace(place(a.from), place(b.from)) || (a.fromPin ?? 0) - (b.fromPin ?? 0));
+	const outGroups = /* @__PURE__ */ new Map();
+	for (const w of outgoing) outGroups.set(signalOf(w.from, w.fromPin), [...outGroups.get(signalOf(w.from, w.fromPin)) ?? [], w]);
+	const top = (ws) => ws.map((w) => place(w.to.node)).sort(byPlace)[0];
+	const outSignals = [...outGroups.entries()].sort((a, b) => byPlace(top(a[1]), top(b[1])));
+	const inNames = uniqueNames(inSignals.map((w, k) => place(w.from).kind === "INPUT" && place(w.from).name ? place(w.from).name : `I${k + 1}`));
+	const outNames = uniqueNames(outSignals.map(([, ws], k) => ws.map((w) => place(w.to.node)).find((n) => n.kind === "OUTPUT")?.name ?? `O${k + 1}`));
+	const x0 = Math.min(...inside.map((n) => n.x));
+	const y0 = Math.min(...inside.map((n) => n.y));
+	const x1 = Math.max(...inside.map((n) => n.x + boxOf(n).w));
+	const dx = 4 - x0;
+	const dy = 1 - y0;
+	const inner = inside.map((n) => ({
+		...n,
+		x: n.x + dx,
+		y: n.y + dy
+	}));
+	const inNodes = inNames.map((nm, k) => ({
+		id: `pi${k + 1}`,
+		kind: "INPUT",
+		x: 0,
+		y: 1 + 2 * k,
+		name: nm,
+		value: 0
+	}));
+	const outNodes = outNames.map((nm, k) => ({
+		id: `po${k + 1}`,
+		kind: "OUTPUT",
+		x: x1 + dx + 2,
+		y: 1 + 2 * k,
+		name: nm
+	}));
+	let wireNo = 0;
+	const wid = () => `w${++wireNo}`;
+	const innerWires = [
+		...internal.map((w) => ({
+			...w,
+			id: wid()
+		})),
+		...incoming.map((w) => {
+			const k = inSignals.findIndex((s) => signalOf(s.from, s.fromPin) === signalOf(w.from, w.fromPin));
+			return {
+				id: wid(),
+				from: inNodes[k].id,
+				to: { ...w.to }
+			};
+		}),
+		...outSignals.map(([, ws], k) => ({
+			id: wid(),
+			from: ws[0].from,
+			...ws[0].fromPin ? { fromPin: ws[0].fromPin } : {},
+			to: {
+				node: outNodes[k].id,
+				pin: 0
+			}
+		}))
+	];
+	const blocks = d.blocks ?? [];
+	const def = {
+		id: nextBlockId(blocks),
+		name,
+		nodes: [
+			...inNodes,
+			...inner,
+			...outNodes
+		],
+		wires: innerWires
+	};
+	const notes = dropLogicNoteTargets(d.notes, picked);
+	let outer = {
+		...d,
+		nodes: d.nodes.filter((n) => !picked.has(n.id)),
+		wires: d.wires.filter((w) => !picked.has(w.from) && !picked.has(w.to.node)),
+		blocks: [...blocks, def],
+		...notes ? { notes } : {}
+	};
+	const id = nextNodeId(d, "CUSTOM");
+	const node = freeSpot(outer, {
+		id,
+		kind: "CUSTOM",
+		x: x0,
+		y: y0,
+		block: def.id,
+		inputs: inNodes.length,
+		outputs: outNodes.length
+	});
+	if (!node) return fail$1(d, "附近沒有空位放方塊");
+	outer = {
+		...outer,
+		nodes: [...outer.nodes, node]
+	};
+	const add = (w) => outer = {
+		...outer,
+		wires: [...outer.wires, {
+			id: nextWireId(outer),
+			...w
+		}]
+	};
+	inSignals.forEach((s, k) => add({
+		from: s.from,
+		...s.fromPin ? { fromPin: s.fromPin } : {},
+		to: {
+			node: id,
+			pin: k
+		}
+	}));
+	outSignals.forEach(([, ws], k) => ws.forEach((w) => add({
+		from: id,
+		...k > 0 ? { fromPin: k } : {},
+		to: { ...w.to }
+	})));
+	return {
+		ok: true,
+		diagram: outer,
+		id
+	};
+}
+//#endregion
 //#region src/editor/manualWire.ts
 /** 實體跳線常見的 10 種顏色；紅、黑、黃…與自動佈線的配色一致。 */
 var WIRE_COLORS = [
@@ -35024,7 +35469,7 @@ function applyRouting(circuit, result) {
 }
 //#endregion
 //#region src/logic/check.ts
-function nodeLabel(node) {
+function nodeLabel(node, d) {
 	if (node.kind === "INPUT") return `輸入 ${node.name}`;
 	if (node.kind === "OUTPUT") return `輸出 ${node.name}`;
 	if (node.kind === "DISPLAY") return `顯示器 ${node.name}`;
@@ -35032,12 +35477,13 @@ function nodeLabel(node) {
 	if (node.kind === "LOW") return `GND ${node.id}`;
 	if (node.kind === "BLOCK") return `方塊 ${node.id}（${node.chip}）`;
 	if (node.kind === "CLOCK") return `時脈 ${node.name}`;
+	if (node.kind === "CUSTOM") return `方塊 ${d?.blocks?.find((b) => b.id === node.block)?.name ?? node.block}（${node.id}）`;
 	return `${node.id}（${node.kind}）`;
 }
 /** 規格第 4 節。順序：缺輸入 / 輸出端、每個節點（依圖上的順序）的開路與沒用到。子專案 59 起閘接回前面的迴授（閂鎖）不算錯。 */
 function checkDiagram(d) {
 	const issues = [];
-	if (d.nodes.some((n) => isGate(n.kind))) {
+	if (d.nodes.some((n) => isGate(n.kind) || n.kind === "CUSTOM")) {
 		if (!d.nodes.some((n) => n.kind === "INPUT")) issues.push({
 			code: "LOGIC_NO_IO",
 			severity: "warning",
@@ -35111,13 +35557,13 @@ function checkDiagram(d) {
 		for (let pin = 0; pin < inputCountOf(node); pin++) if (!driven.has(`${node.id}#${pin}`)) issues.push({
 			code: "LOGIC_INPUT_OPEN",
 			severity: "warning",
-			message: `${nodeLabel(node)}第 ${pin + 1} 個輸入沒有接線，值不確定`,
+			message: `${nodeLabel(node, d)}第 ${pin + 1} 個輸入沒有接線，值不確定`,
 			nodeIds: [node.id]
 		});
-		if (!used.has(node.id)) issues.push({
+		if (!used.has(node.id) && outputCountOf(node) > 0) issues.push({
 			code: "LOGIC_UNUSED",
 			severity: "warning",
-			message: `${nodeLabel(node)}的輸出沒有接到任何地方`,
+			message: `${nodeLabel(node, d)}的輸出沒有接到任何地方`,
 			nodeIds: [node.id]
 		});
 	}
@@ -35187,6 +35633,7 @@ function displayResistorsOf(d, chosen) {
 }
 /** 規格第 6 節：不能轉的原因；可以轉時回傳 null。 */
 function convertProblem(d, options = {}) {
+	d = flat(d).diagram;
 	const issues = checkDiagram(d);
 	const { inputs, outputs } = sortedIo(d);
 	if (inputs.length === 0 && !d.nodes.some((n) => n.kind === "CLOCK") || outputs.length === 0) return "邏輯圖要有輸入端和輸出端才能轉";
@@ -35868,7 +36315,7 @@ function hasParts(d, options) {
 }
 /** 規格（2026-10-13 logic-to-breadboard）第 4、5 節。 */
 function toBreadboard(diagram, options, variant = DEFAULT_LAYOUT) {
-	const d = packFlipFlops(diagram);
+	const d = packFlipFlops(flat(diagram).diagram);
 	if (variant.parts && !hasParts(d, options)) return {
 		ok: false,
 		reason: ""
@@ -36789,6 +37236,7 @@ function isBetterConversion(a, b) {
 * 拿到這一批的結果再往下走。parallel：同時能跑幾件（網頁用好幾個 Worker；MCP 一次一件），只影響時間怎麼分，每件分到的時間和一次一件時一樣。
 */
 function* convertSteps(d, options, budget = {}, parallel = 1) {
+	d = flat(d).diagram;
 	const problem = convertProblem(d, options);
 	if (problem) return {
 		ok: false,
@@ -37060,6 +37508,7 @@ function sumOfProducts(n, ones, names) {
 }
 /** 每個輸出端（依名稱排序）的兩種式子；displays：圖上有 7 段顯示器（不列式子）。 */
 function diagramFormulas(d) {
+	d = flat(d).diagram;
 	const { inputs, outputs: sinks } = sortedIo(d);
 	const displays = sinks.some((n) => n.kind === "DISPLAY");
 	const outputs = sinks.filter((n) => n.kind === "OUTPUT");
@@ -37512,7 +37961,8 @@ function layoutMissing(raw) {
 		y,
 		inputs: typeof n.inputs === "number" ? n.inputs : n.kind === "NOT" ? 1 : 2,
 		...typeof n.chip === "string" ? { chip: n.chip } : {},
-		...n.segments === true ? { segments: true } : {}
+		...n.segments === true ? { segments: true } : {},
+		...typeof n.outputs === "number" ? { outputs: n.outputs } : {}
 	});
 	const hasPos = (n) => Number.isInteger(n.x) && Number.isInteger(n.y);
 	const placed = nodes.filter(hasPos).map((n) => asNode(n, n.x, n.y));
@@ -37533,12 +37983,42 @@ function layoutMissing(raw) {
 		nodes: out
 	};
 }
+/** 子專案 65：自訂方塊的節點先填好腳數（自動排版要知道大小），方塊裡面沒有位置的也自動排版。 */
+function withBlockLayout(raw) {
+	if (!Array.isArray(raw.blocks)) return raw;
+	const count = (b, kind) => isObj(b) && Array.isArray(b.nodes) ? b.nodes.filter((n) => isObj(n) && n.kind === kind).length : 0;
+	const pins = new Map(raw.blocks.filter(isObj).map((b) => [String(b.id), {
+		inputs: count(b, "INPUT"),
+		outputs: count(b, "OUTPUT")
+	}]));
+	const fill = (nodes) => Array.isArray(nodes) ? nodes.map((n) => isObj(n) && n.kind === "CUSTOM" && pins.has(String(n.block)) ? {
+		...n,
+		...pins.get(String(n.block))
+	} : n) : nodes;
+	return {
+		...raw,
+		nodes: fill(raw.nodes),
+		blocks: raw.blocks.map((b) => isObj(b) ? layoutMissing({
+			...b,
+			nodes: fill(b.nodes)
+		}) : b)
+	};
+}
+/** 子專案 65：檔案裡的自訂方塊與腳（MCP 回覆用）。 */
+function blocksText(d) {
+	if (!d.blocks || d.blocks.length === 0) return [];
+	return ["自訂方塊：", ...d.blocks.map((b) => {
+		const p = blockPins(b);
+		const uses = d.nodes.filter((n) => n.kind === "CUSTOM" && n.block === b.id).map((n) => n.id);
+		return `- ${b.name}（id ${b.id}）：輸入 ${p.inputs.map((n) => n.name).join("、") || "沒有"} → 輸出 ${p.outputs.map((n) => n.name).join("、") || "沒有"}；裡面 ${b.nodes.length - p.inputs.length - p.outputs.length} 個元件${uses.length > 0 ? `；主圖用到 ${uses.join("、")}` : ""}`;
+	})];
+}
 function logicSet(f, args) {
 	if (!isObj(args.diagram)) return fail("邏輯圖有問題：diagram 要是物件（version、nodes、wires）");
-	const parsed = parseLogicDiagram(layoutMissing({
+	const parsed = parseLogicDiagram(layoutMissing(withBlockLayout({
 		version: 1,
 		...args.diagram
-	}));
+	})));
 	if (!parsed.ok) return fail(`邏輯圖有問題：${parsed.error}`);
 	const kept = !parsed.diagram.task && f.logic.task ? f.logic.task : void 0;
 	const d = kept ? {
@@ -37547,8 +38027,9 @@ function logicSet(f, args) {
 	} : parsed.diagram;
 	const count = (pred) => d.nodes.filter(pred).length;
 	const blocks = count((n) => n.kind === "BLOCK");
+	const customs = count((n) => n.kind === "CUSTOM");
 	const sinks = count((n) => n.kind === "OUTPUT" || n.kind === "DISPLAY");
-	const lines = [`寫入邏輯圖：輸入 ${count((n) => n.kind === "INPUT")} 個、閘 ${count((n) => isGate(n.kind))} 個${blocks > 0 ? `、IC 方塊 ${blocks} 個` : ""}、輸出 ${sinks} 個、線 ${d.wires.length} 條。`];
+	const lines = [`寫入邏輯圖：輸入 ${count((n) => n.kind === "INPUT")} 個、閘 ${count((n) => isGate(n.kind))} 個${blocks > 0 ? `、IC 方塊 ${blocks} 個` : ""}${customs > 0 ? `、自訂方塊 ${customs} 個` : ""}、輸出 ${sinks} 個、線 ${d.wires.length} 條。`, ...blocksText(d)];
 	const issues = checkDiagram(d);
 	lines.push(issues.length === 0 ? "檢查：沒有發現問題。" : `檢查：\n${issues.map((i) => `- ${i.message}`).join("\n")}`);
 	if (kept) lines.push("保留檔案裡的真值表題目。");
@@ -37561,6 +38042,30 @@ function logicSet(f, args) {
 	};
 }
 var NO_LOGIC = "檔案裡還沒有邏輯圖；用 logic_set 寫入";
+/** 子專案 65（規格 2026-11-14 custom-blocks 第 5 節）：把邏輯圖裡的幾個元件包成一個自訂方塊（和網頁的「包成方塊」一樣）。 */
+function logicWrapBlock(f, args) {
+	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
+	const missing = args.nodes.filter((id) => !f.logic.nodes.some((n) => n.id === id));
+	if (missing.length > 0) return fail(`邏輯圖裡沒有 ${missing.join("、")}`);
+	const before = truthTable(f.logic);
+	const r = wrapAsBlock(f.logic, args.nodes, args.name ?? nextBlockName(f.logic));
+	if (!r.ok) return fail(r.reason);
+	const after = truthTable(r.diagram);
+	const same = before.ok && after.ok ? JSON.stringify(before.rows) === JSON.stringify(after.rows) : null;
+	const def = r.diagram.blocks[r.diagram.blocks.length - 1];
+	return {
+		text: [
+			`把 ${args.nodes.join("、")} 包成方塊 ${def.name}，放在 ${r.id}。`,
+			...blocksText(r.diagram),
+			...same === null ? [] : [same ? "真值表和包起來之前一樣。" : "注意：真值表和包起來之前不一樣。"],
+			"要再放一個：logic_set 加一個 { kind: \"CUSTOM\", block: \"" + def.id + "\" } 的節點；網頁上點兩下方塊可以進去改。"
+		].join("\n"),
+		file: {
+			...f,
+			logic: r.diagram
+		}
+	};
+}
 function logicTruthTable(f, args = {}) {
 	if (f.logic.nodes.length === 0) return fail(NO_LOGIC);
 	if (isSequential(f.logic)) return sequenceReply(f.logic, args.pulses ?? 16, args.clocks);
@@ -38576,7 +39081,7 @@ var server = new McpServer({
 	"電路檔就是網頁「匯出 JSON」的格式；做完用 share_link 給使用者一個連結（點開就在網頁上看到），或請使用者在網頁用「檔案 → 匯入 JSON」打開。",
 	"標準接線規則（auto_route 與 logic_to_breadboard 的結果一定遵守，check_circuit 照這個檢查）：每條導線只能水平或垂直的直線，不能斜；要轉彎就分成兩條線（轉角接在同一排相通的五孔排）；兩條線不能重疊，也不能交叉；線不能跨過 IC（上下、左右都不行）或經過元件腳、別條線的端點。auto_route 與 logic_to_breadboard 接出來的線都符合這些規則。add_wire 和使用者在網頁上自己接一樣可以接斜線（只檢查兩端），check_circuit 會提醒，auto_route 會全部改成直線；水平或垂直的線不合規則時 add_wire 會拒絕。",
 	"建議流程：new_circuit → list_parts（查元件名稱與腳位）→ place_part（IC 第 1 腳放在 F 列，跨過凹槽）→ add_wire → check_circuit → auto_route → simulate。",
-	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
+	"從邏輯圖開始：logic_set → logic_truth_table → logic_to_breadboard（轉換、佈線、比對一次完成）；重複用到的一段可以做成自訂方塊（logic_set 的 blocks，或 logic_wrap_block 包起來）。手接的麵包板用 set_part 標上和邏輯圖一樣的名稱，再用 check_against_diagram 比對。",
 	"從真值表題目開始：task_set → task_show → task_to_diagram → logic_to_breadboard → task_check。",
 	"時序電路（正反器、計數器）：logic_set 用 CLOCK 節點（最多 4 個，各自獨立）與 74LS74 / 76 / 90 / 93 / 161 / 193 方塊或單顆正反器 DFF / JKFF → logic_truth_table 看時序表與文字波形（好幾個時脈時用 clocks 指定送的順序）→ logic_to_breadboard。",
 	"從狀態表題目開始（時序電路的設計題）：state_task_set → state_task_to_diagram（用 DFF / JKFF 產生電路並列出化簡後的式子）→ logic_truth_table → logic_to_breadboard；自己畫的電路（logic_set，狀態位元接輸出端 Q0、Q1…）或接好的麵包板（狀態位元的 LED 叫 Q0、Q1…）用 state_task_check 比對。"
@@ -38717,16 +39222,30 @@ server.registerTool("logic_set", {
 		"HIGH（5V）、LOW（GND）、BLOCK（chip：74LS83、74LS151、74LS153、74LS138、74LS85；時序 IC：74LS74 雙 D 正反器、74LS76 雙 JK 正反器、74LS90、74LS93、74LS161、74LS193 計數器；單顆正反器 DFF（D、CLK、/PRE、/CLR → Q、/Q）、JKFF（J、CLK、K、/PRE、/CLR → Q、/Q），轉成麵包板時兩顆合用一片 74LS74 / 74LS76；輸入可以不接：清除 / 預設 / 載入不用、資料 0、時脈 1）、",
 		"CLOCK（時脈，name，一張圖最多 4 個，各自接不同的正反器、計數器的 CLK；轉成麵包板時每個時脈一個時脈元件，名稱一樣）。腳的順序用 BLOCK 的腳名（和 74LS 資料表一樣），fromPin 是第幾個輸出。",
 		"線：{ id, from, fromPin?（方塊的第幾個輸出）, to: { node, pin } }。節點沒有 x、y 時自動排版。",
-		"閘的輸出可以接回前面（迴授，例如 NAND 交叉接成的 SR 閂鎖）。輸入端最多 12 個；名稱英文字母開頭、最多 8 個英數字（Q̄ 寫成 QBAR、清除寫成 CLR）。"
+		"閘的輸出可以接回前面（迴授，例如 NAND 交叉接成的 SR 閂鎖）。輸入端最多 12 個；名稱英文字母開頭、最多 8 個英數字（Q̄ 寫成 QBAR、清除寫成 CLR）。",
+		"自訂方塊：diagram.blocks 是 [{ id, name, nodes, wires }]，裡面是一張小邏輯圖，輸入端是方塊的輸入腳、輸出端是輸出腳（腳的順序照 y 由上到下，再看 x）；主圖用 { kind: \"CUSTOM\", block: \"<id>\" } 放方塊，to.pin / fromPin 是第幾個腳。方塊裡可以放其他方塊（不能用到自己），不能放 CLOCK、DISPLAY。真值表、轉成麵包板都會把方塊展開。也可以用 logic_wrap_block 把現有的元件包起來。"
 	].join(""),
 	inputSchema: {
 		file,
 		diagram: object({
 			nodes: array(record(string(), unknown())),
-			wires: array(record(string(), unknown()))
-		}).passthrough().describe("{ nodes: [...], wires: [...] }")
+			wires: array(record(string(), unknown())),
+			blocks: array(record(string(), unknown())).optional()
+		}).passthrough().describe("{ nodes: [...], wires: [...], blocks?: [...] }")
 	}
 }, async ({ file: f, diagram }) => withFile(f, (lab) => logicSet(lab, { diagram })));
+server.registerTool("logic_wrap_block", {
+	title: "包成自訂方塊",
+	description: "把邏輯圖裡的幾個元件（閘、IC 方塊、5V / GND、其他自訂方塊）包成一個自訂方塊，和網頁的「包成方塊」一樣：從外面接進來的同一個訊號是一個輸入腳（腳名用來源輸入端的名稱，不然是 I1…），接出去的同一個訊號是一個輸出腳（腳名用接到的輸出端名稱，不然是 O1…）。輸入端、輸出端、時脈、7 段顯示器不能包。回覆列出方塊的腳，並確認真值表沒變。",
+	inputSchema: {
+		file,
+		nodes: array(string()).min(1).describe("要包起來的元件 id"),
+		name: string().optional().describe("方塊名稱（英文字母開頭、最多 8 個英數字；預設 B1、B2…）")
+	}
+}, async ({ file: f, nodes, name }) => withFile(f, (lab) => logicWrapBlock(lab, {
+	nodes,
+	...name ? { name } : {}
+})));
 server.registerTool("logic_truth_table", {
 	title: "真值表",
 	description: "電路檔裡邏輯圖的真值表（輸入依名稱排序，第一個是最高位元，最多 12 個輸入）、每個輸出的布林式（照圖寫出來與化簡後）與檢查結果。有迴授（閂鎖）時，輸出跟之前的狀態有關的格子寫「保持」，一直來回跳的寫「不穩定」。時序電路（有正反器、計數器或時脈）回傳時序表：從重設開始每次脈衝之後的輸出，再加一段文字波形（每格一個字元，‾ 是 1、_ 是 0）。有好幾個時脈時，每次送一個時脈：預設送名稱排第一個的，clocks 指定順序（照順序一直重複），表格多一欄寫送了哪個時脈，波形每個時脈一條。",
