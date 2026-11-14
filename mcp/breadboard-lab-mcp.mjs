@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.14（commit d3215fd）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.14（commit 78e9215）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -33872,6 +33872,61 @@ function mappingText(io, b) {
 	return [...b.inputs.map((s) => s.button ? `${s.node} → ${s.switchId}（按下 = ${s.onIs}）` : `${s.node} → ${s.switchId} 第 ${s.index + 1} 個開關（ON = ${s.onIs}）`), ...io.outputs.map((o) => `${o.name} → ${b.leds[o.id]}`)].join("、");
 }
 //#endregion
+//#region src/logic/stateDiagram.ts
+var bitsOf = (i, m) => Array.from({ length: m }, (_, b) => i >> m - 1 - b & 1).join("");
+function stateDiagram(task) {
+	const m = task.inputs.length;
+	const per = 1 << m;
+	const outText = (out) => out.map(String).join("");
+	const rowsOf = (s) => task.rows.slice(s * per, (s + 1) * per);
+	const moore = task.outputs.length > 0 && Array.from({ length: task.states }, (_, s) => rowsOf(s)).every((rows) => rows.every((r) => outText(r.out) === outText(rows[0].out)));
+	const names = Array.from({ length: task.states }, (_, s) => moore ? `S${s}/${outText(rowsOf(s)[0].out)}` : `S${s}`);
+	const edges = [];
+	const dontCare = [];
+	task.rows.forEach((row, i) => {
+		const from = i >> m;
+		const input = bitsOf(i & per - 1, m);
+		const label = moore || task.outputs.length === 0 ? input : `${input}/${outText(row.out)}`;
+		if (row.next === "X") {
+			dontCare.push({
+				from,
+				label
+			});
+			return;
+		}
+		const edge = edges.find((e) => e.from === from && e.to === row.next);
+		if (edge) edge.labels.push(label);
+		else edges.push({
+			from,
+			to: row.next,
+			labels: [label]
+		});
+	});
+	for (const e of edges) e.labels = e.labels.filter((l) => l !== "");
+	return {
+		moore,
+		names,
+		edges,
+		dontCare
+	};
+}
+/** 標籤怎麼讀（例如「X/Z」「X Y」），放在圖的說明。 */
+function labelLegend(task, moore) {
+	const ins = task.inputs.join("");
+	const outs = task.outputs.join("");
+	if (task.outputs.length === 0) return ins ? `箭頭上寫輸入 ${ins}` : "每次脈衝走一個箭頭";
+	if (moore) return `圓圈裡寫 狀態/${outs}（Moore：輸出只看狀態）${ins ? `，箭頭上寫輸入 ${ins}` : ""}`;
+	return `箭頭上寫 ${ins}/${outs}（Mealy：輸入/輸出）`;
+}
+/** MCP 用的文字版：每個箭頭一行。 */
+function stateDiagramText(task) {
+	const d = stateDiagram(task);
+	const lines = [`狀態圖（${labelLegend(task, d.moore)}）：`];
+	for (const e of d.edges) lines.push(`- ${d.names[e.from]} → ${d.names[e.to]}${e.labels.length > 0 ? `：${e.labels.join("、")}` : ""}`);
+	for (const x of d.dontCare) lines.push(`- ${d.names[x.from]}${x.label ? `（${x.label}）` : ""} → 任意（不在乎，沒有畫箭頭）`);
+	return lines;
+}
+//#endregion
 //#region src/editor/manualWire.ts
 /** 實體跳線常見的 10 種顏色；紅、黑、黃…與自動佈線的配色一致。 */
 var WIRE_COLORS = [
@@ -37641,6 +37696,8 @@ function taskText(task) {
 			return `${[`S${s}(${stateCode(task.states, s)})`, ...ins].join(" ")} | ${row.next === "X" ? "X" : `S${row.next}`}${row.out.length > 0 ? ` ${row.out.join(" ")}` : ""}`;
 		}),
 		"",
+		...stateDiagramText(task),
+		"",
 		`化簡後的式子（積項和；變數 ${excitationTask(task).inputs.join(" ")}，Q0 是最低位元；沒用到的狀態編碼當成不在乎）：`,
 		...equations(task)
 	];
@@ -38736,7 +38793,7 @@ server.registerTool("state_task_set", {
 		"狀態是 S0…S(states − 1)，用二進位編碼（S0 是重設後的狀態；正反器的個數是最少能編出所有狀態的個數，狀態位元叫 Q0、Q1、Q2）。",
 		"rows 是「現在狀態 × 輸入組合」：狀態由小到大，同一個狀態裡輸入照二進位從全 0 到全 1（第一個輸入是最高位元），共 states × 2^輸入數 列；",
 		"每列寫 next（下一個狀態 0–states−1 或 \"X\" 不在乎）與 out（每個輸出的 0 / 1 / \"X\"，輸出寫在每一列，Moore 和 Mealy 都能寫）。",
-		"回覆列出狀態表與化簡後的式子（D 型是 D1、D0；JK 用激勵表，是 J1 K1 J0 K0）。"
+		"回覆列出狀態表、文字版的狀態圖（每個箭頭一行，例如「S0 → S1：1/0」；每個狀態的輸出都和輸入無關時寫成 Moore 形式 S0/1）與化簡後的式子（D 型是 D1、D0；JK 用激勵表，是 J1 K1 J0 K0）。"
 	].join(""),
 	inputSchema: {
 		file,
