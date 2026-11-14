@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.14（commit e3292b3）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.14（commit fd7c944）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -29653,6 +29653,8 @@ function inputCountOf(node) {
 	if (isSource(node.kind)) return 0;
 	if (node.kind === "BLOCK") return node.chip ? BLOCK_PINS[node.chip].inputs.length : 0;
 	if (node.kind === "CUSTOM") return node.inputs ?? 0;
+	if (node.kind === "SPLIT") return 1;
+	if (node.kind === "MERGE") return node.width ?? 4;
 	if (node.kind === "DISPLAY") return node.segments ? 8 : 5;
 	if (node.kind === "OUTPUT" || node.kind === "NOT") return 1;
 	if (node.kind === "XOR") return 2;
@@ -29663,6 +29665,7 @@ function outputCountOf(node) {
 	if (isSink(node.kind)) return 0;
 	if (node.kind === "BLOCK") return node.chip ? BLOCK_PINS[node.chip].outputs.length : 0;
 	if (node.kind === "CUSTOM") return node.outputs ?? 0;
+	if (node.kind === "SPLIT") return node.width ?? 4;
 	return 1;
 }
 /** 規格 2.1 的表。 */
@@ -29670,6 +29673,10 @@ function nodeSize(node) {
 	if (node.kind === "BLOCK" || node.kind === "CUSTOM") return {
 		w: 6,
 		h: Math.max(inputCountOf(node), outputCountOf(node), 1) + 1
+	};
+	if (node.kind === "SPLIT" || node.kind === "MERGE") return {
+		w: 2,
+		h: node.width ?? 4
 	};
 	if (node.kind === "INPUT" || node.kind === "OUTPUT" || node.kind === "HIGH" || node.kind === "LOW" || node.kind === "CLOCK") return {
 		w: 2,
@@ -29703,6 +29710,8 @@ var OFFSETS = {
 		4
 	]
 };
+/** 子專案 66：合起來 / 拆開的匯流排腳在第幾列（中間偏上）。 */
+var busRow = (node) => Math.floor(((node.width ?? 4) - 1) / 2);
 /**
 * 子專案 26：本地座標（沒轉時：輸入在 u = 0、輸出在 u = w，v 是列）換到轉向後、相對於 (x, y) 的位置。
 * 子專案 28：鏡射先把 u 換成 w − u，再轉：90°：(h − 1 − v, u)；180°：(w − u, h − 1 − v)；270°：(v, w − u)。
@@ -29749,7 +29758,8 @@ function boxOf(node) {
 }
 function inputPins(node) {
 	const n = inputCountOf(node);
-	if (node.kind === "BLOCK" || node.kind === "CUSTOM") return Array.from({ length: n }, (_, k) => place(node, 0, k));
+	if (node.kind === "BLOCK" || node.kind === "CUSTOM" || node.kind === "MERGE") return Array.from({ length: n }, (_, k) => place(node, 0, k));
+	if (node.kind === "SPLIT") return [place(node, 0, busRow(node))];
 	if (node.kind === "DISPLAY") return (node.segments ? [
 		0,
 		1,
@@ -29772,7 +29782,8 @@ function inputPins(node) {
 function outputPins(node) {
 	if (isSink(node.kind)) return [];
 	const { w, h } = nodeSize(node);
-	if (node.kind === "BLOCK" || node.kind === "CUSTOM") return Array.from({ length: outputCountOf(node) }, (_, k) => place(node, w, k));
+	if (node.kind === "BLOCK" || node.kind === "CUSTOM" || node.kind === "SPLIT") return Array.from({ length: outputCountOf(node) }, (_, k) => place(node, w, k));
+	if (node.kind === "MERGE") return [place(node, w, busRow(node))];
 	return [place(node, w, isGate(node.kind) ? Math.floor(h / 2) : 0)];
 }
 /** 第 k 個輸出腳（預設第 0 個）。 */
@@ -30013,38 +30024,118 @@ function sopText(terms, names) {
 	if (parts.some((p) => p.length === 0)) return "1";
 	return parts.map((p) => p.map((l) => `${l.name}${l.negated ? "'" : ""}`).join("")).join(" + ");
 }
+var byPlace = (a, c) => a.y - c.y || a.x - c.x;
+function groupOf(list, bus) {
+	const sorted = [...list].sort(byPlace);
+	if (!bus) return sorted.map((n) => ({
+		key: n.name ?? n.id,
+		label: n.name ?? n.id,
+		nodes: [n]
+	}));
+	const parts = /* @__PURE__ */ new Map();
+	for (const n of sorted) {
+		const m = /^(.*?[A-Za-z_])(\d+)$/.exec(n.name ?? "");
+		if (!m) continue;
+		const bits = parts.get(m[1]) ?? /* @__PURE__ */ new Map();
+		bits.set(Number(m[2]), n);
+		parts.set(m[1], bits);
+	}
+	/** 剛好是 0…n−1（n ≥ 2，最多 MAX_BUS 位）的那幾組。 */
+	const groups = /* @__PURE__ */ new Map();
+	for (const [base, bits] of parts) {
+		const n = bits.size;
+		if (n < 2 || n > 8 || !Array.from({ length: n }, (_, k) => bits.has(k)).every(Boolean)) continue;
+		if (sorted.some((x) => x.name === base)) continue;
+		groups.set(base, Array.from({ length: n }, (_, k) => bits.get(k)));
+	}
+	const out = [];
+	const done = /* @__PURE__ */ new Set();
+	for (const n of sorted) {
+		const base = [...groups.entries()].find(([, nodes]) => nodes.includes(n))?.[0];
+		if (base === void 0) out.push({
+			key: n.name ?? n.id,
+			label: n.name ?? n.id,
+			nodes: [n]
+		});
+		else if (!done.has(base)) {
+			done.add(base);
+			const nodes = groups.get(base);
+			out.push({
+				key: base,
+				label: `${base}[${nodes.length - 1}:0]`,
+				nodes
+			});
+		}
+	}
+	return out;
+}
+/** 方塊的腳：輸入腳、輸出腳（照圖上的位置由上到下；多位元腳在那一組最上面的位置）。 */
+function blockPinGroups(b) {
+	return {
+		inputs: groupOf(b.nodes.filter((n) => n.kind === "INPUT"), !!b.busPins),
+		outputs: groupOf(b.nodes.filter((n) => n.kind === "OUTPUT"), !!b.busPins)
+	};
+}
+var blockOfNode = (d, node) => node.kind === "CUSTOM" ? d.blocks?.find((b) => b.id === node.block) : void 0;
+/** 第 pin 個輸入腳的位元數。 */
+function inWidth(d, node, pin) {
+	if (node.kind === "SPLIT") return node.width ?? 1;
+	const b = blockOfNode(d, node);
+	return b ? blockPinGroups(b).inputs[pin]?.nodes.length ?? 1 : 1;
+}
+/** 第 pin 個輸出腳的位元數。 */
+function outWidth(d, node, pin) {
+	if (node.kind === "MERGE") return node.width ?? 1;
+	const b = blockOfNode(d, node);
+	return b ? blockPinGroups(b).outputs[pin]?.nodes.length ?? 1 : 1;
+}
 //#endregion
 //#region src/logic/flatten.ts
 /**
 * 子專案 65（規格 2026-11-14 custom-blocks 第 1 節）：方塊的腳：裡面的輸入端、輸出端，照圖上的位置由上到下（y，再 x）。
 */
 function blockPins(b) {
-	const byPlace = (a, c) => a.y - c.y || a.x - c.x;
+	const g = blockPinGroups(b);
+	const pin = (x) => ({
+		name: x.label,
+		key: x.key,
+		width: x.nodes.length
+	});
 	return {
-		inputs: b.nodes.filter((n) => n.kind === "INPUT").sort(byPlace),
-		outputs: b.nodes.filter((n) => n.kind === "OUTPUT").sort(byPlace)
+		inputs: g.inputs.map(pin),
+		outputs: g.outputs.map(pin)
 	};
 }
 /**
-* 規格第 2 節：把每個自訂方塊換成它裡面的元件（巢狀時一層一層展開）。接到方塊輸入腳的線改接到裡面用到那個輸入端的腳，
+* 規格（2026-11-14 custom-blocks）第 2 節：把每個自訂方塊換成它裡面的元件（巢狀時一層一層展開）。接到方塊輸入腳的線改接到裡面用到那個輸入端的腳，
 * 從方塊輸出腳出去的線改從裡面接到那個輸出端的訊號出去；沒接的腳就是沒接。找不到定義或用到自己的方塊當成空的。
+* 子專案 66（規格 2026-11-14 bus 第 3 節）：以位元為單位：匯流排線拆成一位元的連接，經過合起來、拆開與方塊的多位元腳，最後只剩一位元的線。
 */
 function flattenDiagram(d) {
-	if (!d.nodes.some((n) => n.kind === "CUSTOM")) return {
+	if (!d.nodes.some((n) => n.kind === "CUSTOM" || n.kind === "MERGE" || n.kind === "SPLIT")) return {
 		diagram: d,
 		alias: /* @__PURE__ */ new Map()
 	};
 	const defs = new Map((d.blocks ?? []).map((b) => [b.id, b]));
 	const nodes = [];
 	const wires = [];
-	/** 方塊節點 → 每個輸入腳、輸出腳在裡面的輸入端、輸出端（展開後的 id）。 */
+	/** 方塊節點 → 每個輸入腳、輸出腳的每一位在裡面的輸入端、輸出端（展開後的 id）。 */
 	const custom = /* @__PURE__ */ new Map();
-	/** 裡面的輸入端 → 它是哪個方塊節點的第幾個輸入腳。 */
+	/** 裡面的輸入端 → 它是哪個方塊節點的第幾個輸入腳的第幾位。 */
 	const inputPass = /* @__PURE__ */ new Map();
 	const outputPass = /* @__PURE__ */ new Set();
+	/** 合起來、拆開（展開後不留下）。 */
+	const buses = /* @__PURE__ */ new Map();
 	const add = (list, ws, prefix, stack) => {
 		for (const n of list) {
 			const id = prefix + n.id;
+			if (n.kind === "MERGE" || n.kind === "SPLIT") {
+				buses.set(id, {
+					...n,
+					id
+				});
+				continue;
+			}
 			if (n.kind !== "CUSTOM") {
 				nodes.push({
 					...n,
@@ -30061,16 +30152,17 @@ function flattenDiagram(d) {
 				continue;
 			}
 			const inner = `${id}/`;
-			const pins = blockPins(def);
+			const pins = blockPinGroups(def);
 			custom.set(id, {
-				ins: pins.inputs.map((p) => inner + p.id),
-				outs: pins.outputs.map((p) => inner + p.id)
+				ins: pins.inputs.map((g) => g.nodes.map((p) => inner + p.id)),
+				outs: pins.outputs.map((g) => g.nodes.map((p) => inner + p.id))
 			});
-			pins.inputs.forEach((p, k) => inputPass.set(inner + p.id, {
+			pins.inputs.forEach((g, k) => g.nodes.forEach((p, bit) => inputPass.set(inner + p.id, {
 				node: id,
-				pin: k
-			}));
-			for (const p of pins.outputs) outputPass.add(inner + p.id);
+				pin: k,
+				bit
+			})));
+			for (const g of pins.outputs) for (const p of g.nodes) outputPass.add(inner + p.id);
 			add(def.nodes.filter((m) => m.kind !== "INPUT" && m.kind !== "OUTPUT"), def.wires, inner, [...stack, def.id]);
 		}
 		for (const w of ws) wires.push({
@@ -30084,30 +30176,44 @@ function flattenDiagram(d) {
 		});
 	};
 	add(d.nodes, d.wires, "", []);
-	const driver = new Map(wires.map((w) => [`${w.to.node}#${w.to.pin}`, {
+	/** 來源腳的位元數（方塊的多位元腳、合起來的輸出）。 */
+	const widthOf = (from, fromPin = 0) => custom.get(from)?.outs[fromPin]?.length ?? (buses.get(from)?.kind === "MERGE" ? buses.get(from).width ?? 1 : 1);
+	const key = (node, pin, bit) => `${node}#${pin}#${bit}`;
+	const driver = /* @__PURE__ */ new Map();
+	for (const w of wires) for (let bit = 0; bit < widthOf(w.from, w.fromPin); bit++) driver.set(key(w.to.node, w.to.pin, bit), {
 		from: w.from,
-		fromPin: w.fromPin
-	}]));
-	/** 一路找到真正的來源（經過方塊的腳、裡面的輸入端與輸出端）；沒接時是 null。 */
+		fromPin: w.fromPin,
+		bit
+	});
+	/** 一路找到真正的來源（經過方塊的腳、裡面的輸入端與輸出端、合起來、拆開）；沒接時是 null。 */
 	const resolve = (start) => {
 		let src = start;
 		for (let guard = 0; src && guard < 1e4; guard++) {
+			const bit = src.bit ?? 0;
 			const c = custom.get(src.from);
 			if (c) {
-				const out = c.outs[src.fromPin ?? 0];
+				const out = c.outs[src.fromPin ?? 0]?.[bit];
 				src = out === void 0 ? void 0 : { from: out };
 				continue;
 			}
 			const pass = inputPass.get(src.from);
 			if (pass) {
-				src = driver.get(`${pass.node}#${pass.pin}`);
+				src = driver.get(key(pass.node, pass.pin, pass.bit));
 				continue;
 			}
 			if (outputPass.has(src.from)) {
-				src = driver.get(`${src.from}#0`);
+				src = driver.get(key(src.from, 0, 0));
 				continue;
 			}
-			return src;
+			const bus = buses.get(src.from);
+			if (bus) {
+				src = bus.kind === "MERGE" ? driver.get(key(bus.id, bit, 0)) : driver.get(key(bus.id, 0, src.fromPin ?? 0));
+				continue;
+			}
+			return {
+				from: src.from,
+				...src.fromPin ? { fromPin: src.fromPin } : {}
+			};
 		}
 		return null;
 	};
@@ -30115,7 +30221,11 @@ function flattenDiagram(d) {
 	const flatWires = [];
 	for (const w of wires) {
 		if (!real.has(w.to.node)) continue;
-		const s = resolve(w);
+		const s = resolve({
+			from: w.from,
+			fromPin: w.fromPin,
+			bit: 0
+		});
 		if (!s) continue;
 		const { fromPin: _drop, ...rest } = w;
 		flatWires.push({
@@ -30125,13 +30235,19 @@ function flattenDiagram(d) {
 		});
 	}
 	const alias = /* @__PURE__ */ new Map();
-	for (const [id, c] of custom) c.outs.forEach((_, k) => {
-		const s = resolve({
-			from: id,
-			fromPin: k
-		});
-		if (s) alias.set(signalOf(id, k), signalOf(s.from, s.fromPin));
-	});
+	const note = (id, pin, width) => {
+		for (let bit = 0; bit < width; bit++) {
+			const s = resolve({
+				from: id,
+				fromPin: pin,
+				bit
+			});
+			if (s) alias.set(width === 1 ? signalOf(id, pin) : `${signalOf(id, pin)}[${bit}]`, signalOf(s.from, s.fromPin));
+		}
+	};
+	for (const [id, c] of custom) c.outs.forEach((bits, k) => note(id, k, bits.length));
+	for (const [id, b] of buses) if (b.kind === "MERGE") note(id, 0, b.width ?? 1);
+	else for (let k = 0; k < (b.width ?? 1); k++) note(id, k, 1);
 	const { blocks: _blocks, ...rest } = d;
 	return {
 		diagram: {
@@ -31958,6 +32074,43 @@ function withStateTask(d, task) {
 	} : rest;
 }
 //#endregion
+//#region src/logic/edit.ts
+var PREFIX$1 = {
+	gate: "g",
+	INPUT: "i",
+	OUTPUT: "o",
+	DISPLAY: "d",
+	HIGH: "k",
+	LOW: "k",
+	BLOCK: "b",
+	CLOCK: "c",
+	CUSTOM: "m",
+	MERGE: "bm",
+	SPLIT: "bs"
+};
+var NAME_RULE$1 = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
+"ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+function nextNodeId(d, kind) {
+	const prefix = PREFIX$1[isGate(kind) ? "gate" : kind];
+	const used = new Set(d.nodes.map((n) => n.id));
+	for (let i = 1;; i++) if (!used.has(`${prefix}${i}`)) return `${prefix}${i}`;
+}
+function nextWireId(d) {
+	const used = new Set(d.wires.map((w) => w.id));
+	for (let i = 1;; i++) if (!used.has(`w${i}`)) return `w${i}`;
+}
+function canPlace(d, node, ignoreId) {
+	return d.nodes.every((n) => n.id === ignoreId || n.id === node.id || !overlaps(n, node));
+}
+/** 線的兩端位元數不一樣，或接到不存在的腳。 */
+function busMismatch(d, w) {
+	const s = d.nodes.find((n) => n.id === w.from);
+	const t = d.nodes.find((n) => n.id === w.to.node);
+	if (!s || !t) return true;
+	if ((w.fromPin ?? 0) >= outputCountOf(s) || w.to.pin >= inputCountOf(t)) return true;
+	return outWidth(d, s, w.fromPin ?? 0) !== inWidth(d, t, w.to.pin);
+}
+//#endregion
 //#region src/logic/file.ts
 var KINDS = [
 	"AND",
@@ -31973,9 +32126,11 @@ var KINDS = [
 	"LOW",
 	"BLOCK",
 	"CLOCK",
-	"CUSTOM"
+	"CUSTOM",
+	"MERGE",
+	"SPLIT"
 ];
-var NAME_RULE$1 = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
+var NAME_RULE = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
 var isObj$1 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isInt = (v) => Number.isInteger(v);
 var LogicFormatError = class extends Error {};
@@ -32004,6 +32159,9 @@ function parseNode(raw, i, blocks) {
 	} else if (node.kind === "BLOCK") {
 		if (!isBlockChip(n.chip)) fail$3(`元件 ${node.id} 的 IC ${String(n.chip)} 不認得`);
 		node.chip = n.chip;
+	} else if (node.kind === "MERGE" || node.kind === "SPLIT") {
+		if (!isInt(n.width) || n.width < 2 || n.width > 8) fail$3(`元件 ${node.id} 的位元數 ${String(n.width)} 不合法（2–8）`);
+		node.width = n.width;
 	} else if (node.kind === "CUSTOM") {
 		const pins = typeof n.block === "string" ? blocks.get(n.block) : void 0;
 		if (!pins) fail$3(`元件 ${node.id} 用到不存在的自訂方塊 ${String(n.block)}`);
@@ -32011,7 +32169,7 @@ function parseNode(raw, i, blocks) {
 		node.inputs = pins.inputs;
 		node.outputs = pins.outputs;
 	} else if (node.kind !== "HIGH" && node.kind !== "LOW") {
-		if (typeof n.name !== "string" || !NAME_RULE$1.test(n.name)) fail$3(`元件 ${node.id} 的名稱 ${String(n.name)} 不合法`);
+		if (typeof n.name !== "string" || !NAME_RULE.test(n.name)) fail$3(`元件 ${node.id} 的名稱 ${String(n.name)} 不合法`);
 		node.name = n.name;
 		if (node.kind === "INPUT") node.value = n.value === 1 ? 1 : 0;
 		if (node.kind === "CLOCK") node.value = 0;
@@ -32108,14 +32266,16 @@ function parseBlocks(raw) {
 	return raw.map((b, i) => {
 		if (!isObj$1(b) || typeof b.id !== "string" || !b.id || !Array.isArray(b.nodes) || !Array.isArray(b.wires)) fail$3(`第 ${i + 1} 個自訂方塊格式不對`);
 		const o = b;
-		if (typeof o.name !== "string" || !NAME_RULE$1.test(o.name)) fail$3(`自訂方塊 ${String(o.id)} 的名稱 ${String(o.name)} 不合法`);
+		if (typeof o.name !== "string" || !NAME_RULE.test(o.name)) fail$3(`自訂方塊 ${String(o.id)} 的名稱 ${String(o.name)} 不合法`);
 		if (ids.has(o.id)) fail$3(`自訂方塊 id ${String(o.id)} 重複`);
 		if (names.has(o.name)) fail$3(`自訂方塊名稱 ${String(o.name)} 重複`);
 		ids.add(o.id);
 		names.add(o.name);
+		if (o.busPins !== void 0 && typeof o.busPins !== "boolean") fail$3(`自訂方塊 ${String(o.name)} 的 busPins 要是 true 或 false`);
 		return {
 			id: o.id,
 			name: o.name,
+			busPins: o.busPins === true ? true : void 0,
 			nodes: o.nodes,
 			wires: o.wires
 		};
@@ -32127,10 +32287,16 @@ function parseLogicDiagram(raw) {
 		if (!isObj$1(raw) || raw.version !== 1 || !Array.isArray(raw.nodes) || !Array.isArray(raw.wires)) fail$3("格式不對");
 		const r = raw;
 		const blocks = r.blocks === void 0 ? [] : parseBlocks(r.blocks);
-		const pins = new Map(blocks.map((b) => [b.id, {
-			inputs: b.nodes.filter((n) => isObj$1(n) && n.kind === "INPUT").length,
-			outputs: b.nodes.filter((n) => isObj$1(n) && n.kind === "OUTPUT").length
-		}]));
+		const pins = new Map(blocks.map((b) => {
+			const g = blockPinGroups({
+				nodes: b.nodes.filter(isObj$1),
+				busPins: b.busPins
+			});
+			return [b.id, {
+				inputs: g.inputs.length,
+				outputs: g.outputs.length
+			}];
+		}));
 		const { nodes, wires } = parseGraph(r.nodes, r.wires, pins);
 		const parsed = blocks.map((b) => {
 			const inner = parseGraph(b.nodes, b.wires, pins, `方塊 ${b.name}：`);
@@ -32138,6 +32304,7 @@ function parseLogicDiagram(raw) {
 			return {
 				id: b.id,
 				name: b.name,
+				...b.busPins ? { busPins: true } : {},
 				nodes: inner.nodes,
 				wires: inner.wires
 			};
@@ -32149,6 +32316,17 @@ function parseLogicDiagram(raw) {
 			wires,
 			...parsed.length > 0 ? { blocks: parsed } : {}
 		};
+		const widthProblem = (list, graph, where) => {
+			const bad = list.find((w) => busMismatch(graph, w));
+			if (bad) fail$3(`${where}線 ${bad.id} 兩端的位元數不一樣`);
+		};
+		widthProblem(wires, diagram, "");
+		for (const b of parsed) widthProblem(b.wires, {
+			version: 1,
+			nodes: b.nodes,
+			wires: b.wires,
+			blocks: parsed
+		}, `方塊 ${b.name}：`);
 		if (r.task !== void 0) {
 			const task = parseTask(r.task);
 			if (!task.ok) return {
@@ -34199,33 +34377,6 @@ function stateDiagramText(task) {
 	return lines;
 }
 //#endregion
-//#region src/logic/edit.ts
-var PREFIX$1 = {
-	gate: "g",
-	INPUT: "i",
-	OUTPUT: "o",
-	DISPLAY: "d",
-	HIGH: "k",
-	LOW: "k",
-	BLOCK: "b",
-	CLOCK: "c",
-	CUSTOM: "m"
-};
-var NAME_RULE = /^[A-Za-z][A-Za-z0-9_]{0,7}$/;
-"ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
-function nextNodeId(d, kind) {
-	const prefix = PREFIX$1[isGate(kind) ? "gate" : kind];
-	const used = new Set(d.nodes.map((n) => n.id));
-	for (let i = 1;; i++) if (!used.has(`${prefix}${i}`)) return `${prefix}${i}`;
-}
-function nextWireId(d) {
-	const used = new Set(d.wires.map((w) => w.id));
-	for (let i = 1;; i++) if (!used.has(`w${i}`)) return `w${i}`;
-}
-function canPlace(d, node, ignoreId) {
-	return d.nodes.every((n) => n.id === ignoreId || n.id === node.id || !overlaps(n, node));
-}
-//#endregion
 //#region src/logic/customBlocks.ts
 /** 子專案 65（規格 2026-11-14 custom-blocks）：自訂方塊的編輯（純函式，網頁與 MCP 共用）。 */
 var fail$1 = (diagram, reason) => ({
@@ -34246,7 +34397,7 @@ function nextBlockId(blocks) {
 }
 /** 名稱規則和輸入端一樣；同一個檔案不能重複。 */
 function blockNameProblem(d, name, ignoreId) {
-	if (!NAME_RULE.test(name)) return "方塊名稱要用英文字母開頭，只能有英文字母、數字、底線，最多 8 個字";
+	if (!NAME_RULE$1.test(name)) return "方塊名稱要用英文字母開頭，只能有英文字母、數字、底線，最多 8 個字";
 	if ((d.blocks ?? []).some((b) => b.name === name && b.id !== ignoreId)) return `已經有叫 ${name} 的方塊了`;
 	return null;
 }
@@ -34352,6 +34503,7 @@ function wrapAsBlock(d, ids, name = nextBlockName(d)) {
 	const def = {
 		id: nextBlockId(blocks),
 		name,
+		busPins: true,
 		nodes: [
 			...inNodes,
 			...inner,
@@ -34359,6 +34511,7 @@ function wrapAsBlock(d, ids, name = nextBlockName(d)) {
 		],
 		wires: innerWires
 	};
+	const groups = blockPinGroups(def);
 	const notes = dropLogicNoteTargets(d.notes, picked);
 	let outer = {
 		...d,
@@ -34374,8 +34527,8 @@ function wrapAsBlock(d, ids, name = nextBlockName(d)) {
 		x: x0,
 		y: y0,
 		block: def.id,
-		inputs: inNodes.length,
-		outputs: outNodes.length
+		inputs: groups.inputs.length,
+		outputs: groups.outputs.length
 	});
 	if (!node) return fail$1(d, "附近沒有空位放方塊");
 	outer = {
@@ -34389,19 +34542,82 @@ function wrapAsBlock(d, ids, name = nextBlockName(d)) {
 			...w
 		}]
 	};
-	inSignals.forEach((s, k) => add({
-		from: s.from,
-		...s.fromPin ? { fromPin: s.fromPin } : {},
-		to: {
-			node: id,
-			pin: k
+	/** 放一個合起來 / 拆開在方塊旁邊（左邊或右邊，放不下就往下找）。 */
+	const busNode = (kind, width, row) => {
+		const bid = nextNodeId(outer, kind);
+		const spot = freeSpot(outer, {
+			id: bid,
+			kind,
+			width,
+			x: kind === "MERGE" ? node.x - 4 : node.x + boxOf(node).w + 2,
+			y: node.y + row
+		});
+		if (!spot) return null;
+		outer = {
+			...outer,
+			nodes: [...outer.nodes, spot]
+		};
+		return bid;
+	};
+	const inIndex = (n) => inNodes.indexOf(n);
+	for (const [p, g] of groups.inputs.entries()) {
+		const sources = g.nodes.map((n) => inSignals[inIndex(n)]);
+		if (g.nodes.length === 1) {
+			const s = sources[0];
+			add({
+				from: s.from,
+				...s.fromPin ? { fromPin: s.fromPin } : {},
+				to: {
+					node: id,
+					pin: p
+				}
+			});
+			continue;
 		}
-	}));
-	outSignals.forEach(([, ws], k) => ws.forEach((w) => add({
-		from: id,
-		...k > 0 ? { fromPin: k } : {},
-		to: { ...w.to }
-	})));
+		const m = busNode("MERGE", g.nodes.length, p);
+		if (!m) return fail$1(d, "附近沒有空位放「合起來」");
+		sources.forEach((s, bit) => add({
+			from: s.from,
+			...s.fromPin ? { fromPin: s.fromPin } : {},
+			to: {
+				node: m,
+				pin: bit
+			}
+		}));
+		add({
+			from: m,
+			to: {
+				node: id,
+				pin: p
+			}
+		});
+	}
+	for (const [p, g] of groups.outputs.entries()) {
+		const sets = g.nodes.map((n) => outSignals[outNodes.indexOf(n)][1]);
+		if (g.nodes.length === 1) {
+			for (const w of sets[0]) add({
+				from: id,
+				...p > 0 ? { fromPin: p } : {},
+				to: { ...w.to }
+			});
+			continue;
+		}
+		const sp = busNode("SPLIT", g.nodes.length, p);
+		if (!sp) return fail$1(d, "附近沒有空位放「拆開」");
+		add({
+			from: id,
+			...p > 0 ? { fromPin: p } : {},
+			to: {
+				node: sp,
+				pin: 0
+			}
+		});
+		sets.forEach((ws, bit) => ws.forEach((w) => add({
+			from: sp,
+			...bit > 0 ? { fromPin: bit } : {},
+			to: { ...w.to }
+		})));
+	}
 	return {
 		ok: true,
 		diagram: outer,
@@ -35477,6 +35693,8 @@ function nodeLabel(node, d) {
 	if (node.kind === "LOW") return `GND ${node.id}`;
 	if (node.kind === "BLOCK") return `方塊 ${node.id}（${node.chip}）`;
 	if (node.kind === "CLOCK") return `時脈 ${node.name}`;
+	if (node.kind === "MERGE") return `合起來 ${node.id}（${node.width} 位元）`;
+	if (node.kind === "SPLIT") return `拆開 ${node.id}（${node.width} 位元）`;
 	if (node.kind === "CUSTOM") return `方塊 ${d?.blocks?.find((b) => b.id === node.block)?.name ?? node.block}（${node.id}）`;
 	return `${node.id}（${node.kind}）`;
 }
@@ -37962,7 +38180,8 @@ function layoutMissing(raw) {
 		inputs: typeof n.inputs === "number" ? n.inputs : n.kind === "NOT" ? 1 : 2,
 		...typeof n.chip === "string" ? { chip: n.chip } : {},
 		...n.segments === true ? { segments: true } : {},
-		...typeof n.outputs === "number" ? { outputs: n.outputs } : {}
+		...typeof n.outputs === "number" ? { outputs: n.outputs } : {},
+		...typeof n.width === "number" ? { width: n.width } : {}
 	});
 	const hasPos = (n) => Number.isInteger(n.x) && Number.isInteger(n.y);
 	const placed = nodes.filter(hasPos).map((n) => asNode(n, n.x, n.y));
@@ -37986,11 +38205,21 @@ function layoutMissing(raw) {
 /** 子專案 65：自訂方塊的節點先填好腳數（自動排版要知道大小），方塊裡面沒有位置的也自動排版。 */
 function withBlockLayout(raw) {
 	if (!Array.isArray(raw.blocks)) return raw;
-	const count = (b, kind) => isObj(b) && Array.isArray(b.nodes) ? b.nodes.filter((n) => isObj(n) && n.kind === kind).length : 0;
-	const pins = new Map(raw.blocks.filter(isObj).map((b) => [String(b.id), {
-		inputs: count(b, "INPUT"),
-		outputs: count(b, "OUTPUT")
-	}]));
+	const blocks = raw.blocks.map((b) => isObj(b) ? b.busPins === false ? (({ busPins: _off, ...rest }) => rest)(b) : {
+		...b,
+		busPins: true
+	} : b);
+	const count = (b) => {
+		const g = blockPinGroups({
+			nodes: Array.isArray(b.nodes) ? b.nodes.filter(isObj) : [],
+			busPins: b.busPins === true ? true : void 0
+		});
+		return {
+			inputs: g.inputs.length,
+			outputs: g.outputs.length
+		};
+	};
+	const pins = new Map(blocks.filter(isObj).map((b) => [String(b.id), count(b)]));
 	const fill = (nodes) => Array.isArray(nodes) ? nodes.map((n) => isObj(n) && n.kind === "CUSTOM" && pins.has(String(n.block)) ? {
 		...n,
 		...pins.get(String(n.block))
@@ -37998,7 +38227,7 @@ function withBlockLayout(raw) {
 	return {
 		...raw,
 		nodes: fill(raw.nodes),
-		blocks: raw.blocks.map((b) => isObj(b) ? layoutMissing({
+		blocks: blocks.map((b) => isObj(b) ? layoutMissing({
 			...b,
 			nodes: fill(b.nodes)
 		}) : b)
@@ -39223,7 +39452,8 @@ server.registerTool("logic_set", {
 		"CLOCK（時脈，name，一張圖最多 4 個，各自接不同的正反器、計數器的 CLK；轉成麵包板時每個時脈一個時脈元件，名稱一樣）。腳的順序用 BLOCK 的腳名（和 74LS 資料表一樣），fromPin 是第幾個輸出。",
 		"線：{ id, from, fromPin?（方塊的第幾個輸出）, to: { node, pin } }。節點沒有 x、y 時自動排版。",
 		"閘的輸出可以接回前面（迴授，例如 NAND 交叉接成的 SR 閂鎖）。輸入端最多 12 個；名稱英文字母開頭、最多 8 個英數字（Q̄ 寫成 QBAR、清除寫成 CLR）。",
-		"自訂方塊：diagram.blocks 是 [{ id, name, nodes, wires }]，裡面是一張小邏輯圖，輸入端是方塊的輸入腳、輸出端是輸出腳（腳的順序照 y 由上到下，再看 x）；主圖用 { kind: \"CUSTOM\", block: \"<id>\" } 放方塊，to.pin / fromPin 是第幾個腳。方塊裡可以放其他方塊（不能用到自己），不能放 CLOCK、DISPLAY。真值表、轉成麵包板都會把方塊展開。也可以用 logic_wrap_block 把現有的元件包起來。"
+		"自訂方塊：diagram.blocks 是 [{ id, name, nodes, wires }]，裡面是一張小邏輯圖，輸入端是方塊的輸入腳、輸出端是輸出腳（腳的順序照 y 由上到下，再看 x）；主圖用 { kind: \"CUSTOM\", block: \"<id>\" } 放方塊，to.pin / fromPin 是第幾個腳。方塊裡可以放其他方塊（不能用到自己），不能放 CLOCK、DISPLAY。真值表、轉成麵包板都會把方塊展開。也可以用 logic_wrap_block 把現有的元件包起來。",
+		"匯流排：MERGE（合起來，width 2–8：width 個一位元輸入 pin 0…width−1 是第 0 位到最高位 → 一個匯流排輸出）、SPLIT（拆開：一個匯流排輸入 → width 個一位元輸出，fromPin k 是第 k 位）；線的位元數是來源腳的位元數，兩端要一樣。方塊裡的輸入端（輸出端）叫 A0、A1…A(n−1) 時合成一個 n 位元的腳 A[n−1:0]（預設，blocks 裡寫 busPins: false 可以關掉），要用匯流排接。"
 	].join(""),
 	inputSchema: {
 		file,
@@ -39236,7 +39466,7 @@ server.registerTool("logic_set", {
 }, async ({ file: f, diagram }) => withFile(f, (lab) => logicSet(lab, { diagram })));
 server.registerTool("logic_wrap_block", {
 	title: "包成自訂方塊",
-	description: "把邏輯圖裡的幾個元件（閘、IC 方塊、5V / GND、其他自訂方塊）包成一個自訂方塊，和網頁的「包成方塊」一樣：從外面接進來的同一個訊號是一個輸入腳（腳名用來源輸入端的名稱，不然是 I1…），接出去的同一個訊號是一個輸出腳（腳名用接到的輸出端名稱，不然是 O1…）。輸入端、輸出端、時脈、7 段顯示器不能包。回覆列出方塊的腳，並確認真值表沒變。",
+	description: "把邏輯圖裡的幾個元件（閘、IC 方塊、5V / GND、其他自訂方塊、合起來、拆開）包成一個自訂方塊，和網頁的「包成方塊」一樣：從外面接進來的同一個訊號是一個輸入腳（腳名用來源輸入端的名稱，不然是 I1…），接出去的同一個訊號是一個輸出腳（腳名用接到的輸出端名稱，不然是 O1…）；A0、A1… 這種腳合成多位元腳，外面自動加 MERGE / SPLIT 接好。輸入端、輸出端、時脈、7 段顯示器不能包。回覆列出方塊的腳，並確認真值表沒變。",
 	inputSchema: {
 		file,
 		nodes: array(string()).min(1).describe("要包起來的元件 id"),
