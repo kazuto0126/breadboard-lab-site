@@ -1,4 +1,4 @@
-// Breadboard Lab MCP 伺服器 2026.11.21（commit 75b9337）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
+// Breadboard Lab MCP 伺服器 2026.11.25（commit 3221c08）— 設定說明：https://kazuto0126.github.io/breadboard-lab-site/mcp/
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
@@ -30289,6 +30289,13 @@ function usesItself(blocks, id) {
 //#endregion
 //#region src/core/simulation/models.ts
 var not = (v) => v === "X" ? "X" : v === 1 ? 0 : 1;
+/**
+* 非同步清除 / 預設腳是 X（還不知道有沒有作用）時的結果：沒作用時是 normal，有作用時是 forced 裡的值；
+* 全部一樣就是那個值，不然是 X。回授計數器上電時 NAND 的輸出還是 X，已經是 0 再清除一次還是 0，不能讓 X 卡在迴圈裡。
+*/
+function eitherWay(normal, forced) {
+	return forced.every((v) => v === normal) ? normal : "X";
+}
 function and(values) {
 	if (values.includes(0)) return 0;
 	return values.includes("X") ? "X" : 1;
@@ -30407,8 +30414,10 @@ function dffModel(spec) {
 				const both = pre === 1 && clr === 1;
 				if (both || pre === 1) q = 1;
 				else if (clr === 1) q = 0;
-				else if (pre === "X" || clr === "X") q = "X";
-				else if (rising(state.prev[ff.clock], read(ff.clock))) q = load === 1 ? read(ff.d) : load === 0 ? q : "X";
+				else {
+					if (rising(state.prev[ff.clock], read(ff.clock))) q = load === 1 ? read(ff.d) : load === 0 ? q : "X";
+					q = eitherWay(q, [...pre === "X" ? [1] : [], ...clr === "X" ? [0] : []]);
+				}
 				if (ff.q) outputs[ff.q] = drive(q);
 				if (ff.qn) outputs[ff.qn] = drive(both ? 1 : not(q));
 				return q;
@@ -30434,20 +30443,20 @@ function rippleCounterModel(spec) {
 			bits: zeros(widths.reduce((a, b) => a + b, 0))
 		}),
 		evaluate(read, state) {
-			let values = spec.stages.map((_, k) => toNumber(state.bits.slice(offsets[k], offsets[k] + widths[k])));
-			let preset = false;
-			for (const p of spec.presets) {
-				const when = allAsserted(read, p.when);
-				if (when === 0) continue;
-				values = when === 1 ? [...p.values] : values.map(() => "X");
-				preset = true;
-				break;
-			}
-			if (!preset) values = values.map((v, k) => {
+			const counted = spec.stages.map((_, k) => toNumber(state.bits.slice(offsets[k], offsets[k] + widths[k]))).map((v, k) => {
 				const stage = spec.stages[k];
 				if (!falling(state.prev[stage.clock], read(stage.clock))) return v;
 				return v === "X" ? "X" : (v + 1) % stage.modulus;
 			});
+			const afterPresets = (from) => {
+				if (from >= spec.presets.length) return counted;
+				const p = spec.presets[from];
+				const when = allAsserted(read, p.when);
+				if (when === 0) return afterPresets(from + 1);
+				if (when === 1) return [...p.values];
+				return afterPresets(from + 1).map((v, k) => eitherWay(v, [p.values[k]]));
+			};
+			const values = afterPresets(0);
 			const outputs = {};
 			const bits = spec.stages.flatMap((stage, k) => {
 				const stageBits = toBits(values[k], widths[k]);
@@ -30476,15 +30485,18 @@ function syncCounterModel(spec) {
 		evaluate(read, state) {
 			let q = toNumber(state.bits);
 			const clear = asserted(read, spec.clear);
-			if (spec.clear.mode === "async" && clear !== 0) q = clear === 1 ? 0 : "X";
-			else if (rising(state.prev[spec.clock], read(spec.clock))) {
-				const load = asserted(read, spec.load);
-				const enabled = allAsserted(read, spec.enable);
-				if (spec.clear.mode === "sync" && clear !== 0) q = clear === 1 ? 0 : "X";
-				else if (load === 1) q = toNumber(readAll(read, spec.data));
-				else if (load === "X") q = "X";
-				else if (enabled === 1) q = q === "X" ? "X" : (q + 1) % (max + 1);
-				else if (enabled === "X") q = "X";
+			const edge = rising(state.prev[spec.clock], read(spec.clock));
+			if (clear === 1 && (spec.clear.mode === "async" || edge)) q = 0;
+			else {
+				if (edge) {
+					const load = asserted(read, spec.load);
+					const enabled = allAsserted(read, spec.enable);
+					if (load === 1) q = toNumber(readAll(read, spec.data));
+					else if (load === "X") q = "X";
+					else if (enabled === 1) q = q === "X" ? "X" : (q + 1) % (max + 1);
+					else if (enabled === "X") q = "X";
+				}
+				if (clear === "X" && (spec.clear.mode === "async" || edge)) q = eitherWay(q, [0]);
 			}
 			const bits = toBits(q, width);
 			const outputs = {};
@@ -30520,11 +30532,13 @@ function upDownCounterModel(spec) {
 			const up = read(spec.up);
 			const down = read(spec.down);
 			if (clear === 1) q = 0;
-			else if (clear === "X") q = "X";
-			else if (load === 1) q = toNumber(readAll(read, spec.data));
-			else if (load === "X") q = "X";
-			else if (rising(state.prev[spec.up], up) && down === 1) q = q === "X" ? "X" : (q + 1) % modulus;
-			else if (rising(state.prev[spec.down], down) && up === 1) q = q === "X" ? "X" : (q + modulus - 1) % modulus;
+			else {
+				if (load === 1) q = toNumber(readAll(read, spec.data));
+				else if (load === "X") q = "X";
+				else if (rising(state.prev[spec.up], up) && down === 1) q = q === "X" ? "X" : (q + 1) % modulus;
+				else if (rising(state.prev[spec.down], down) && up === 1) q = q === "X" ? "X" : (q + modulus - 1) % modulus;
+				if (clear === "X") q = eitherWay(q, [0]);
+			}
 			const bits = toBits(q, width);
 			const outputs = {};
 			spec.outputs.forEach((pin, i) => outputs[pin] = bits[i]);
@@ -30608,14 +30622,16 @@ function jkffModel(spec) {
 				const both = pre === 1 && clr === 1;
 				if (both || pre === 1) q = 1;
 				else if (clr === 1) q = 0;
-				else if (pre === "X" || clr === "X") q = "X";
-				else if (falling(state.prev[ff.clock], read(ff.clock))) {
-					const j = read(ff.j);
-					const k = read(ff.k);
-					if (j === "X" || k === "X") q = "X";
-					else if (j === 1 && k === 1) q = not(q);
-					else if (j === 1) q = 1;
-					else if (k === 1) q = 0;
+				else {
+					if (falling(state.prev[ff.clock], read(ff.clock))) {
+						const j = read(ff.j);
+						const k = read(ff.k);
+						if (j === "X" || k === "X") q = "X";
+						else if (j === 1 && k === 1) q = not(q);
+						else if (j === 1) q = 1;
+						else if (k === 1) q = 0;
+					}
+					q = eitherWay(q, [...pre === "X" ? [1] : [], ...clr === "X" ? [0] : []]);
 				}
 				if (ff.q) outputs[ff.q] = q;
 				if (ff.qn) outputs[ff.qn] = both ? 1 : not(q);
@@ -30962,14 +30978,21 @@ function evaluateFlat(d, values, state) {
 	let result = combinational(order, driver, values, seq, feedback.length > 0 ? memory : null);
 	for (let round = 0; sequential.length > 0 && round < MAX_SETTLE; round++) {
 		let changed = false;
-		for (const node of sequential) {
-			const ev = modelOf(node.chip).evaluate(readOf(node, result.nodes), seq[node.id].state);
-			const out = BLOCK_PINS[node.chip].outputs.map((name) => bitOf(ev.outputs[modelOutput(node.chip, name)]));
-			if (out.some((b, k) => b !== seq[node.id].out[k])) changed = true;
-			seq[node.id] = {
-				state: ev.state,
-				out
-			};
+		for (let wave = 0; wave < MAX_SETTLE; wave++) {
+			const view = new Map(result.nodes);
+			for (const node of sequential) seq[node.id].out.forEach((b, k) => view.set(signalOf(node.id, k), b));
+			let moved = false;
+			for (const node of sequential) {
+				const ev = modelOf(node.chip).evaluate(readOf(node, view), seq[node.id].state);
+				const out = BLOCK_PINS[node.chip].outputs.map((name) => bitOf(ev.outputs[modelOutput(node.chip, name)]));
+				if (out.some((b, k) => b !== seq[node.id].out[k])) moved = true;
+				seq[node.id] = {
+					state: ev.state,
+					out
+				};
+			}
+			if (!moved) break;
+			changed = true;
 		}
 		if (!changed) break;
 		result = combinational(order, driver, values, seq, feedback.length > 0 ? memory : null);
@@ -39295,7 +39318,7 @@ function folderFromArgs(argv, cwd) {
 * 工具的邏輯在 src/mcp/（純函式）；這裡只負責路徑檢查、讀檔、寫檔。
 */
 /** 版本號：打包時換成建置的日期（vite.mcp.config.ts），原始碼版是 1.0.0。 */
-var VERSION = "2026.11.21";
+var VERSION = "2026.11.25";
 if (process.argv.includes("--version")) {
 	console.log(VERSION);
 	process.exit(0);
